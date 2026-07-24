@@ -346,6 +346,108 @@ main {
   opacity: 0.9;
 }
 
+/* 3D view overlay toolbar */
+
+.preview3d {
+  position: relative;
+}
+
+.preview-canvas {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+.preview-canvas canvas {
+  display: block;
+}
+
+.viewbar {
+  position: absolute;
+  left: 50%;
+  bottom: 0.75rem;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  z-index: 3;
+}
+
+.viewbar-row {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.25rem;
+  background: var(--input-bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+}
+
+.viewbar-row button {
+  font: inherit;
+  font-size: 0.8rem;
+  color: var(--text);
+  background: none;
+  border: none;
+  border-radius: 5px;
+  padding: 0.3rem 0.55rem;
+  cursor: pointer;
+  opacity: 0.55;
+}
+
+.viewbar-row button:hover {
+  background: var(--control-hover);
+  color: var(--text-h);
+  opacity: 0.9;
+}
+
+.viewbar-row button.active {
+  background: var(--control);
+  color: var(--text-h);
+  opacity: 1;
+}
+
+.viewbar-sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 0.15rem 0.2rem;
+  background: var(--border);
+}
+
+.viewbar-panel {
+  width: 240px;
+  max-height: 55vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  padding: 0.75rem;
+  font-size: 0.85rem;
+  background: var(--input-bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+}
+
+.viewbar-panel select {
+  font: inherit;
+  font-size: 0.85rem;
+  color: var(--text);
+  background: var(--control);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 0.3rem 0.5rem;
+  cursor: pointer;
+}
+
+.viewbar-panel-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.6rem;
+}
+
 /* Inspector */
 
 .inspector {
@@ -371,10 +473,125 @@ main {
   color: var(--text-h);
 }
 
+/* Collapsible panels */
+
+.panel {
+  margin: 0.35rem -0.4rem 0;
+  border-radius: 8px;
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  width: 100%;
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 500;
+  text-align: left;
+  color: var(--text-h);
+  background: none;
+  border: none;
+  border-radius: 6px;
+  padding: 0.4rem;
+  cursor: pointer;
+}
+
+.panel-head:hover {
+  background: var(--control);
+}
+
+.panel-chev {
+  display: inline-block;
+  font-size: 0.7rem;
+  opacity: 0.55;
+  transition: transform 0.12s ease;
+}
+
+.panel-chev.open {
+  transform: rotate(90deg);
+}
+
+.panel-body {
+  padding: 0.15rem 0.4rem 0.6rem;
+}
+
+.panel-body > .button-row {
+  margin-bottom: 0.6rem;
+}
+
 .field-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 0.5rem 0.6rem;
+}
+
+/* Sliders */
+
+.field-slider {
+  grid-column: 1 / -1;
+}
+
+.field-slider > span {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.field-slider em {
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-h);
+  opacity: 0.9;
+}
+
+input[type='range'] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 1.1rem;
+  margin: 0;
+  background: none;
+  cursor: pointer;
+}
+
+input[type='range']::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border-strong);
+}
+
+input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 13px;
+  height: 13px;
+  margin-top: -4.5px;
+  border-radius: 50%;
+  border: none;
+  background: var(--accent);
+}
+
+input[type='range']::-moz-range-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border-strong);
+}
+
+input[type='range']::-moz-range-thumb {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: none;
+  background: var(--accent);
+}
+
+input[type='range']:focus {
+  outline: none;
+}
+
+input[type='range']:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px var(--accent-veil);
 }
 
 .field {
@@ -434,6 +651,10 @@ main {
   grid-template-columns: 3.2rem 2.6rem 1fr 1fr;
   gap: 0.4rem;
   align-items: center;
+}
+
+.material-row input[type='range'] {
+  min-width: 0;
 }
 
 .material-row > span {

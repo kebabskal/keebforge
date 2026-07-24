@@ -25,6 +25,7 @@ import {
 import { groupMap, useDocStore } from '../model/store'
 import { useTheme } from '../ui/theme'
 import { capGeo, CAP_PROFILE, frustumGeo } from './capGeometry'
+import { ViewBar } from './ViewBar'
 import { useViewSettings } from './viewSettings'
 
 /** Simplified switch/cap dimensions per type, mm (heights above plate top;
@@ -814,5 +815,10 @@ export function Preview3D() {
     }
   }, [])
 
-  return <div className="editor" ref={wrapRef} />
+  return (
+    <div className="editor preview3d">
+      <div className="preview-canvas" ref={wrapRef} />
+      <ViewBar />
+    </div>
+  )
 }
