@@ -16,11 +16,16 @@ import {
   type Doc,
   type Group,
   type GroupLayout,
+  type BezelSettings,
+  type BoardColors,
   type Key,
   type KeyType,
   type MirrorSettings,
   type PlateSettings,
+  DEFAULT_BEZEL,
+  DEFAULT_COLORS,
   DEFAULT_PLATE,
+  DEFAULT_TILT,
 } from './keys'
 
 const STORAGE_KEY = 'keebforge.doc.v1'
@@ -87,6 +92,9 @@ export interface DocState extends Doc {
   updateGroupLayout: (id: string, layout: GroupLayout) => void
   setMirror: (patch: Partial<MirrorSettings>) => void
   setPlate: (patch: Partial<PlateSettings>) => void
+  setBezel: (patch: Partial<BezelSettings>) => void
+  setTilt: (deg: number) => void
+  setColors: (patch: Partial<BoardColors>) => void
 
   /** Transient transform: begin snapshots the doc, transform applies patches
    * relative to that snapshot (so drags don't accumulate error), end commits
@@ -267,6 +275,21 @@ function relayoutStacks(keys: Key[], groups: Group[]): Key[] {
 
 // ---- Persistence ----------------------------------------------------------
 
+/** Fill in defaults; docs saved before the radius split carry a single
+ * `radius`, which maps onto the outer radius. */
+export function normalizeBezel(raw: unknown): BezelSettings {
+  if (!raw || typeof raw !== 'object' || typeof (raw as BezelSettings).width !== 'number') {
+    return { ...DEFAULT_BEZEL }
+  }
+  const legacy = raw as BezelSettings & { radius?: number }
+  const migrated =
+    typeof legacy.radius === 'number' && legacy.radiusOuter === undefined
+      ? { radiusOuter: legacy.radius, radiusInner: legacy.radius }
+      : {}
+  const { radius: _radius, ...rest } = legacy
+  return { ...DEFAULT_BEZEL, ...migrated, ...rest }
+}
+
 function loadSaved(): Doc | null {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
@@ -284,6 +307,12 @@ function loadSaved(): Doc | null {
         parsed.plate && typeof parsed.plate.padding === 'number'
           ? (parsed.plate as PlateSettings)
           : { ...DEFAULT_PLATE },
+      bezel: normalizeBezel(parsed.bezel),
+      tilt: typeof parsed.tilt === 'number' ? parsed.tilt : DEFAULT_TILT,
+      colors:
+        parsed.colors && typeof parsed.colors.case === 'string'
+          ? { ...DEFAULT_COLORS, ...(parsed.colors as BoardColors) }
+          : { ...DEFAULT_COLORS },
     }
   } catch {
     return null
@@ -310,7 +339,15 @@ export function coalesceUndo<T>(key: string, fn: () => T): T {
   }
 }
 
-const docOf = (s: Doc): Doc => ({ keys: s.keys, groups: s.groups, mirror: s.mirror, plate: s.plate })
+const docOf = (s: Doc): Doc => ({
+  keys: s.keys,
+  groups: s.groups,
+  mirror: s.mirror,
+  plate: s.plate,
+  bezel: s.bezel,
+  tilt: s.tilt,
+  colors: s.colors,
+})
 
 export const useDocStore = create<DocState>((set, get) => {
   const commit = (patch: Partial<Doc>) => {
@@ -338,6 +375,9 @@ export const useDocStore = create<DocState>((set, get) => {
       groups,
       mirror: patch.mirror ?? state.mirror,
       plate: patch.plate ?? state.plate,
+      bezel: patch.bezel ?? state.bezel,
+      tilt: patch.tilt ?? state.tilt,
+      colors: patch.colors ?? state.colors,
       past: pushPast ? [...state.past.slice(-MAX_HISTORY + 1), prev] : state.past,
       future: [],
       selection: new Set([...state.selection].filter((id) => alive.has(id))),
@@ -775,6 +815,18 @@ export const useDocStore = create<DocState>((set, get) => {
       commit({ plate: { ...get().plate, ...patch } })
     },
 
+    setBezel: (patch) => {
+      commit({ bezel: { ...get().bezel, ...patch } })
+    },
+
+    setTilt: (deg) => {
+      commit({ tilt: deg })
+    },
+
+    setColors: (patch) => {
+      commit({ colors: { ...get().colors, ...patch } })
+    },
+
     beginTransform: () => {
       transformSnapshot = docOf(get())
     },
@@ -844,6 +896,9 @@ export const useDocStore = create<DocState>((set, get) => {
         groups: doc.groups ?? [],
         mirror: doc.mirror ?? { enabled: false, axis: 6 * U },
         plate: doc.plate ?? { ...DEFAULT_PLATE },
+        bezel: normalizeBezel(doc.bezel),
+        tilt: doc.tilt ?? DEFAULT_TILT,
+        colors: { ...DEFAULT_COLORS, ...doc.colors },
       })
       set({ selection: new Set() })
     },
@@ -859,7 +914,10 @@ useDocStore.subscribe((state, prev) => {
     state.keys === prev.keys &&
     state.groups === prev.groups &&
     state.mirror === prev.mirror &&
-    state.plate === prev.plate
+    state.plate === prev.plate &&
+    state.bezel === prev.bezel &&
+    state.tilt === prev.tilt &&
+    state.colors === prev.colors
   )
     return
   clearTimeout(saveTimer)
@@ -868,11 +926,14 @@ useDocStore.subscribe((state, prev) => {
       localStorage.setItem(
         STORAGE_KEY,
         JSON.stringify({
-          version: 3,
+          version: 4,
           keys: state.keys,
           groups: state.groups,
           mirror: state.mirror,
           plate: state.plate,
+          bezel: state.bezel,
+          tilt: state.tilt,
+          colors: state.colors,
         }),
       )
     } catch {

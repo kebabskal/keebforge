@@ -8,7 +8,8 @@ import {
   type KeyType,
 } from '../model/keys'
 import { alignmentItems, coalesceUndo, groupMap, useDocStore } from '../model/store'
-import { FOAM_CLEARANCE, plateWithCutouts } from '../model/outline'
+import { useViewSettings } from '../preview/viewSettings'
+import { bezelShape, FOAM_CLEARANCE, plateWithCutouts } from '../model/outline'
 import { downloadText, toDXF } from '../export/dxf'
 
 const fmt = (v: number) => String(Math.round(v * 1000) / 1000)
@@ -90,6 +91,27 @@ function TextField(props: {
         }}
         onKeyDown={(e) => {
           if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
+        }}
+      />
+    </label>
+  )
+}
+
+function ColorField(props: {
+  label: string
+  value: string
+  onCommit: (value: string) => void
+}) {
+  return (
+    <label className="field">
+      <span>{props.label}</span>
+      <input
+        type="color"
+        value={props.value}
+        onChange={(e) => {
+          const value = e.target.value
+          // One undo step per field while scrubbing the picker.
+          coalesceUndo(`color-${props.label}`, () => props.onCommit(value))
         }}
       />
     </label>
@@ -279,6 +301,13 @@ function DocumentPanel() {
   const setMirror = useDocStore((s) => s.setMirror)
   const plate = useDocStore((s) => s.plate)
   const setPlate = useDocStore((s) => s.setPlate)
+  const bezel = useDocStore((s) => s.bezel)
+  const setBezel = useDocStore((s) => s.setBezel)
+  const tilt = useDocStore((s) => s.tilt)
+  const setTilt = useDocStore((s) => s.setTilt)
+  const colors = useDocStore((s) => s.colors)
+  const setColors = useDocStore((s) => s.setColors)
+  const view = useViewSettings()
   const keyCount = useDocStore((s) => s.keys.length)
   const mirroredCount = useDocStore((s) =>
     s.mirror.enabled
@@ -287,8 +316,11 @@ function DocumentPanel() {
   )
 
   const exportDXF = (clearance: number, filename: string) => {
-    const { keys, groups, mirror, plate } = useDocStore.getState()
-    const shapes = plateWithCutouts({ keys, groups, mirror, plate }, clearance)
+    const { keys, groups, mirror, plate, bezel, tilt, colors } = useDocStore.getState()
+    const shapes = plateWithCutouts(
+      { keys, groups, mirror, plate, bezel, tilt, colors },
+      clearance,
+    )
     downloadText(filename, toDXF(shapes))
   }
 
@@ -314,7 +346,17 @@ function DocumentPanel() {
           step={1}
           onCommit={(axis) => setMirror({ axis })}
         />
+        <NumberField
+          label="Tilt (°)"
+          value={tilt}
+          step={1}
+          onCommit={setTilt}
+        />
       </div>
+      <p className="hint">
+        Tilt is the typing angle shown in 3D: positive raises the back edge,
+        pivoting on the front.
+      </p>
       <h3>Plate &amp; foam</h3>
       <div className="field-grid">
         <NumberField
@@ -324,6 +366,141 @@ function DocumentPanel() {
           onCommit={(padding) => setPlate({ padding: Math.max(0, padding) })}
         />
       </div>
+      <h3>Bezel</h3>
+      <div className="field-grid">
+        <label className="field field-check">
+          <span>Enabled</span>
+          <input
+            type="checkbox"
+            checked={bezel.enabled}
+            onChange={(e) => setBezel({ enabled: e.target.checked })}
+          />
+        </label>
+        <label className="field">
+          <span>Mode</span>
+          <select
+            value={bezel.mode}
+            onChange={(e) => setBezel({ mode: e.target.value as 'box' | 'tight' })}
+          >
+            <option value="tight">Tight</option>
+            <option value="box">Box</option>
+          </select>
+        </label>
+        <NumberField
+          label="Width (mm)"
+          value={bezel.width}
+          step={0.5}
+          onCommit={(width) => setBezel({ width: Math.max(0, width) })}
+        />
+        <NumberField
+          label="Outset (mm)"
+          value={bezel.outset}
+          step={0.25}
+          onCommit={(outset) => setBezel({ outset: Math.max(0, outset) })}
+        />
+        <NumberField
+          label="Height (mm)"
+          value={bezel.height}
+          step={0.5}
+          onCommit={(height) => setBezel({ height: Math.max(0, height) })}
+        />
+        <NumberField
+          label="Outer radius (mm)"
+          value={bezel.radiusOuter}
+          step={0.5}
+          onCommit={(radiusOuter) => setBezel({ radiusOuter: Math.max(0, radiusOuter) })}
+        />
+        <NumberField
+          label="Inner radius (mm)"
+          value={bezel.radiusInner}
+          step={0.5}
+          onCommit={(radiusInner) => setBezel({ radiusInner: Math.max(0, radiusInner) })}
+        />
+        <NumberField
+          label="Bevel (mm)"
+          value={bezel.bevel}
+          step={0.25}
+          onCommit={(bevel) => setBezel({ bevel: Math.max(0, bevel) })}
+        />
+      </div>
+      <p className="hint">
+        A rim around the keycap opening: tight follows the keycap contour, box
+        is a rectangular frame. Outset is the gap around keycaps, height is
+        above the plate top.
+      </p>
+      <h3>Colors</h3>
+      <div className="field-grid">
+        <ColorField
+          label="Case"
+          value={colors.case}
+          onCommit={(v) => setColors({ case: v })}
+        />
+        <ColorField
+          label="Caps"
+          value={colors.cap}
+          onCommit={(v) => setColors({ cap: v })}
+        />
+        <ColorField
+          label="Accent caps"
+          value={colors.capAccent}
+          onCommit={(v) => setColors({ capAccent: v })}
+        />
+      </div>
+      <p className="hint">Unlabeled keys use the accent color.</p>
+      <h3>3D view</h3>
+      <div className="field-grid">
+        <NumberField
+          label="Camera FOV (°)"
+          value={view.fov}
+          step={5}
+          onCommit={(fov) => view.update({ fov: Math.min(100, Math.max(10, fov)) })}
+        />
+        <label className="field">
+          <span>Backdrop</span>
+          <select
+            value={view.backdrop}
+            onChange={(e) =>
+              view.update({ backdrop: e.target.value as 'table' | 'studio' })
+            }
+          >
+            <option value="table">Table</option>
+            <option value="studio">Studio</option>
+          </select>
+        </label>
+        <ColorField
+          label="Backdrop color"
+          value={view.backdropColor}
+          onCommit={(backdropColor) => view.update({ backdropColor })}
+        />
+        <NumberField
+          label="Light angle (°)"
+          value={view.lightAngle}
+          step={15}
+          onCommit={(lightAngle) => view.update({ lightAngle })}
+        />
+        <NumberField
+          label="Key light"
+          value={view.keyLight}
+          step={0.2}
+          onCommit={(keyLight) => view.update({ keyLight: Math.max(0, keyLight) })}
+        />
+        <NumberField
+          label="Fill light"
+          value={view.fillLight}
+          step={0.1}
+          onCommit={(fillLight) => view.update({ fillLight: Math.max(0, fillLight) })}
+        />
+        <NumberField
+          label="Ambient"
+          value={view.ambient}
+          step={0.1}
+          onCommit={(ambient) => view.update({ ambient: Math.max(0, ambient) })}
+        />
+      </div>
+      <p className="hint">
+        Camera and lighting are per-browser view settings; colors are part of
+        the document.
+      </p>
       <p className="hint">
         The plate is the union of all key areas plus padding, with per-switch
         cutouts (14 mm MX, 13.8 mm Choc). Foam adds {FOAM_CLEARANCE} mm cutout
@@ -333,6 +510,15 @@ function DocumentPanel() {
         <button onClick={() => exportDXF(0, 'keebforge-plate.dxf')}>Plate DXF</button>
         <button onClick={() => exportDXF(FOAM_CLEARANCE, 'keebforge-foam.dxf')}>
           Foam DXF
+        </button>
+        <button
+          disabled={!bezel.enabled}
+          onClick={() => {
+            const doc = useDocStore.getState()
+            downloadText('keebforge-bezel.dxf', toDXF(bezelShape(doc)))
+          }}
+        >
+          Bezel DXF
         </button>
       </div>
       <h3>Shortcuts</h3>

@@ -10,6 +10,7 @@ import {
   type Key,
   type XForm,
 } from '../model/keys'
+import { bezelShape, plateOutline, type MultiPolygon } from '../model/outline'
 import {
   groupMap,
   memberKeyIds,
@@ -33,6 +34,7 @@ const PALETTES = {
     outline: 0x6aa6ff,
     groupOutline: 0x8f7ddb,
     mirrorAxis: 0x50b88a,
+    bezel: 0x77809a,
     ghost: 0x3b3f4d,
     label: '#e8eaf0',
   },
@@ -48,6 +50,7 @@ const PALETTES = {
     outline: 0x2f6fd0,
     groupOutline: 0x7a5fd0,
     mirrorAxis: 0x2e9968,
+    bezel: 0x9aa2b5,
     ghost: 0xc4c9d3,
     label: '#2c313b',
   },
@@ -87,11 +90,13 @@ function makeLabelTexture(label: string, color: string): THREE.CanvasTexture {
 export function EditorCanvas() {
   const wrapRef = useRef<HTMLDivElement>(null)
   const bandRef = useRef<HTMLDivElement>(null)
+  const dimsRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     const wrap = wrapRef.current
     const band = bandRef.current
-    if (!wrap || !band) return
+    const dims = dimsRef.current
+    if (!wrap || !band || !dims) return
 
     const store = useDocStore
     const COLORS = PALETTES[useTheme.getState().theme]
@@ -213,6 +218,7 @@ export function EditorCanvas() {
         dashSize: 4,
         gapSize: 3,
       }),
+      bezelLine: new THREE.LineBasicMaterial({ color: COLORS.bezel }),
       ghostCap: new THREE.MeshBasicMaterial({
         color: COLORS.ghost,
         transparent: true,
@@ -346,6 +352,99 @@ export function EditorCanvas() {
     axisLine.position.z = -0.6
     scene.add(axisLine)
 
+    // Bezel contours and the board-size badge, rebuilt only when the
+    // geometry-relevant slices of the store change — sync() also fires for
+    // selection changes, which don't affect either.
+    let bezelLines: THREE.LineLoop[] = []
+    let bezelDeps: Partial<
+      Pick<
+        ReturnType<typeof store.getState>,
+        'keys' | 'groups' | 'mirror' | 'plate' | 'bezel'
+      >
+    > = {}
+    const rebuildOutlines = (state: ReturnType<typeof store.getState>) => {
+      if (
+        state.keys === bezelDeps.keys &&
+        state.groups === bezelDeps.groups &&
+        state.mirror === bezelDeps.mirror &&
+        state.plate === bezelDeps.plate &&
+        state.bezel === bezelDeps.bezel
+      )
+        return
+      bezelDeps = {
+        keys: state.keys,
+        groups: state.groups,
+        mirror: state.mirror,
+        plate: state.plate,
+        bezel: state.bezel,
+      }
+      for (const line of bezelLines) {
+        scene.remove(line)
+        line.geometry.dispose()
+      }
+      bezelLines = []
+      dims.style.display = 'none'
+      try {
+        const doc = {
+          keys: state.keys,
+          groups: state.groups,
+          mirror: state.mirror,
+          plate: state.plate,
+          bezel: state.bezel,
+          tilt: state.tilt,
+          colors: state.colors,
+        }
+        const bezelMp = state.bezel.enabled ? bezelShape(doc) : []
+        for (const poly of bezelMp) {
+          for (const ring of poly) {
+            const geo = new THREE.BufferGeometry().setFromPoints(
+              ring.map(([x, y]) => new THREE.Vector3(x, y, 0)),
+            )
+            const line = new THREE.LineLoop(geo, materials.bezelLine)
+            line.position.z = -0.45
+            scene.add(line)
+            bezelLines.push(line)
+          }
+        }
+        // Overall board footprint: plate and bezel outer edges combined.
+        let minX = Infinity
+        let minY = Infinity
+        let maxX = -Infinity
+        let maxY = -Infinity
+        const track = (mp: MultiPolygon) => {
+          for (const poly of mp) {
+            for (const [x, y] of poly[0]) {
+              minX = Math.min(minX, x)
+              minY = Math.min(minY, y)
+              maxX = Math.max(maxX, x)
+              maxY = Math.max(maxY, y)
+            }
+          }
+        }
+        track(plateOutline(doc))
+        track(bezelMp)
+        if (minX < maxX) {
+          dims.textContent = `${(maxX - minX).toFixed(1)} × ${(maxY - minY).toFixed(1)} mm`
+          dims.style.display = 'block'
+        }
+      } catch (error) {
+        console.warn('keebforge: outline generation failed', error)
+      }
+    }
+
+    // Outline generation runs polygon offsetting — too heavy for every drag
+    // frame. Throttle to trailing updates; single edits still feel instant.
+    let outlineTimer: ReturnType<typeof setTimeout> | undefined
+    let outlineLastRun = 0
+    const scheduleOutlines = () => {
+      const wait = Math.max(0, 150 - (performance.now() - outlineLastRun))
+      clearTimeout(outlineTimer)
+      outlineTimer = setTimeout(() => {
+        outlineLastRun = performance.now()
+        rebuildOutlines(store.getState())
+      }, wait)
+    }
+
     // Dashed outline around a fully-selected group.
     let groupBox: THREE.LineLoop | null = null
     const clearGroupBox = () => {
@@ -397,6 +496,8 @@ export function EditorCanvas() {
 
       axisLine.visible = state.mirror.enabled
       axisLine.position.x = state.mirror.axis
+
+      scheduleOutlines()
 
       clearGroupBox()
       const whole = wholeSelectedGroup(state)
@@ -731,7 +832,9 @@ export function EditorCanvas() {
       canvas.removeEventListener('contextmenu', onContextMenu)
       window.removeEventListener('keydown', onKeyDown)
       window.removeEventListener('keyup', onKeyUp)
+      clearTimeout(outlineTimer)
       clearGroupBox()
+      for (const line of bezelLines) line.geometry.dispose()
       for (const v of views.values()) disposeSprite(v)
       for (const geo of geoCache.values()) geo.dispose()
       for (const m of Object.values(materials)) m.dispose()
@@ -745,6 +848,7 @@ export function EditorCanvas() {
   return (
     <div className="editor" ref={wrapRef}>
       <div className="select-band" ref={bandRef} />
+      <div className="dims-badge" ref={dimsRef} />
     </div>
   )
 }

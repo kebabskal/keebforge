@@ -68,11 +68,62 @@ export interface PlateSettings {
 
 export const DEFAULT_PLATE: PlateSettings = { padding: 3 }
 
+export interface BezelSettings {
+  enabled: boolean
+  /** `tight` follows the keycap contour; `box` is a rectangular frame around
+   * the whole board. */
+  mode: 'box' | 'tight'
+  /** Rim width from the opening's edge outward, mm. */
+  width: number
+  /** Clearance between keycap edges and the opening, mm. */
+  outset: number
+  /** Rim height above the plate top, mm. */
+  height: number
+  /** Corner radius of the outer bezel edge, mm. */
+  radiusOuter: number
+  /** Corner radius of the opening around the keys, mm. */
+  radiusInner: number
+  /** Chamfer on the bezel's top and bottom edges (3D preview), mm. */
+  bevel: number
+}
+
+export const DEFAULT_BEZEL: BezelSettings = {
+  enabled: true,
+  mode: 'tight',
+  width: 6,
+  outset: 1,
+  height: 6,
+  radiusOuter: 4,
+  radiusInner: 1,
+  bevel: 1.5,
+}
+
+/** Typing angle in degrees: positive raises the back edge. 3D-preview only
+ * for now (plate/foam exports are flat projections regardless). */
+export const DEFAULT_TILT = 5
+
+/** Material colors used by the 3D preview (hex CSS colors). */
+export interface BoardColors {
+  case: string
+  cap: string
+  /** Unlabeled keys (thumbs etc.) render in the accent color. */
+  capAccent: string
+}
+
+export const DEFAULT_COLORS: BoardColors = {
+  case: '#454b58',
+  cap: '#e7e3d7',
+  capAccent: '#5c7d6e',
+}
+
 export interface Doc {
   keys: Key[]
   groups: Group[]
   mirror: MirrorSettings
   plate: PlateSettings
+  bezel: BezelSettings
+  tilt: number
+  colors: BoardColors
 }
 
 /** Switch pitch (center-to-center spacing) and keycap size per switch type, mm. */
@@ -407,5 +458,8 @@ export function defaultDoc(): Doc {
     groups: [cluster, thumbs],
     mirror: { enabled: true, axis: 6 * U },
     plate: { ...DEFAULT_PLATE },
+    bezel: { ...DEFAULT_BEZEL },
+    tilt: DEFAULT_TILT,
+    colors: { ...DEFAULT_COLORS },
   }
 }

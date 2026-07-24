@@ -39,9 +39,15 @@ export function Toolbar() {
   const fileRef = useRef<HTMLInputElement>(null)
 
   const exportJson = () => {
-    const { keys, groups, mirror } = useDocStore.getState()
+    const { keys, groups, mirror, plate, bezel, tilt, colors } = useDocStore.getState()
     const blob = new Blob(
-      [JSON.stringify({ version: 2, keys, groups, mirror }, null, 2)],
+      [
+        JSON.stringify(
+          { version: 4, keys, groups, mirror, plate, bezel, tilt, colors },
+          null,
+          2,
+        ),
+      ],
       { type: 'application/json' },
     )
     const url = URL.createObjectURL(blob)
@@ -71,6 +77,19 @@ export function Toolbar() {
         mirror:
           parsed.mirror && typeof parsed.mirror.axis === 'number'
             ? parsed.mirror
+            : undefined,
+        plate:
+          parsed.plate && typeof parsed.plate.padding === 'number'
+            ? parsed.plate
+            : undefined,
+        bezel:
+          parsed.bezel && typeof parsed.bezel.width === 'number'
+            ? parsed.bezel
+            : undefined,
+        tilt: typeof parsed.tilt === 'number' ? parsed.tilt : undefined,
+        colors:
+          parsed.colors && typeof parsed.colors.case === 'string'
+            ? parsed.colors
             : undefined,
       } as Partial<Doc>)
     } catch (err) {
