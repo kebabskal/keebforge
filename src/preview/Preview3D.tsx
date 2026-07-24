@@ -17,6 +17,7 @@ import {
 import {
   caseBottomOutline,
   caseShells,
+  CSK_DEPTH,
   foamWithCutouts,
   FOAM_THICKNESS,
   PLATE_THICKNESS,
@@ -126,6 +127,15 @@ export function Preview3D() {
     // backdrop hides itself when the camera goes under (see backdropVis).
     controls.maxPolarAngle = Math.PI - 0.05
 
+    // Render on demand: the RAF loop only draws after something invalidated
+    // (camera movement, rebuilds, view settings), so an idle preview costs no
+    // GPU work. Damping keeps firing 'change' until the camera settles.
+    let renderQueued = true
+    const invalidate = () => {
+      renderQueued = true
+    }
+    controls.addEventListener('change', invalidate)
+
     const hemi = new THREE.HemisphereLight(0xcdd8f2, 0x2a251e, 0.75)
     scene.add(hemi)
     const sun = new THREE.DirectionalLight(0xffffff, 2.4)
@@ -204,9 +214,9 @@ export function Preview3D() {
     // Meshes grouped by part, so visibility toggles apply without a rebuild.
     // Repopulated on every rebuild.
     const partMeshes: Record<
-      'caps' | 'switches' | 'case' | 'plate' | 'foam' | 'bottom',
+      'caps' | 'switches' | 'case' | 'plate' | 'foam' | 'bottom' | 'screws',
       THREE.Object3D[]
-    > = { caps: [], switches: [], case: [], plate: [], foam: [], bottom: [] }
+    > = { caps: [], switches: [], case: [], plate: [], foam: [], bottom: [], screws: [] }
 
     const applyViewSettings = () => {
       const v = useViewSettings.getState()
@@ -219,6 +229,7 @@ export function Preview3D() {
         plate: v.showPlate,
         foam: v.showFoam,
         bottom: v.showBottom,
+        screws: v.showScrews,
       }
       // Exploded view: raise each layer along the board normal by its place
       // in the assembly stack (bottom lid stays on the desk). Offsets are
@@ -234,6 +245,8 @@ export function Preview3D() {
       const r = Math.min(1, g / 5)
       const lift = {
         bottom: 0,
+        // Screws ride with the lid they pass through.
+        screws: 0,
         foam: g,
         plate: 2 * g,
         case: 3 * g + 12 * r,
@@ -262,6 +275,7 @@ export function Preview3D() {
       // VSM needs at least a little blur or its variance test bands visibly.
       sun.shadow.radius = Math.max(1, v.shadowBlur)
       ssaoPass.enabled = v.ssao
+      invalidate()
     }
 
     // World-space cut at the desk surface for the wedge bottom; the constant
@@ -504,11 +518,32 @@ export function Preview3D() {
         // top, rim ring (keycap opening) above it, and the supporting lip
         // reaching up to the plate's underside. Plate and foam are cut to
         // the cavity, so nothing interpenetrates.
+        const screws = screwPositions(doc)
         if (doc.bezel.enabled && doc.bezel.width > 0) {
           const bevel = Math.min(doc.bezel.bevel ?? 0, doc.bezel.width / 2 - 0.05)
+          const wallH = PLATE_THICKNESS + cavity
+          // Self-tapping pilots are blind: only as deep as the screw bites,
+          // so the wall still reads solid from inside the case. Splitting the
+          // band at that depth is how an extruded outline gets a blind hole.
+          const pilotH = Math.min(SCREW.bite, wallH)
           for (const shell of caseShells(doc)) {
             trackFront(shell.hull)
-            addSlab(shell.wall, 'case', PLATE_THICKNESS + cavity, caseBottomY, materials.bezel, true)
+            if (screws.length > 0) {
+              const drilled = subtractDiscs(shell.wall, screws, SCREW.pilotR)
+              addSlab(drilled, 'case', pilotH, caseBottomY, materials.bezel, true)
+              if (wallH > pilotH) {
+                addSlab(
+                  shell.wall,
+                  'case',
+                  wallH - pilotH,
+                  caseBottomY + pilotH,
+                  materials.bezel,
+                  true,
+                )
+              }
+            } else {
+              addSlab(shell.wall, 'case', wallH, caseBottomY, materials.bezel, true)
+            }
             if (doc.bezel.height > 0) {
               // Extrusion bevels are symmetric, so sink the rim by one bevel:
               // the bottom chamfer ends up buried inside the wall band below
@@ -522,10 +557,10 @@ export function Preview3D() {
         // `wedge` extrudes deep enough to reach the desk at full tilt/tent
         // and is cut off at it by the clipping plane.
         if (doc.bottom.enabled) {
-          // Lid screws go up through the lid into the bezel wall; the lid
-          // outline gets clearance holes at the generated positions.
-          const screws = screwPositions(doc)
-          const bottomMp = subtractDiscs(caseBottomOutline(doc), screws, SCREW.lidHoleR)
+          // Lid screws go up through the lid into the bezel wall. The lid is
+          // opened to the countersink's full width; the collars below put the
+          // bore back, leaving a cone seat over a clearance hole.
+          const bottomMp = subtractDiscs(caseBottomOutline(doc), screws, SCREW.cskR)
           trackFront(bottomMp)
           let extent = 0
           for (const poly of bottomMp) {
@@ -578,8 +613,31 @@ export function Preview3D() {
           if (screws.length > 0) {
             const shaftLen = bottomThickness + SCREW.bite
             const shaftGeo = new THREE.CylinderGeometry(SCREW.shaftR, SCREW.shaftR, shaftLen, 12)
-            const headGeo = new THREE.CylinderGeometry(SCREW.headR, SCREW.headR, SCREW.headH, 16)
-            slabGeos.push(shaftGeo, headGeo)
+            // Countersunk head: a cone widening to its major radius at the
+            // lid's underside, matching the seat it drops into.
+            const headGeo = new THREE.CylinderGeometry(SCREW.shaftR, SCREW.headR, SCREW.headH, 16)
+            // The seat itself. Extrusions can only cut straight holes, so the
+            // lid is opened to the full countersink and this collar restores
+            // the material around the bore: a cone down to the underside,
+            // then a plain clearance bore up to the lid's top face.
+            const seatDepth = Math.min(CSK_DEPTH, Math.max(0, bottomThickness - 0.3))
+            // Profile runs counter-clockwise in the (radius, height) plane so
+            // the revolved faces end up pointing out of the solid ring.
+            const collarLathe = new THREE.LatheGeometry(
+              [
+                new THREE.Vector2(SCREW.cskR, 0),
+                new THREE.Vector2(SCREW.cskR, bottomThickness),
+                new THREE.Vector2(SCREW.lidHoleR, bottomThickness),
+                new THREE.Vector2(SCREW.lidHoleR, seatDepth),
+                new THREE.Vector2(SCREW.cskR, 0),
+              ],
+              24,
+            )
+            // A lathe shares vertices across profile corners, which would
+            // round off the seat's rim; crease it back like the slabs.
+            const collarGeo = toCreasedNormals(collarLathe, Math.PI / 6)
+            collarLathe.dispose()
+            slabGeos.push(shaftGeo, headGeo, collarGeo)
             for (const [sx, sy] of screws) {
               const shaft = new THREE.Mesh(shaftGeo, materials.screw)
               shaft.position.set(sx, restY + shaftLen / 2, -sy)
@@ -588,7 +646,16 @@ export function Preview3D() {
               head.position.set(sx, restY + SCREW.headH / 2, -sy)
               head.userData.assembledY = head.position.y
               targetFor(sx).add(shaft, head)
-              partMeshes.bottom.push(shaft, head)
+              partMeshes.screws.push(shaft, head)
+              // The collar is lid material, not fastener — it stays visible
+              // when the screws are hidden, so the seats read as holes.
+              const collar = new THREE.Mesh(collarGeo, materials.bezel)
+              collar.position.set(sx, restY, -sy)
+              collar.userData.assembledY = collar.position.y
+              collar.castShadow = true
+              collar.receiveShadow = true
+              targetFor(sx).add(collar)
+              partMeshes.bottom.push(collar)
             }
           }
           // Tray ridge: an inset rim rising from the lid to the plate's
@@ -873,6 +940,7 @@ export function Preview3D() {
       composer.setSize(w, h)
       camera.aspect = w / h
       camera.updateProjectionMatrix()
+      invalidate()
     }
     resize()
     const observer = new ResizeObserver(resize)
@@ -882,6 +950,8 @@ export function Preview3D() {
     const animate = () => {
       frame = requestAnimationFrame(animate)
       controls.update()
+      if (!renderQueued) return
+      renderQueued = false
       backdropVis()
       composer.render()
     }

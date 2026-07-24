@@ -9,6 +9,7 @@ const PARTS = [
   ['showPlate', 'Plate'],
   ['showFoam', 'Foam'],
   ['showBottom', 'Bottom'],
+  ['showScrews', 'Screws'],
 ] as const
 
 /** Overlay toolbar at the bottom of the 3D view: per-part visibility

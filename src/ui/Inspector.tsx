@@ -10,7 +10,13 @@ import {
   type KeyType,
 } from '../model/keys'
 import { alignmentItems, coalesceUndo, groupMap, useDocStore } from '../model/store'
-import { bezelShape, FOAM_CLEARANCE, foamWithCutouts, plateWithCutouts } from '../model/outline'
+import {
+  bezelShape,
+  FOAM_CLEARANCE,
+  foamWithCutouts,
+  maxScrewInset,
+  plateWithCutouts,
+} from '../model/outline'
 import { downloadText, toDXF } from '../export/dxf'
 import { NumberField, Section, SliderField, TextField } from './fields'
 
@@ -579,6 +585,17 @@ function DocumentPanel() {
             bottom (they come up through it) — enable both to see them.
           </p>
         )}
+        {mounting.enabled &&
+          bezel.enabled &&
+          bottom.enabled &&
+          (bottom.inset ?? 0) > maxScrewInset(bezel.width) && (
+            <p className="hint hint-warn">
+              The bottom is inset too far to fasten: its edge sits inboard of
+              every spot the wall can hold a pilot hole. Drop the inset to{' '}
+              {Math.max(0, Math.floor(maxScrewInset(bezel.width) * 2) / 2)} mm
+              or widen the bezel.
+            </p>
+          )}
         <p className="hint">
           M2 self-tapping screws go up through the bottom lid into pilot holes
           in the bezel wall, spaced evenly along the wall. Spacing sets the

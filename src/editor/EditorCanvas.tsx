@@ -13,7 +13,13 @@ import {
   type Key,
   type XForm,
 } from '../model/keys'
-import { bezelShape, plateOutline, type MultiPolygon } from '../model/outline'
+import {
+  bezelShape,
+  plateOutline,
+  SCREW,
+  screwPositions,
+  type MultiPolygon,
+} from '../model/outline'
 import {
   coalesceUndo,
   groupMap,
@@ -39,6 +45,7 @@ const PALETTES = {
     groupOutline: 0x8f7ddb,
     mirrorAxis: 0x50b88a,
     bezel: 0x77809a,
+    screw: 0x9b8f6e,
     ghost: 0x3b3f4d,
     snapGuide: 0xe0607e,
     label: '#e8eaf0',
@@ -56,6 +63,7 @@ const PALETTES = {
     groupOutline: 0x7a5fd0,
     mirrorAxis: 0x2e9968,
     bezel: 0x9aa2b5,
+    screw: 0x8d7c4f,
     ghost: 0xc4c9d3,
     snapGuide: 0xd23a60,
     label: '#2c313b',
@@ -156,6 +164,13 @@ export function EditorCanvas() {
     // the HTML gizmo overlay too.
     let positionGizmosHook: () => void = () => {}
 
+    // Render on demand: the RAF loop only draws after something invalidated,
+    // so an idle editor costs no GPU work.
+    let renderQueued = true
+    const invalidate = () => {
+      renderQueued = true
+    }
+
     const applyCamera = () => {
       const { clientWidth: w, clientHeight: h } = wrap
       camera.left = view.cx - w / 2 / view.zoom
@@ -164,6 +179,7 @@ export function EditorCanvas() {
       camera.bottom = view.cy - h / 2 / view.zoom
       camera.updateProjectionMatrix()
       positionGizmosHook()
+      invalidate()
     }
 
     const toMM = (clientX: number, clientY: number) => {
@@ -232,6 +248,7 @@ export function EditorCanvas() {
         gapSize: 3,
       }),
       bezelLine: new THREE.LineBasicMaterial({ color: COLORS.bezel }),
+      screwLine: new THREE.LineBasicMaterial({ color: COLORS.screw }),
       snapGuide: new THREE.LineBasicMaterial({ color: COLORS.snapGuide }),
       ghostCap: new THREE.MeshBasicMaterial({
         color: COLORS.ghost,
@@ -397,10 +414,18 @@ export function EditorCanvas() {
     // geometry-relevant slices of the store change — sync() also fires for
     // selection changes, which don't affect either.
     let bezelLines: THREE.LineLoop[] = []
+    // Screw markers share one unit-circle geometry, scaled per ring.
+    const screwCircleGeo = new THREE.BufferGeometry().setFromPoints(
+      Array.from({ length: 32 }, (_, i) => {
+        const a = (i / 32) * Math.PI * 2
+        return new THREE.Vector3(Math.cos(a), Math.sin(a), 0)
+      }),
+    )
+    let screwLines: THREE.LineLoop[] = []
     let bezelDeps: Partial<
       Pick<
         ReturnType<typeof store.getState>,
-        'keys' | 'groups' | 'mirror' | 'plate' | 'bezel'
+        'keys' | 'groups' | 'mirror' | 'plate' | 'bezel' | 'bottom' | 'mounting'
       >
     > = {}
     const rebuildOutlines = (state: ReturnType<typeof store.getState>) => {
@@ -409,7 +434,9 @@ export function EditorCanvas() {
         state.groups === bezelDeps.groups &&
         state.mirror === bezelDeps.mirror &&
         state.plate === bezelDeps.plate &&
-        state.bezel === bezelDeps.bezel
+        state.bezel === bezelDeps.bezel &&
+        state.bottom === bezelDeps.bottom &&
+        state.mounting === bezelDeps.mounting
       )
         return
       bezelDeps = {
@@ -418,12 +445,16 @@ export function EditorCanvas() {
         mirror: state.mirror,
         plate: state.plate,
         bezel: state.bezel,
+        bottom: state.bottom,
+        mounting: state.mounting,
       }
       for (const line of bezelLines) {
         scene.remove(line)
         line.geometry.dispose()
       }
       bezelLines = []
+      for (const line of screwLines) scene.remove(line)
+      screwLines = []
       dims.style.display = 'none'
       try {
         const doc = {
@@ -449,6 +480,20 @@ export function EditorCanvas() {
             bezelLines.push(line)
           }
         }
+        // Screws: the lid's clearance hole ringed by the head's footprint,
+        // so it reads at a glance whether a head clears the parts around it.
+        if (state.bottom.enabled) {
+          for (const [x, y] of screwPositions(doc)) {
+            for (const r of [SCREW.lidHoleR, SCREW.headR]) {
+              const line = new THREE.LineLoop(screwCircleGeo, materials.screwLine)
+              line.position.set(x, y, -0.4)
+              line.scale.set(r, r, 1)
+              scene.add(line)
+              screwLines.push(line)
+            }
+          }
+        }
+
         // Overall board footprint: plate and bezel outer edges combined.
         let minX = Infinity
         let minY = Infinity
@@ -485,6 +530,7 @@ export function EditorCanvas() {
       outlineTimer = setTimeout(() => {
         outlineLastRun = performance.now()
         rebuildOutlines(store.getState())
+        invalidate()
       }, wait)
     }
 
@@ -502,6 +548,10 @@ export function EditorCanvas() {
     // HTML overlay handles: a rotation handle for the selection, and — when
     // a whole column cluster is selected — per-column stagger/splay drag
     // handles plus add/remove column buttons.
+
+    // Half of .gizmo-handle's 12px box — how far a handle reaches past the
+    // point it is placed at.
+    const HANDLE_RADIUS_PX = 6
 
     let gizmoSig = ''
     let gizmoPlacers: (() => void)[] = []
@@ -599,6 +649,21 @@ export function EditorCanvas() {
         wBot: keyWorldXF(bottom, groups),
         pitchX: spec.pitchX,
         pitchY: spec.pitchY,
+      }
+    }
+
+    /** World positions of a column's two handles: splay above the top key,
+     * stagger below the bottom one. Shared so the size bar can dodge them. */
+    const columnHandlePoints = (groupId: string, col: number) => {
+      const info = columnInfo(groupId, col)
+      if (!info) return null
+      const rad = (info.wTop.r * Math.PI) / 180
+      const up = { x: -Math.sin(rad), y: Math.cos(rad) }
+      const off = info.pitchY * 0.85
+      return {
+        info,
+        splay: { x: info.wTop.x + up.x * off, y: info.wTop.y + up.y * off },
+        stagger: { x: info.wBot.x - up.x * off, y: info.wBot.y - up.y * off },
       }
     }
 
@@ -879,8 +944,18 @@ export function EditorCanvas() {
         sizeBar.style.display = b ? '' : 'none'
         if (!b) return
         const p = mmToPx((b.minX + b.maxX) / 2, b.minY)
+        // Stagger handles hang below the cluster's bottom row, so clear the
+        // lowest of them rather than the selection bounds alone.
+        let lowest = p.y
+        if (clusterId) {
+          for (let col = 0; col < columnCount; col++) {
+            const pts = columnHandlePoints(clusterId, col)
+            if (!pts) continue
+            lowest = Math.max(lowest, mmToPx(pts.stagger.x, pts.stagger.y).y + HANDLE_RADIUS_PX)
+          }
+        }
         sizeBar.style.left = `${p.x}px`
-        sizeBar.style.top = `${p.y + 24}px`
+        sizeBar.style.top = `${lowest + 24}px`
         const st = store.getState()
         const widths = new Set(
           st.keys.filter((k) => st.selection.has(k.id)).map((k) => k.w),
@@ -948,15 +1023,13 @@ export function EditorCanvas() {
           ),
         )
         gizmoPlacers.push(() => {
-          const info = columnInfo(clusterId, col)
+          const pts = columnHandlePoints(clusterId, col)
+          const info = pts?.info ?? null
           stag.style.display = info ? '' : 'none'
           splay.style.display = info ? '' : 'none'
-          if (!info) return
-          const rad = (info.wTop.r * Math.PI) / 180
-          const up = { x: -Math.sin(rad), y: Math.cos(rad) }
-          const off = info.pitchY * 0.85
-          placeEl(splay, info.wTop.x + up.x * off, info.wTop.y + up.y * off)
-          placeEl(stag, info.wBot.x - up.x * off, info.wBot.y - up.y * off)
+          if (!pts || !info) return
+          placeEl(splay, pts.splay.x, pts.splay.y)
+          placeEl(stag, pts.stagger.x, pts.stagger.y)
           stag.classList.toggle('at-default', info.layout.columns[col].stagger === 0)
           splay.classList.toggle('at-default', info.layout.columns[col].splay === 0)
         })
@@ -1261,6 +1334,7 @@ export function EditorCanvas() {
       }
 
       rebuildGizmos()
+      invalidate()
     }
 
     // ---- Interaction ------------------------------------------------------
@@ -1551,6 +1625,7 @@ export function EditorCanvas() {
     const onPointerUp = (e: PointerEvent) => {
       hideDragBadge()
       setSnapGuides(null, null)
+      invalidate()
       if (mode.kind === 'drag') {
         useDocStore.getState().endTransform()
       } else if (mode.kind === 'band') {
@@ -1675,6 +1750,8 @@ export function EditorCanvas() {
     let frame = 0
     const animate = () => {
       frame = requestAnimationFrame(animate)
+      if (!renderQueued) return
+      renderQueued = false
       renderer.render(scene, camera)
     }
     animate()
@@ -1694,6 +1771,7 @@ export function EditorCanvas() {
       wrap.removeChild(dragBadge)
       clearGroupBox()
       for (const line of bezelLines) line.geometry.dispose()
+      screwCircleGeo.dispose()
       for (const v of views.values()) disposeSprite(v)
       for (const geo of geoCache.values()) geo.dispose()
       for (const m of Object.values(materials)) m.dispose()

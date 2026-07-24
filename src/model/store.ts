@@ -731,24 +731,9 @@ export const useDocStore = create<DocState>((set, get) => {
     nudgeSelected: (dx, dy) => {
       const state = get()
       if (state.selection.size === 0) return
-      const whole = wholeSelectedGroup(state)
-      if (whole) {
-        commit({
-          groups: state.groups.map((g) =>
-            g.id === whole.id ? { ...g, x: g.x + dx, y: g.y + dy } : g,
-          ),
-        })
-      } else {
-        const groups = groupMap(state.groups)
-        commit({
-          keys: state.keys.map((k) => {
-            if (!state.selection.has(k.id)) return k
-            const frame = groupWorldXF(groups, k.groupId)
-            const local = rotateDelta(frame.r, dx, dy)
-            return { ...k, x: k.x + local.x, y: k.y + local.y }
-          }),
-        })
-      }
+      // Move in alignment units: a fully-selected group shifts its origin, so
+      // stack-layout members aren't re-packed back to where they started.
+      applyItemMoves(alignmentItems(state).map((item) => ({ item, dx, dy })))
     },
 
     alignSelected: (mode) => {

@@ -599,6 +599,54 @@ export function caseBottomOutline(doc: Doc): MultiPolygon {
   }
 }
 
+export interface BoxRect {
+  minX: number
+  minY: number
+  maxX: number
+  maxY: number
+}
+
+/** Split halves only take their margin on the outward edge. */
+function marginsFor(half: 'left' | 'right' | 'both', bezel: Doc['bezel']): CaseMargins {
+  return {
+    top: bezel.marginTop ?? 0,
+    bottom: bezel.marginBottom ?? 0,
+    left: half === 'right' ? 0 : bezel.marginLeft ?? 0,
+    right: half === 'left' ? 0 : bezel.marginRight ?? 0,
+  }
+}
+
+/** The rectangle a `box`-mode piece is built from: the keycap bounding box
+ * padded by outset + wall width, plus per-side margins. Screw placement
+ * anchors on its corners rather than rediscovering them in the outline. */
+export function bezelBoxes(doc: Doc): BoxRect[] {
+  const bezel = doc.bezel
+  if (!bezel.enabled || bezel.width <= 0 || bezel.mode !== 'box') return []
+  const pad = bezel.outset + bezel.width
+  return keyWorldSides(doc).map((side) => {
+    const margins = marginsFor(side.half, bezel)
+    let minX = Infinity
+    let minY = Infinity
+    let maxX = -Infinity
+    let maxY = -Infinity
+    for (const { key, world } of side.worlds) {
+      const size = capSize(key)
+      for (const [x, y] of rectPoly(world, size.w, size.h)[0]) {
+        minX = Math.min(minX, x)
+        minY = Math.min(minY, y)
+        maxX = Math.max(maxX, x)
+        maxY = Math.max(maxY, y)
+      }
+    }
+    return {
+      minX: minX - pad - margins.left,
+      minY: minY - pad - margins.bottom,
+      maxX: maxX + pad + margins.right,
+      maxY: maxY + pad + margins.top,
+    }
+  })
+}
+
 function bezelSolidsUncached(doc: Doc): BezelSolids[] {
   const bezel = doc.bezel
   if (!bezel.enabled || bezel.width <= 0) return []
@@ -612,19 +660,15 @@ function bezelSolidsUncached(doc: Doc): BezelSolids[] {
     return r > 0 ? smoothOutline(mp, r, sc) : closeGaps(mp, sc)
   }
   const result: BezelSolids[] = []
-  for (const side of keyWorldSides(doc)) {
+  const boxes = bezelBoxes(doc)
+  const sides = keyWorldSides(doc)
+  for (const [index, side] of sides.entries()) {
     const capRects = (pad: number): Polygon[] =>
       side.worlds.map(({ key, world }) => {
         const size = capSize(key)
         return rectPoly(world, size.w + 2 * pad, size.h + 2 * pad)
       })
-    // Split halves only take the margin on their outward edge.
-    const margins: CaseMargins = {
-      top: bezel.marginTop ?? 0,
-      bottom: bezel.marginBottom ?? 0,
-      left: side.half === 'right' ? 0 : bezel.marginLeft ?? 0,
-      right: side.half === 'left' ? 0 : bezel.marginRight ?? 0,
-    }
+    const margins = marginsFor(side.half, bezel)
     const opening = prep(
       robustClip((s) => polygonClipping.union(s), capRects(bezel.outset)),
       bezel.radiusInner ?? 0,
@@ -639,28 +683,16 @@ function bezelSolidsUncached(doc: Doc): BezelSolids[] {
         bezel.radiusOuter ?? 0,
       )
     } else {
-      let minX = Infinity
-      let minY = Infinity
-      let maxX = -Infinity
-      let maxY = -Infinity
-      for (const rect of capRects(0)) {
-        for (const [x, y] of rect[0]) {
-          minX = Math.min(minX, x)
-          minY = Math.min(minY, y)
-          maxX = Math.max(maxX, x)
-          maxY = Math.max(maxY, y)
-        }
-      }
-      const pad = bezel.outset + bezel.width
+      const b = boxes[index]
       outer = prep(
         [
           [
             [
-              [minX - pad - margins.left, minY - pad - margins.bottom],
-              [maxX + pad + margins.right, minY - pad - margins.bottom],
-              [maxX + pad + margins.right, maxY + pad + margins.top],
-              [minX - pad - margins.left, maxY + pad + margins.top],
-              [minX - pad - margins.left, minY - pad - margins.bottom],
+              [b.minX, b.minY],
+              [b.maxX, b.minY],
+              [b.maxX, b.maxY],
+              [b.minX, b.maxY],
+              [b.minX, b.minY],
             ],
           ],
         ],
@@ -674,22 +706,38 @@ function bezelSolidsUncached(doc: Doc): BezelSolids[] {
 
 // ---- Mounting -------------------------------------------------------------
 
-/** M2 self-tapping screw dimensions (radii/lengths in mm): the lid gets a
- * clearance hole, the screw bites into a pilot in the bezel wall above. */
+/** M2 self-tapping screw dimensions (radii/lengths in mm). The screw passes
+ * freely through the lid and cuts its own thread in the wall above, so the
+ * two holes are deliberately different sizes: the lid's bore is oversized
+ * past the shank, the wall's pilot is undersized so the thread can bite. */
 export const SCREW = {
-  /** Clearance-hole radius through the bottom lid. */
+  /** Clearance bore through the bottom lid — wider than the shank, so the
+   * screw slides through instead of tapping into it. */
   lidHoleR: 1.25,
+  /** Pilot hole in the top-case wall — narrower than the shank, leaving
+   * material for the self-tapping thread to cut into. */
+  pilotR: 0.8,
+  /** Major radius of the countersink seat in the lid's underside. */
+  cskR: 2,
   /** Shaft/head radii and lengths for the 3D-preview proxy. */
   shaftR: 0.9,
   headR: 1.9,
-  headH: 1.4,
+  /** Head cone height. The head is a 90° countersunk one, so it rises by
+   * exactly the radius it narrows over. */
+  headH: 1,
   /** Thread engagement into the wall above the lid's top face. */
   bite: 6,
 }
 
+/** Depth of the lid's countersink. The seat is a 90° cone, so it sinks by
+ * exactly the radius it opens by — head flush with the underside. */
+export const CSK_DEPTH = SCREW.cskR - SCREW.lidHoleR
+
 /** Evenly spaced points along a ring's perimeter, `spacing` mm apart,
  * phase-anchored at the vertex farthest from the ring centroid (a corner,
- * so screws land in corners first and the layout is stable under edits). */
+ * so screws land in corners first and the layout is stable under edits).
+ * Used for `tight` outlines, which have no canonical corners; `box` pieces
+ * take their screws from the rectangle they were built from instead. */
 function sampleRing(ring: Ring, spacing: number): [number, number][] {
   let pts = ring as [number, number][]
   if (
@@ -716,6 +764,16 @@ function sampleRing(ring: Ring, spacing: number): [number, number][] {
     cx += x / n
     cy += y / n
   }
+  const at = (s: number): [number, number] => {
+    const t = ((s % total) + total) % total
+    let i = 0
+    while (i < n - 1 && cum[i + 1] <= t) i++
+    const f = (t - cum[i]) / Math.max(1e-9, cum[i + 1] - cum[i])
+    const [x1, y1] = pts[i]
+    const [x2, y2] = pts[(i + 1) % n]
+    return [x1 + (x2 - x1) * f, y1 + (y2 - y1) * f]
+  }
+
   let start = 0
   let best = -1
   for (let i = 0; i < n; i++) {
@@ -727,14 +785,44 @@ function sampleRing(ring: Ring, spacing: number): [number, number][] {
   }
   const count = Math.max(2, Math.round(total / spacing))
   const out: [number, number][] = []
-  for (let k = 0; k < count; k++) {
-    const t = (cum[start] + (k * total) / count) % total
-    let i = 0
-    while (i < n - 1 && cum[i + 1] <= t) i++
-    const f = (t - cum[i]) / Math.max(1e-9, cum[i + 1] - cum[i])
-    const [x1, y1] = pts[i]
-    const [x2, y2] = pts[(i + 1) % n]
-    out.push([x1 + (x2 - x1) * f, y1 + (y2 - y1) * f])
+  for (let k = 0; k < count; k++) out.push(at(cum[start] + (k * total) / count))
+  return out
+}
+
+/** Screws for a box case: one in each corner, with the edges between them
+ * subdivided into equal steps no longer than `spacing`. `e` is how far in
+ * from the outer face the screw line sits. A corner screw follows the outer
+ * fillet — pulled diagonally inward so it stays `e` clear of the rounded
+ * edge rather than sitting where the sharp corner would have been. */
+function sampleBoxRect(
+  box: BoxRect,
+  e: number,
+  bezel: Doc['bezel'],
+  spacing: number,
+): [number, number][] {
+  const w = box.maxX - box.minX - 2 * e
+  const h = box.maxY - box.minY - 2 * e
+  // Too small a piece to be worth fastening (or to fit screws at all).
+  if (w <= 0 || h <= 0 || 2 * (w + h) < 40) return []
+  // `prep` clamps the fillet radius, so match it here.
+  const radius = Math.max(0, Math.min(bezel.radiusOuter ?? 0, 6))
+  const spineR = Math.max(0, radius - e)
+  const off = radius > e ? radius - spineR / Math.SQRT2 : e
+  const corners: [number, number][] = [
+    [box.minX + off, box.minY + off],
+    [box.maxX - off, box.minY + off],
+    [box.maxX - off, box.maxY - off],
+    [box.minX + off, box.maxY - off],
+  ]
+  const out: [number, number][] = []
+  for (let i = 0; i < 4; i++) {
+    const [x0, y0] = corners[i]
+    const [x1, y1] = corners[(i + 1) % 4]
+    const steps = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0) / spacing))
+    // k starts at 0, so each corner is emitted exactly once.
+    for (let k = 0; k < steps; k++) {
+      out.push([x0 + ((x1 - x0) * k) / steps, y0 + ((y1 - y0) * k) / steps])
+    }
   }
   return out
 }
@@ -749,12 +837,46 @@ let screwCache: {
   result: [number, number][]
 } | null = null
 
+/** Deepest a screw can sit inside the hull before its pilot leaves the
+ * top-case wall band: material inboard of the wall belongs to the bottom
+ * tray, which screws pass through rather than into. */
+function deepestScrewLine(bezelWidth: number): number {
+  const wallW = Math.max(0.8, bezelWidth)
+  return Math.max(wallW - 1.2, wallW / 2)
+}
+
+/** Deepest bottom inset that still admits screws. An inset lid pulls its
+ * edge inboard while the pilot must stay in the wall band, so past this
+ * depth no position satisfies both and the lid cannot be fastened. */
+export function maxScrewInset(bezelWidth: number): number {
+  return deepestScrewLine(bezelWidth) - SCREW.cskR - 0.5
+}
+
+/** Make a screw layout symmetric about the mirror axis. Ring sampling walks
+ * each outline from its own anchor, so a mirrored board would otherwise get
+ * two independently-phased halves. Keep the left half plus anything sitting
+ * on the axis, then reflect it — the right half becomes an exact mirror. */
+function mirrorScrews(pts: [number, number][], axis: number): [number, number][] {
+  const onAxis = 0.05
+  const out: [number, number][] = []
+  for (const [x, y] of pts) {
+    if (Math.abs(x - axis) <= onAxis) out.push([axis, y])
+    else if (x < axis) out.push([x, y], [2 * axis - x, y])
+  }
+  return out
+}
+
 /** Screw positions: evenly spaced along the bezel wall's centerline (the
  * outer solid eroded by half the wall width), per case piece and island.
  * The centerline is at least width/2 clear of both the keycap opening and
  * the outer face, so an M2 pilot always has wall material around it. */
 export function screwPositions(doc: Doc): [number, number][] {
+  // Screws exist to hold the lid on, so no lid means nothing to fasten.
   if (!doc.mounting.enabled || !doc.bezel.enabled || doc.bezel.width <= 0) return []
+  if (!doc.bottom.enabled) return []
+  // Past this inset the lid's edge has retreated inboard of every position
+  // the wall can hold a pilot in — no screw could reach both.
+  if (Math.max(0, doc.bottom.inset ?? 0) > maxScrewInset(doc.bezel.width)) return []
   if (
     screwCache &&
     screwCache.keys === doc.keys &&
@@ -766,25 +888,32 @@ export function screwPositions(doc: Doc): [number, number][] {
   ) {
     return screwCache.result
   }
-  const result: [number, number][] = []
+  let result: [number, number][] = []
   try {
     // Deep enough into the piece that heads clear an inset lid's edge, but
     // the pilot must stay inside the top-case wall band — the ridge further
     // in belongs to the bottom tray, which screws pass through, not into.
-    const inset = doc.bottom.enabled ? Math.max(0, doc.bottom.inset ?? 0) : 0
+    const inset = Math.max(0, doc.bottom.inset ?? 0)
     const e = Math.max(
       1,
       Math.min(
-        Math.max(doc.bezel.width / 2, inset + SCREW.headR + 0.6),
-        Math.max(doc.bezel.width - 1.2, doc.bezel.width / 2),
+        Math.max(doc.bezel.width / 2, inset + SCREW.cskR + 0.5),
+        deepestScrewLine(doc.bezel.width),
       ),
     )
-    for (const shell of caseShells(doc)) {
-      const spine = simplify(erode(shell.hull, e), 0.05)
-      for (const poly of spine) {
-        result.push(...sampleRing(poly[0], Math.max(20, doc.mounting.spacing)))
+    const spacing = Math.max(20, doc.mounting.spacing)
+    const boxes = bezelBoxes(doc)
+    if (boxes.length > 0) {
+      // A box case is a known rectangle, so its four corners are the screw
+      // positions — no need to rediscover them in the generated outline.
+      for (const box of boxes) result.push(...sampleBoxRect(box, e, doc.bezel, spacing))
+    } else {
+      for (const shell of caseShells(doc)) {
+        const spine = simplify(erode(shell.hull, e), 0.05)
+        for (const poly of spine) result.push(...sampleRing(poly[0], spacing))
       }
     }
+    if (doc.mirror.enabled) result = mirrorScrews(result, doc.mirror.axis)
   } catch (error) {
     console.warn('keebforge: screw placement failed', error)
   }

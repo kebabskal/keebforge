@@ -30,6 +30,8 @@ export interface ViewSettings {
   showPlate: boolean
   showFoam: boolean
   showBottom: boolean
+  /** Hiding the screws exposes the countersunk holes they sit in. */
+  showScrews: boolean
 }
 
 export const DEFAULT_VIEW: ViewSettings = {
@@ -49,6 +51,7 @@ export const DEFAULT_VIEW: ViewSettings = {
   showPlate: true,
   showFoam: true,
   showBottom: true,
+  showScrews: true,
 }
 
 // v2: re-seed everyone once with the studio-look defaults.
