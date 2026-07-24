@@ -72,11 +72,15 @@ export function capGeo(
     idx.push(last + i, center, last + ((i + 1) % n))
   }
   // Closed bottom: shadow mapping rasterizes back faces, and an open shell
-  // has none from an overhead light, so open caps cast no shadow.
+  // has none from an overhead light, so open caps cast no shadow. The disk
+  // gets its own copy of the base ring — sharing vertices with the side wall
+  // would average the wall normals toward -y and shade the bottom edge dark.
+  const bottomStart = pos.length / 3
+  for (const [x, z] of base) pos.push(x, 0, z)
   const bottomCenter = pos.length / 3
   pos.push(0, 0, 0)
   for (let i = 0; i < n; i++) {
-    idx.push(i, (i + 1) % n, bottomCenter)
+    idx.push(bottomStart + i, bottomStart + ((i + 1) % n), bottomCenter)
   }
 
   const geo = new THREE.BufferGeometry()
