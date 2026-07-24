@@ -5,25 +5,162 @@
 }
 
 header {
-  padding: 1rem 1.5rem;
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid #262833;
 }
 
 header h1 {
   margin: 0;
-  font-size: 1.5rem;
+  font-size: 1.15rem;
   letter-spacing: 0.02em;
 }
 
-header p {
-  margin: 0.25rem 0 0;
-  opacity: 0.6;
-}
-
-.scene {
+main {
   flex: 1;
+  display: flex;
   min-height: 0;
 }
 
-.scene canvas {
+/* Toolbar */
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.toolbar button,
+.toolbar select,
+.inspector select {
+  font: inherit;
+  font-size: 0.85rem;
+  color: var(--text);
+  background: #22242e;
+  border: 1px solid #32353f;
+  border-radius: 6px;
+  padding: 0.3rem 0.7rem;
+  cursor: pointer;
+}
+
+.toolbar button:hover:not(:disabled) {
+  background: #2b2e3a;
+  color: var(--text-h);
+}
+
+.toolbar button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.toolbar-sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 0.15rem 0.35rem;
+  background: #2c2e38;
+}
+
+/* Editor canvas */
+
+.editor {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  overflow: hidden;
+}
+
+.editor canvas {
   display: block;
+  touch-action: none;
+}
+
+.select-band {
+  display: none;
+  position: absolute;
+  pointer-events: none;
+  border: 1px solid #6aa6ff;
+  background: rgba(106, 166, 255, 0.12);
+}
+
+/* Inspector */
+
+.inspector {
+  width: 270px;
+  flex-shrink: 0;
+  padding: 1rem;
+  border-left: 1px solid #262833;
+  overflow-y: auto;
+  font-size: 0.85rem;
+}
+
+.inspector h2 {
+  margin: 0 0 0.75rem;
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: var(--text-h);
+}
+
+.inspector h3 {
+  margin: 1.25rem 0 0.35rem;
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--text-h);
+}
+
+.field-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.5rem 0.6rem;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.field span {
+  opacity: 0.65;
+  font-size: 0.75rem;
+}
+
+.field input,
+.field select {
+  font: inherit;
+  color: var(--text-h);
+  background: #1c1e26;
+  border: 1px solid #32353f;
+  border-radius: 6px;
+  padding: 0.3rem 0.5rem;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.field input:focus,
+.field select:focus {
+  outline: none;
+  border-color: #6aa6ff;
+}
+
+.hint {
+  opacity: 0.65;
+  line-height: 1.5;
+  margin: 0.5rem 0;
+  padding-left: 1rem;
+}
+
+p.hint {
+  padding-left: 0;
+}
+
+kbd {
+  font-family: inherit;
+  font-size: 0.78rem;
+  background: #22242e;
+  border: 1px solid #32353f;
+  border-radius: 4px;
+  padding: 0 0.3rem;
 }
