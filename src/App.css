@@ -56,6 +56,12 @@ main {
   cursor: default;
 }
 
+.toolbar button.active {
+  background: #2c3a55;
+  border-color: #6aa6ff;
+  color: var(--text-h);
+}
+
 .toolbar-sep {
   width: 1px;
   align-self: stretch;
@@ -143,6 +149,57 @@ main {
 .field select:focus {
   outline: none;
   border-color: #6aa6ff;
+}
+
+.field-check {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.field-check input {
+  width: auto;
+}
+
+.column-table {
+  margin-top: 0.6rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.column-row {
+  display: grid;
+  grid-template-columns: 2rem 1fr 1fr;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.column-row > span {
+  opacity: 0.65;
+  font-size: 0.75rem;
+}
+
+.column-head {
+  margin-bottom: 0.1rem;
+}
+
+.inspector button.wide {
+  margin-top: 1rem;
+  width: 100%;
+  font: inherit;
+  font-size: 0.85rem;
+  color: var(--text);
+  background: #22242e;
+  border: 1px solid #32353f;
+  border-radius: 6px;
+  padding: 0.35rem 0.7rem;
+  cursor: pointer;
+}
+
+.inspector button.wide:hover {
+  background: #2b2e3a;
+  color: var(--text-h);
 }
 
 .hint {
