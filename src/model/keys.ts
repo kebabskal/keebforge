@@ -48,10 +48,19 @@ export interface MirrorSettings {
   axis: number
 }
 
+export interface PlateSettings {
+  /** Margin around each key's pitch area when generating the plate/foam
+   * outline, mm. */
+  padding: number
+}
+
+export const DEFAULT_PLATE: PlateSettings = { padding: 3 }
+
 export interface Doc {
   keys: Key[]
   groups: Group[]
   mirror: MirrorSettings
+  plate: PlateSettings
 }
 
 /** Switch pitch (center-to-center spacing) and keycap size per switch type, mm. */
@@ -276,5 +285,6 @@ export function defaultDoc(): Doc {
     keys,
     groups: [cluster, thumbs],
     mirror: { enabled: true, axis: 6 * U },
+    plate: { ...DEFAULT_PLATE },
   }
 }

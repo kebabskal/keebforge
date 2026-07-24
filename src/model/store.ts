@@ -16,6 +16,8 @@ import {
   type Key,
   type KeyType,
   type MirrorSettings,
+  type PlateSettings,
+  DEFAULT_PLATE,
 } from './keys'
 
 const STORAGE_KEY = 'keebforge.doc.v1'
@@ -59,6 +61,7 @@ export interface DocState extends Doc {
   updateGroup: (id: string, patch: Partial<Omit<Group, 'id' | 'layout'>>) => void
   updateGroupLayout: (id: string, layout: GroupLayout) => void
   setMirror: (patch: Partial<MirrorSettings>) => void
+  setPlate: (patch: Partial<PlateSettings>) => void
 
   /** Transient transform: begin snapshots the doc, transform applies patches
    * relative to that snapshot (so drags don't accumulate error), end commits
@@ -168,6 +171,10 @@ function loadSaved(): Doc | null {
         parsed.mirror && typeof parsed.mirror.axis === 'number'
           ? (parsed.mirror as MirrorSettings)
           : { enabled: false, axis: 6 * U },
+      plate:
+        parsed.plate && typeof parsed.plate.padding === 'number'
+          ? (parsed.plate as PlateSettings)
+          : { ...DEFAULT_PLATE },
     }
   } catch {
     return null
@@ -178,7 +185,7 @@ function loadSaved(): Doc | null {
 
 let transformSnapshot: Doc | null = null
 
-const docOf = (s: Doc): Doc => ({ keys: s.keys, groups: s.groups, mirror: s.mirror })
+const docOf = (s: Doc): Doc => ({ keys: s.keys, groups: s.groups, mirror: s.mirror, plate: s.plate })
 
 export const useDocStore = create<DocState>((set, get) => {
   const commit = (patch: Partial<Doc>) => {
@@ -202,6 +209,7 @@ export const useDocStore = create<DocState>((set, get) => {
       keys,
       groups,
       mirror: patch.mirror ?? state.mirror,
+      plate: patch.plate ?? state.plate,
       past: [...state.past.slice(-MAX_HISTORY + 1), prev],
       future: [],
       selection: new Set([...state.selection].filter((id) => alive.has(id))),
@@ -434,6 +442,10 @@ export const useDocStore = create<DocState>((set, get) => {
       commit({ mirror: { ...get().mirror, ...patch } })
     },
 
+    setPlate: (patch) => {
+      commit({ plate: { ...get().plate, ...patch } })
+    },
+
     beginTransform: () => {
       transformSnapshot = docOf(get())
     },
@@ -494,6 +506,7 @@ export const useDocStore = create<DocState>((set, get) => {
         keys: doc.keys ?? [],
         groups: doc.groups ?? [],
         mirror: doc.mirror ?? { enabled: false, axis: 6 * U },
+        plate: doc.plate ?? { ...DEFAULT_PLATE },
       })
       set({ selection: new Set() })
     },
@@ -505,14 +518,25 @@ export type { ColumnDef }
 // Autosave to localStorage, debounced.
 let saveTimer: ReturnType<typeof setTimeout> | undefined
 useDocStore.subscribe((state, prev) => {
-  if (state.keys === prev.keys && state.groups === prev.groups && state.mirror === prev.mirror)
+  if (
+    state.keys === prev.keys &&
+    state.groups === prev.groups &&
+    state.mirror === prev.mirror &&
+    state.plate === prev.plate
+  )
     return
   clearTimeout(saveTimer)
   saveTimer = setTimeout(() => {
     try {
       localStorage.setItem(
         STORAGE_KEY,
-        JSON.stringify({ version: 2, keys: state.keys, groups: state.groups, mirror: state.mirror }),
+        JSON.stringify({
+          version: 3,
+          keys: state.keys,
+          groups: state.groups,
+          mirror: state.mirror,
+          plate: state.plate,
+        }),
       )
     } catch {
       // Storage full or unavailable — autosave is best-effort.

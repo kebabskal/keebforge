@@ -7,6 +7,8 @@ import {
   type KeyType,
 } from '../model/keys'
 import { groupMap, useDocStore } from '../model/store'
+import { FOAM_CLEARANCE, plateWithCutouts } from '../model/outline'
+import { downloadText, toDXF } from '../export/dxf'
 
 const fmt = (v: number) => String(Math.round(v * 1000) / 1000)
 
@@ -199,7 +201,15 @@ function GroupPanel({ group }: { group: Group }) {
 function DocumentPanel() {
   const mirror = useDocStore((s) => s.mirror)
   const setMirror = useDocStore((s) => s.setMirror)
+  const plate = useDocStore((s) => s.plate)
+  const setPlate = useDocStore((s) => s.setPlate)
   const keyCount = useDocStore((s) => s.keys.length)
+
+  const exportDXF = (clearance: number, filename: string) => {
+    const { keys, groups, mirror, plate } = useDocStore.getState()
+    const shapes = plateWithCutouts({ keys, groups, mirror, plate }, clearance)
+    downloadText(filename, toDXF(shapes))
+  }
 
   return (
     <>
@@ -222,6 +232,26 @@ function DocumentPanel() {
           step={1}
           onCommit={(axis) => setMirror({ axis })}
         />
+      </div>
+      <h3>Plate &amp; foam</h3>
+      <div className="field-grid">
+        <NumberField
+          label="Edge padding (mm)"
+          value={plate.padding}
+          step={0.5}
+          onCommit={(padding) => setPlate({ padding: Math.max(0, padding) })}
+        />
+      </div>
+      <p className="hint">
+        The plate is the union of all key areas plus padding, with per-switch
+        cutouts (14 mm MX, 13.8 mm Choc). Foam adds {FOAM_CLEARANCE} mm cutout
+        clearance. Check the 3D view, then export for CAD:
+      </p>
+      <div className="button-row">
+        <button onClick={() => exportDXF(0, 'keebforge-plate.dxf')}>Plate DXF</button>
+        <button onClick={() => exportDXF(FOAM_CLEARANCE, 'keebforge-foam.dxf')}>
+          Foam DXF
+        </button>
       </div>
       <h3>Shortcuts</h3>
       <ul className="hint">
