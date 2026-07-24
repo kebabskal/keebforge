@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import {
+  DEFAULT_TENT,
   isKeyMirrored,
   keyWorldXF,
   type Group,
@@ -200,19 +201,29 @@ function GroupPanel({ group }: { group: Group }) {
               </select>
             </label>
             {layout.kind === 'stack' && (
-              <NumberField
-                label="Gap (mm)"
-                value={layout.gap}
-                step={0.5}
-                onCommit={(gap) => updateGroupLayout(group.id, { ...layout, gap })}
-              />
+              <>
+                <NumberField
+                  label="Gap (mm)"
+                  value={layout.gap}
+                  step={0.5}
+                  onCommit={(gap) => updateGroupLayout(group.id, { ...layout, gap })}
+                />
+                <NumberField
+                  label="Curve (°/key)"
+                  value={layout.curve ?? 0}
+                  step={1}
+                  onCommit={(curve) => updateGroupLayout(group.id, { ...layout, curve })}
+                />
+              </>
             )}
           </div>
           {layout.kind === 'stack' && (
             <p className="hint">
               Keys pack along the {layout.axis === 'x' ? 'row' : 'column'} in
-              order, each taking up its own size. Drag a key within the stack
-              to reorder; resizing re-packs automatically.
+              order, each taking up its own size. Curve fans the stack that
+              many degrees per key (a thumb arc) and overrides key rotations.
+              Drag a key within the stack to reorder; resizing re-packs
+              automatically.
             </p>
           )}
         </>
@@ -305,8 +316,9 @@ function DocumentPanel() {
   const setBezel = useDocStore((s) => s.setBezel)
   const tilt = useDocStore((s) => s.tilt)
   const setTilt = useDocStore((s) => s.setTilt)
-  const colors = useDocStore((s) => s.colors)
-  const setColors = useDocStore((s) => s.setColors)
+  const materials = useDocStore((s) => s.materials)
+  const setMaterial = useDocStore((s) => s.setMaterial)
+  const setMaterialsLinked = useDocStore((s) => s.setMaterialsLinked)
   const view = useViewSettings()
   const keyCount = useDocStore((s) => s.keys.length)
   const mirroredCount = useDocStore((s) =>
@@ -316,9 +328,9 @@ function DocumentPanel() {
   )
 
   const exportDXF = (clearance: number, filename: string) => {
-    const { keys, groups, mirror, plate, bezel, tilt, colors } = useDocStore.getState()
+    const { keys, groups, mirror, plate, bezel, tilt, materials } = useDocStore.getState()
     const shapes = plateWithCutouts(
-      { keys, groups, mirror, plate, bezel, tilt, colors },
+      { keys, groups, mirror, plate, bezel, tilt, materials },
       clearance,
     )
     downloadText(filename, toDXF(shapes))
@@ -331,6 +343,14 @@ function DocumentPanel() {
         {keyCount} keys
         {mirror.enabled ? ` (${keyCount + mirroredCount} with mirror)` : ''}
       </p>
+      <div className="button-row">
+        <button
+          onClick={() => useDocStore.getState().applyAlphaLabels()}
+          title="QWERTY onto the column structure: 5 alpha columns per hand hugging the middle, digits on a 4th row; thumbs and extra pinky columns are left alone"
+        >
+          Auto-label alphas
+        </button>
+      </div>
       <div className="field-grid">
         <label className="field field-check">
           <span>Mirror</span>
@@ -346,6 +366,34 @@ function DocumentPanel() {
           step={1}
           onCommit={(axis) => setMirror({ axis })}
         />
+        <label
+          className="field field-check"
+          title="Separate case per half instead of one mono-block"
+        >
+          <span>Split case</span>
+          <input
+            type="checkbox"
+            disabled={!mirror.enabled}
+            checked={mirror.enabled && mirror.split === true}
+            onChange={(e) => setMirror({ split: e.target.checked })}
+          />
+        </label>
+        {mirror.enabled && mirror.split === true && (
+          <>
+            <NumberField
+              label="Tent (°)"
+              value={mirror.tent ?? DEFAULT_TENT}
+              step={1}
+              onCommit={(tent) => setMirror({ tent })}
+            />
+            <NumberField
+              label="Rotation (°)"
+              value={mirror.rotation ?? 0}
+              step={1}
+              onCommit={(rotation) => setMirror({ rotation })}
+            />
+          </>
+        )}
         <NumberField
           label="Tilt (°)"
           value={tilt}
@@ -355,7 +403,8 @@ function DocumentPanel() {
       </div>
       <p className="hint">
         Tilt is the typing angle shown in 3D: positive raises the back edge,
-        pivoting on the front.
+        pivoting on the front. A split case gives each half its own outlines,
+        tented about the outer edges.
       </p>
       <h3>Plate &amp; foam</h3>
       <div className="field-grid">
@@ -422,31 +471,111 @@ function DocumentPanel() {
           step={0.25}
           onCommit={(bevel) => setBezel({ bevel: Math.max(0, bevel) })}
         />
+        <NumberField
+          label="Margin top (mm)"
+          value={bezel.marginTop ?? 0}
+          step={1}
+          onCommit={(v) => setBezel({ marginTop: Math.max(0, v) })}
+        />
+        <NumberField
+          label="Margin bottom (mm)"
+          value={bezel.marginBottom ?? 0}
+          step={1}
+          onCommit={(v) => setBezel({ marginBottom: Math.max(0, v) })}
+        />
+        {mirror.enabled ? (
+          <NumberField
+            label="Margin side (mm)"
+            value={bezel.marginLeft ?? 0}
+            step={1}
+            onCommit={(v) =>
+              setBezel({ marginLeft: Math.max(0, v), marginRight: Math.max(0, v) })
+            }
+          />
+        ) : (
+          <>
+            <NumberField
+              label="Margin left (mm)"
+              value={bezel.marginLeft ?? 0}
+              step={1}
+              onCommit={(v) => setBezel({ marginLeft: Math.max(0, v) })}
+            />
+            <NumberField
+              label="Margin right (mm)"
+              value={bezel.marginRight ?? 0}
+              step={1}
+              onCommit={(v) => setBezel({ marginRight: Math.max(0, v) })}
+            />
+          </>
+        )}
       </div>
       <p className="hint">
         A rim around the keycap opening: tight follows the keycap contour, box
         is a rectangular frame. Outset is the gap around keycaps, height is
         above the plate top.
       </p>
-      <h3>Colors</h3>
-      <div className="field-grid">
-        <ColorField
-          label="Case"
-          value={colors.case}
-          onCommit={(v) => setColors({ case: v })}
+      <h3>Materials</h3>
+      <label className="field field-check">
+        <span>Link (one material for everything)</span>
+        <input
+          type="checkbox"
+          checked={materials.linked}
+          onChange={(e) => setMaterialsLinked(e.target.checked)}
         />
-        <ColorField
-          label="Caps"
-          value={colors.cap}
-          onCommit={(v) => setColors({ cap: v })}
-        />
-        <ColorField
-          label="Accent caps"
-          value={colors.capAccent}
-          onCommit={(v) => setColors({ capAccent: v })}
-        />
+      </label>
+      <div className="material-table">
+        <div className="material-row material-head">
+          <span />
+          <span />
+          <span>Rough</span>
+          <span>Spec</span>
+        </div>
+        {(materials.linked
+          ? ([['case', 'All']] as const)
+          : ([
+              ['plate', 'Plate'],
+              ['case', 'Case'],
+              ['cap', 'Caps'],
+              ['capAccent', 'Accent'],
+            ] as const)
+        ).map(([slot, label]) => {
+          const m = materials[slot]
+          const clamp01 = (v: number) => Math.max(0, Math.min(1, v))
+          return (
+            <div className="material-row" key={slot}>
+              <span>{label}</span>
+              <input
+                type="color"
+                value={m.color}
+                onChange={(e) => {
+                  const color = e.target.value
+                  coalesceUndo(`mat-${slot}`, () => setMaterial(slot, { color }))
+                }}
+              />
+              <NumberField
+                label=""
+                value={m.roughness}
+                step={0.05}
+                onCommit={(roughness) =>
+                  setMaterial(slot, { roughness: clamp01(roughness) })
+                }
+              />
+              <NumberField
+                label=""
+                value={m.specular}
+                step={0.05}
+                onCommit={(specular) =>
+                  setMaterial(slot, { specular: clamp01(specular) })
+                }
+              />
+            </div>
+          )
+        })}
       </div>
-      <p className="hint">Unlabeled keys use the accent color.</p>
+      <p className="hint">
+        Roughness blurs reflections (0 gloss – 1 matte); specular sets how
+        strongly the surface reflects. Unlabeled keys use the accent material.
+      </p>
       <h3>3D view</h3>
       <div className="field-grid">
         <NumberField
@@ -496,6 +625,43 @@ function DocumentPanel() {
           step={0.1}
           onCommit={(ambient) => view.update({ ambient: Math.max(0, ambient) })}
         />
+        <NumberField
+          label="Shadow blur"
+          value={view.shadowBlur}
+          step={1}
+          onCommit={(shadowBlur) =>
+            view.update({ shadowBlur: Math.max(1, Math.min(25, shadowBlur)) })
+          }
+        />
+        <label className="field field-check">
+          <span>SSAO</span>
+          <input
+            type="checkbox"
+            checked={view.ssao}
+            onChange={(e) => view.update({ ssao: e.target.checked })}
+          />
+        </label>
+      </div>
+      <h3>Show parts</h3>
+      <div className="field-grid">
+        {(
+          [
+            ['showCaps', 'Keycaps'],
+            ['showSwitches', 'Switches'],
+            ['showCase', 'Case'],
+            ['showPlate', 'Plate'],
+            ['showFoam', 'Foam'],
+          ] as const
+        ).map(([field, label]) => (
+          <label className="field field-check" key={field}>
+            <span>{label}</span>
+            <input
+              type="checkbox"
+              checked={view[field]}
+              onChange={(e) => view.update({ [field]: e.target.checked })}
+            />
+          </label>
+        ))}
       </div>
       <p className="hint">
         Camera and lighting are per-browser view settings; colors are part of
@@ -524,6 +690,7 @@ function DocumentPanel() {
       <h3>Shortcuts</h3>
       <ul className="hint">
         <li>Click — select key's group; <kbd>Alt</kbd>-click — single key</li>
+        <li><kbd>Shift</kbd>-drag — constrain movement to one axis</li>
         <li><kbd>Ctrl+G</kbd> / <kbd>Ctrl+Shift+G</kbd> — group / ungroup</li>
         <li><kbd>Ctrl+D</kbd> — duplicate selection</li>
         <li><kbd>R</kbd> / <kbd>Shift+R</kbd> — rotate ±15°</li>
@@ -622,6 +789,14 @@ export function Inspector() {
             type="checkbox"
             checked={primary.mirror !== false}
             onChange={(e) => updateSelected({ mirror: e.target.checked })}
+          />
+        </label>
+        <label className="field field-check" title="Spacebar/modifier-style rounded top">
+          <span>Convex cap</span>
+          <input
+            type="checkbox"
+            checked={primary.convex === true}
+            onChange={(e) => updateSelected({ convex: e.target.checked })}
           />
         </label>
       </div>

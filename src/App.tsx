@@ -9,6 +9,19 @@ import './App.css'
 // Remembered across view switches within the session.
 let lastSplit = 0.55
 
+type ViewMode = '2d' | '3d' | 'split'
+const VIEW_KEY = 'keebforge.viewmode'
+
+function initialView(): ViewMode {
+  try {
+    const saved = localStorage.getItem(VIEW_KEY)
+    if (saved === '2d' || saved === '3d' || saved === 'split') return saved
+  } catch {
+    // fall through to default
+  }
+  return 'split'
+}
+
 /** Top/bottom panes with a draggable divider; fraction is the top pane's
  * share of the height. Both canvases watch their wrapper with a
  * ResizeObserver, so resizing the panes is enough. */
@@ -41,7 +54,15 @@ function SplitView({ top, bottom }: { top: ReactNode; bottom: ReactNode }) {
 }
 
 export default function App() {
-  const [view, setView] = useState<'2d' | '3d' | 'split'>('2d')
+  const [view, setViewState] = useState<ViewMode>(initialView)
+  const setView = (v: ViewMode) => {
+    setViewState(v)
+    try {
+      localStorage.setItem(VIEW_KEY, v)
+    } catch {
+      // best-effort persistence
+    }
+  }
   const theme = useTheme((s) => s.theme)
   const toggleTheme = useTheme((s) => s.toggle)
 

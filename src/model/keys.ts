@@ -20,6 +20,8 @@ export interface Key {
   row?: number
   /** Include this key in the mirrored half (default true). */
   mirror?: boolean
+  /** Convex (spacebar/modifier-style) cap top instead of the concave dish. */
+  convex?: boolean
 }
 
 export interface ColumnDef {
@@ -36,8 +38,10 @@ export type GroupLayout =
   | { kind: 'free' }
   | { kind: 'columns'; rows: number; columns: ColumnDef[]; keyType: KeyType }
   /** Auto layout: pack the group's keys along one axis, each taking up its
-   * pitch-area extent plus `gap` mm between neighbours. */
-  | { kind: 'stack'; axis: 'x' | 'y'; gap: number }
+   * pitch-area extent plus `gap` mm between neighbours. `curve` fans the
+   * stack like splay does for columns: each key turns that many degrees
+   * relative to its neighbour, and the packing direction follows the fan. */
+  | { kind: 'stack'; axis: 'x' | 'y'; gap: number; curve?: number }
 
 /** A group of keys with its own frame. Groups can nest via parentId. */
 export interface Group {
@@ -58,7 +62,17 @@ export interface MirrorSettings {
   enabled: boolean
   /** X position of the vertical mirror axis, mm (world). */
   axis: number
+  /** Split case: each half gets its own plate/bezel outlines instead of one
+   * mono-block spanning both. */
+  split?: boolean
+  /** Tenting angle per half when split, degrees (3D preview). */
+  tent?: number
+  /** Yaw of each half around the vertical axis when split, degrees; positive
+   * angles the back edges inward (3D preview). */
+  rotation?: number
 }
+
+export const DEFAULT_TENT = 5
 
 export interface PlateSettings {
   /** Margin around each key's pitch area when generating the plate/foam
@@ -85,6 +99,12 @@ export interface BezelSettings {
   radiusInner: number
   /** Chamfer on the bezel's top and bottom edges (3D preview), mm. */
   bevel: number
+  /** Extra outward case margins per world direction, mm. On split cases the
+   * left/right margins apply to each half's outward edge only. */
+  marginTop: number
+  marginBottom: number
+  marginLeft: number
+  marginRight: number
 }
 
 export const DEFAULT_BEZEL: BezelSettings = {
@@ -96,24 +116,45 @@ export const DEFAULT_BEZEL: BezelSettings = {
   radiusOuter: 4,
   radiusInner: 1,
   bevel: 1.5,
+  marginTop: 0,
+  marginBottom: 0,
+  marginLeft: 0,
+  marginRight: 0,
 }
 
 /** Typing angle in degrees: positive raises the back edge. 3D-preview only
  * for now (plate/foam exports are flat projections regardless). */
 export const DEFAULT_TILT = 5
 
-/** Material colors used by the 3D preview (hex CSS colors). */
-export interface BoardColors {
-  case: string
-  cap: string
-  /** Unlabeled keys (thumbs etc.) render in the accent color. */
-  capAccent: string
+/** One 3D-preview material: color plus surface finish. `specular` (0–1)
+ * drives how mirror-like the surface reflects (metalness in the PBR model);
+ * `roughness` (0–1) how blurred those reflections are. */
+export interface BoardMaterial {
+  color: string
+  roughness: number
+  specular: number
 }
 
-export const DEFAULT_COLORS: BoardColors = {
-  case: '#454b58',
-  cap: '#e7e3d7',
-  capAccent: '#5c7d6e',
+export type MaterialSlot = 'plate' | 'case' | 'cap' | 'capAccent'
+
+export const MATERIAL_SLOTS: MaterialSlot[] = ['plate', 'case', 'cap', 'capAccent']
+
+export interface BoardMaterials {
+  /** When set, editing any material applies to every slot. */
+  linked: boolean
+  plate: BoardMaterial
+  case: BoardMaterial
+  cap: BoardMaterial
+  /** Unlabeled keys (thumbs etc.) render in the accent material. */
+  capAccent: BoardMaterial
+}
+
+export const DEFAULT_MATERIALS: BoardMaterials = {
+  linked: false,
+  plate: { color: '#878d99', roughness: 0.38, specular: 0.85 },
+  case: { color: '#454b58', roughness: 0.45, specular: 0.55 },
+  cap: { color: '#e7e3d7', roughness: 0.85, specular: 0 },
+  capAccent: { color: '#5c7d6e', roughness: 0.85, specular: 0 },
 }
 
 export interface Doc {
@@ -123,7 +164,7 @@ export interface Doc {
   plate: PlateSettings
   bezel: BezelSettings
   tilt: number
-  colors: BoardColors
+  materials: BoardMaterials
 }
 
 /** Switch pitch (center-to-center spacing) and keycap size per switch type, mm. */
@@ -360,28 +401,60 @@ export function columnSlots(layout: Extract<GroupLayout, { kind: 'columns' }>): 
  * current order along that axis (left-to-right for x, top-to-bottom for y),
  * each taking its pitch-area extent plus the layout gap, centered on the
  * group origin. Rotated keys take up their rotated bounding extent, so a
- * gap of 0 keeps footprints tangent exactly like a column cluster does. */
+ * gap of 0 keeps footprints tangent exactly like a column cluster does.
+ * With a non-zero curve, keys additionally get rotations fanning around the
+ * middle of the stack, and the packing direction follows the fan (a thumb
+ * arc); keys' own rotations are overridden in that case. */
 export function stackPositions(
   layout: Extract<GroupLayout, { kind: 'stack' }>,
   members: Key[],
-): Map<string, { x: number; y: number }> {
+): Map<string, { x: number; y: number; r?: number }> {
   const ordered = [...members].sort((a, b) =>
     layout.axis === 'x' ? a.x - b.x : b.y - a.y,
   )
-  const extents = ordered.map((k) => {
+  const curve = layout.curve ?? 0
+  const n = ordered.length
+  const angleOf = (i: number) => (i - (n - 1) / 2) * curve
+  const extents = ordered.map((k, i) => {
     const { w, h } = keySize(k)
-    const cos = Math.abs(Math.cos(k.r * DEG))
-    const sin = Math.abs(Math.sin(k.r * DEG))
+    const r = curve !== 0 ? angleOf(i) : k.r
+    const cos = Math.abs(Math.cos(r * DEG))
+    const sin = Math.abs(Math.sin(r * DEG))
     return layout.axis === 'x' ? w * cos + h * sin : w * sin + h * cos
   })
-  const total =
-    extents.reduce((s, e) => s + e, 0) + layout.gap * Math.max(0, ordered.length - 1)
-  const out = new Map<string, { x: number; y: number }>()
-  let cursor = -total / 2
+  const out = new Map<string, { x: number; y: number; r?: number }>()
+  if (curve === 0) {
+    const total =
+      extents.reduce((s, e) => s + e, 0) + layout.gap * Math.max(0, n - 1)
+    let cursor = -total / 2
+    ordered.forEach((k, i) => {
+      const center = cursor + extents[i] / 2
+      out.set(k.id, layout.axis === 'x' ? { x: center, y: 0 } : { x: 0, y: -center })
+      cursor += extents[i] + layout.gap
+    })
+    return out
+  }
+  // Curved: chain the centers, advancing between neighbours along the mean
+  // of their fan angles, then re-center on the group origin.
+  const centers: { x: number; y: number }[] = [{ x: 0, y: 0 }]
+  for (let i = 1; i < n; i++) {
+    const step = extents[i - 1] / 2 + layout.gap + extents[i] / 2
+    const mid = ((angleOf(i - 1) + angleOf(i)) / 2) * DEG
+    const prev = centers[i - 1]
+    const dir =
+      layout.axis === 'x'
+        ? { x: Math.cos(mid), y: Math.sin(mid) }
+        : { x: Math.sin(mid), y: -Math.cos(mid) }
+    centers.push({ x: prev.x + dir.x * step, y: prev.y + dir.y * step })
+  }
+  const cx = centers.reduce((s, c) => s + c.x, 0) / n
+  const cy = centers.reduce((s, c) => s + c.y, 0) / n
   ordered.forEach((k, i) => {
-    const center = cursor + extents[i] / 2
-    out.set(k.id, layout.axis === 'x' ? { x: center, y: 0 } : { x: 0, y: -center })
-    cursor += extents[i] + layout.gap
+    out.set(k.id, {
+      x: centers[i].x - cx,
+      y: centers[i].y - cy,
+      r: Math.round(angleOf(i) * 100) / 100,
+    })
   })
   return out
 }
@@ -460,6 +533,6 @@ export function defaultDoc(): Doc {
     plate: { ...DEFAULT_PLATE },
     bezel: { ...DEFAULT_BEZEL },
     tilt: DEFAULT_TILT,
-    colors: { ...DEFAULT_COLORS },
+    materials: structuredClone(DEFAULT_MATERIALS),
   }
 }

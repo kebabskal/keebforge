@@ -1,7 +1,18 @@
 import { useEffect, useRef } from 'react'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
-import { capSize, isKeyMirrored, keyWorldXF, mirrorXF, type XForm } from '../model/keys'
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js'
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js'
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js'
+import { SSAOPass } from 'three/addons/postprocessing/SSAOPass.js'
+import {
+  capSize,
+  DEFAULT_TENT,
+  isKeyMirrored,
+  keyWorldXF,
+  mirrorXF,
+  type XForm,
+} from '../model/keys'
 import {
   bezelShape,
   FOAM_CLEARANCE,
@@ -12,27 +23,14 @@ import {
 } from '../model/outline'
 import { groupMap, useDocStore } from '../model/store'
 import { useTheme } from '../ui/theme'
+import { capGeo, CAP_PROFILE, frustumGeo } from './capGeometry'
 import { useViewSettings } from './viewSettings'
 
 /** Simplified switch/cap dimensions per type, mm (heights above plate top). */
 const SWITCH_3D = {
-  mx: { housingBase: 15.6, housingTop: 11, housingH: 5.6, capBottom: 6, capH: 7.5, capTaper: 4.5 },
-  choc: { housingBase: 15, housingTop: 13, housingH: 2.4, capBottom: 3.5, capH: 3.2, capTaper: 3 },
+  mx: { housingBase: 15.6, housingTop: 11, housingH: 5.6, capBottom: 6 },
+  choc: { housingBase: 15, housingTop: 13, housingH: 2.4, capBottom: 3.5 },
 } as const
-
-/** Tapered box: bottom bw×bd at y=0, top tw×td at y=h. */
-function frustumGeo(bw: number, bd: number, tw: number, td: number, h: number) {
-  const geo = new THREE.BoxGeometry(1, 1, 1)
-  geo.translate(0, 0.5, 0)
-  const pos = geo.attributes.position as THREE.BufferAttribute
-  for (let i = 0; i < pos.count; i++) {
-    const y = pos.getY(i)
-    const top = y > 0.5
-    pos.setXYZ(i, pos.getX(i) * (top ? tw : bw), y * h, pos.getZ(i) * (top ? td : bd))
-  }
-  geo.computeVertexNormals()
-  return geo
-}
 
 function shapesFromPolygons(mp: MultiPolygon): THREE.Shape[] {
   // Shapes close implicitly; the rings' duplicated closing point (and any
@@ -71,13 +69,29 @@ export function Preview3D() {
     const renderer = new THREE.WebGLRenderer({ antialias: true })
     renderer.setPixelRatio(window.devicePixelRatio)
     renderer.shadowMap.enabled = true
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap
+    // VSM blurs the shadow map itself, giving real soft penumbras.
+    renderer.shadowMap.type = THREE.VSMShadowMap
     wrap.appendChild(renderer.domElement)
 
     const scene = new THREE.Scene()
     scene.background = new THREE.Color(light ? 0xe6e9ef : 0x16171d)
 
     const camera = new THREE.PerspectiveCamera(useViewSettings.getState().fov, 1, 1, 6000)
+
+    // Post-processing: multisampled render target so AA survives, SSAO for
+    // contact shading, OutputPass for the sRGB conversion.
+    const composer = new EffectComposer(
+      renderer,
+      new THREE.WebGLRenderTarget(1, 1, { samples: 4, type: THREE.HalfFloatType }),
+    )
+    composer.addPass(new RenderPass(scene, camera))
+    const ssaoPass = new SSAOPass(scene, camera, 1, 1)
+    ssaoPass.kernelRadius = 8
+    ssaoPass.minDistance = 0.0002
+    ssaoPass.maxDistance = 0.01
+    composer.addPass(ssaoPass)
+    composer.addPass(new OutputPass())
+
     const controls = new OrbitControls(camera, renderer.domElement)
     controls.enableDamping = true
     controls.dampingFactor = 0.08
@@ -89,6 +103,13 @@ export function Preview3D() {
     sun.position.set(80, 160, 100)
     sun.castShadow = true
     sun.shadow.mapSize.set(2048, 2048)
+    sun.shadow.radius = 5
+    sun.shadow.blurSamples = 12
+    sun.shadow.bias = -0.0002
+    // Cover all receivers (table, backdrop): fragments beyond the shadow
+    // camera's depth range otherwise read as a shadow seam under VSM.
+    sun.shadow.camera.near = 1
+    sun.shadow.camera.far = 4000
     scene.add(sun)
     const fill = new THREE.DirectionalLight(0x9fb4e8, 0.5)
     fill.position.set(-60, 80, -90)
@@ -147,10 +168,27 @@ export function Preview3D() {
       cyclo.geometry = geo
     }
 
+    // Meshes grouped by part, so visibility toggles apply without a rebuild.
+    // Repopulated on every rebuild.
+    const partMeshes: Record<
+      'caps' | 'switches' | 'case' | 'plate' | 'foam',
+      THREE.Object3D[]
+    > = { caps: [], switches: [], case: [], plate: [], foam: [] }
+
     const applyViewSettings = () => {
       const v = useViewSettings.getState()
       camera.fov = v.fov
       camera.updateProjectionMatrix()
+      const shown = {
+        caps: v.showCaps,
+        switches: v.showSwitches,
+        case: v.showCase,
+        plate: v.showPlate,
+        foam: v.showFoam,
+      }
+      for (const part of Object.keys(partMeshes) as (keyof typeof partMeshes)[]) {
+        for (const mesh of partMeshes[part]) mesh.visible = shown[part]
+      }
       sun.intensity = v.keyLight
       const az = (v.lightAngle * Math.PI) / 180
       sun.position.set(
@@ -163,6 +201,9 @@ export function Preview3D() {
       ground.visible = v.backdrop === 'table'
       cyclo.visible = v.backdrop === 'studio'
       ;(cyclo.material as THREE.MeshStandardMaterial).color.set(v.backdropColor)
+      // VSM needs at least a little blur or its variance test bands visibly.
+      sun.shadow.radius = Math.max(1, v.shadowBlur)
+      ssaoPass.enabled = v.ssao
     }
 
     const materials = {
@@ -203,6 +244,15 @@ export function Preview3D() {
       }
       return geo
     }
+    const cachedCap = (type: 'mx' | 'choc', w: number, h: number, convex: boolean) => {
+      const key = `cap:${type}:${w.toFixed(2)}x${h.toFixed(2)}:${convex ? 'x' : 'c'}`
+      let geo = geoCache.get(key)
+      if (!geo) {
+        geo = capGeo(w, h, CAP_PROFILE[type], convex)
+        geoCache.set(key, geo)
+      }
+      return geo
+    }
 
     let bounds = { cx: 0, cz: 0, radius: 120 }
 
@@ -216,13 +266,22 @@ export function Preview3D() {
         plate: state.plate,
         bezel: state.bezel,
         tilt: state.tilt,
-        colors: state.colors,
+        materials: state.materials,
       }
       const groups = groupMap(doc.groups)
 
-      materials.bezel.color.set(doc.colors.case)
-      materials.cap.color.set(doc.colors.cap)
-      materials.capAccent.color.set(doc.colors.capAccent)
+      const applyMaterial = (
+        target: THREE.MeshStandardMaterial,
+        m: { color: string; roughness: number; specular: number },
+      ) => {
+        target.color.set(m.color)
+        target.roughness = m.roughness
+        target.metalness = m.specular
+      }
+      applyMaterial(materials.plate, doc.materials.plate)
+      applyMaterial(materials.bezel, doc.materials.case)
+      applyMaterial(materials.cap, doc.materials.cap)
+      applyMaterial(materials.capAccent, doc.materials.capAccent)
 
       // Front edge of the board (min 2D y across outlines) — the tilt pivot.
       let frontY = Infinity
@@ -232,11 +291,47 @@ export function Preview3D() {
         }
       }
 
+      // Split case: each half is a nested pair of groups — the inner one for
+      // yaw about the half's center, the outer one for tenting about the
+      // half's outer bottom edge (inner edges rise toward the middle).
+      const split = doc.mirror.enabled && doc.mirror.split === true
+      const axis = doc.mirror.axis
+      const makeHalf = () => {
+        const tent = new THREE.Group()
+        const yaw = new THREE.Group()
+        tent.add(yaw)
+        return { tent, yaw }
+      }
+      const halves = { left: makeHalf(), right: makeHalf() }
+      const outerX = { left: Infinity, right: -Infinity }
+      const sideBounds = {
+        left: { minX: Infinity, maxX: -Infinity, minZ: Infinity, maxZ: -Infinity },
+        right: { minX: Infinity, maxX: -Infinity, minZ: Infinity, maxZ: -Infinity },
+      }
+      // Footprint samples per half (x, z), used to keep yawed halves apart.
+      const sidePts = { left: [] as [number, number][], right: [] as [number, number][] }
+      if (split) board.add(halves.left.tent, halves.right.tent)
+      const targetFor = (x: number) => {
+        if (!split) return board
+        const side = x < axis ? 'left' : 'right'
+        return halves[side].yaw
+      }
+      const noteX = (x0: number, x1: number) => {
+        if (!split) return
+        if ((x0 + x1) / 2 < axis) outerX.left = Math.min(outerX.left, x0)
+        else outerX.right = Math.max(outerX.right, x1)
+      }
+
       // Plate and foam, extruded from the generated outlines.
       // `bevel` chamfers the top and bottom edges inward (holes chamfer
       // outward), keeping the outline footprint unchanged.
+      for (const part of Object.keys(partMeshes) as (keyof typeof partMeshes)[]) {
+        partMeshes[part] = []
+      }
+
       const addSlab = (
         mp: MultiPolygon,
+        part: 'plate' | 'foam' | 'case',
         thickness: number,
         y: number,
         material: THREE.Material,
@@ -244,7 +339,7 @@ export function Preview3D() {
         bevel = 0,
       ) => {
         const b = Math.max(0, Math.min(bevel, thickness / 2 - 0.05))
-        for (const shape of shapesFromPolygons(mp)) {
+        shapesFromPolygons(mp).forEach((shape, i) => {
           const geo = new THREE.ExtrudeGeometry(shape, {
             depth: thickness - 2 * b,
             bevelEnabled: b > 0,
@@ -260,17 +355,30 @@ export function Preview3D() {
           mesh.position.y = y + b
           mesh.castShadow = shadows
           mesh.receiveShadow = true
-          board.add(mesh)
-        }
+          let sMinX = Infinity
+          let sMaxX = -Infinity
+          for (const [x] of mp[i][0]) {
+            sMinX = Math.min(sMinX, x)
+            sMaxX = Math.max(sMaxX, x)
+          }
+          noteX(sMinX, sMaxX)
+          if (split) {
+            const pts = sidePts[(sMinX + sMaxX) / 2 < axis ? 'left' : 'right']
+            for (const [x, y] of mp[i][0]) pts.push([x, -y])
+          }
+          targetFor((sMinX + sMaxX) / 2).add(mesh)
+          partMeshes[part].push(mesh)
+        })
       }
       // A clipping failure should degrade to "no plate shown", not crash the
       // whole app (React unmounts the tree on uncaught render errors).
       try {
         const plateMp = plateWithCutouts(doc)
         trackFront(plateMp)
-        addSlab(plateMp, PLATE_THICKNESS, -PLATE_THICKNESS, materials.plate, true)
+        addSlab(plateMp, 'plate', PLATE_THICKNESS, -PLATE_THICKNESS, materials.plate, true)
         addSlab(
           plateWithCutouts(doc, FOAM_CLEARANCE),
+          'foam',
           FOAM_THICKNESS,
           -PLATE_THICKNESS - FOAM_THICKNESS,
           materials.foam,
@@ -283,6 +391,7 @@ export function Preview3D() {
           trackFront(bezelMp)
           addSlab(
             bezelMp,
+            'case',
             doc.bezel.height + PLATE_THICKNESS + FOAM_THICKNESS,
             -PLATE_THICKNESS - FOAM_THICKNESS,
             materials.bezel,
@@ -323,27 +432,101 @@ export function Preview3D() {
           materials.housing,
         )
         holder.add(housing)
+        partMeshes.switches.push(housing)
 
         const capMesh = new THREE.Mesh(
-          cachedFrustum(
-            `cap-${key.type}-${key.w}x${key.h}`,
-            cap.w,
-            cap.h,
-            Math.max(cap.w - dims.capTaper, 4),
-            Math.max(cap.h - dims.capTaper, 4),
-            dims.capH,
-          ),
+          cachedCap(key.type, cap.w, cap.h, key.convex === true),
           key.label ? materials.cap : materials.capAccent,
         )
         capMesh.position.y = dims.capBottom
         capMesh.castShadow = true
         holder.add(capMesh)
+        partMeshes.caps.push(capMesh)
 
-        board.add(holder)
+        noteX(world.x - 12, world.x + 12)
+        if (split) {
+          const side = world.x < axis ? 'left' : 'right'
+          const b = sideBounds[side]
+          b.minX = Math.min(b.minX, world.x)
+          b.maxX = Math.max(b.maxX, world.x)
+          b.minZ = Math.min(b.minZ, -world.y)
+          b.maxZ = Math.max(b.maxZ, -world.y)
+          sidePts[side].push([world.x - 12, -world.y], [world.x + 12, -world.y])
+        }
+        targetFor(world.x).add(holder)
         minX = Math.min(minX, world.x - 20)
         maxX = Math.max(maxX, world.x + 20)
         minZ = Math.min(minZ, -world.y - 20)
         maxZ = Math.max(maxZ, -world.y + 20)
+      }
+
+      // Yaw each half about its center (positive = backs angle inward), then
+      // tent about its outer bottom edge so the inner edges rise toward the
+      // middle like a tent.
+      if (split) {
+        const rotRad = (((doc.mirror.rotation ?? 0) * Math.PI) / 180)
+        const applyYaw = (
+          g: THREE.Group,
+          b: (typeof sideBounds)['left'],
+          theta: number,
+        ) => {
+          if (!Number.isFinite(b.minX)) return
+          const px = (b.minX + b.maxX) / 2
+          const pz = (b.minZ + b.maxZ) / 2
+          const cos = Math.cos(theta)
+          const sin = Math.sin(theta)
+          g.rotation.y = theta
+          g.position.set(
+            px - (px * cos + pz * sin),
+            0,
+            pz - (-px * sin + pz * cos),
+          )
+        }
+        applyYaw(halves.left.yaw, sideBounds.left, -rotRad)
+        applyYaw(halves.right.yaw, sideBounds.right, rotRad)
+
+        const tentRad = (((doc.mirror.tent ?? DEFAULT_TENT) * Math.PI) / 180)
+        const groundY = -PLATE_THICKNESS - FOAM_THICKNESS
+        const applyTent = (g: THREE.Group, px: number, theta: number) => {
+          if (!Number.isFinite(px)) return
+          const cos = Math.cos(theta)
+          const sin = Math.sin(theta)
+          g.rotation.z = theta
+          g.position.set(
+            px - (px * cos - groundY * sin),
+            groundY - (px * sin + groundY * cos),
+            0,
+          )
+        }
+        applyTent(halves.left.tent, outerX.left, tentRad)
+        applyTent(halves.right.tent, outerX.right, -tentRad)
+
+        // Keep the halves apart: yawing swings inner corners toward the
+        // seam, so measure each half's rotated footprint and separate them
+        // to a small clearance if they would cross.
+        const innerEdge = (side: 'left' | 'right', theta: number) => {
+          const b = sideBounds[side]
+          if (!Number.isFinite(b.minX) || sidePts[side].length === 0) return null
+          const px = (b.minX + b.maxX) / 2
+          const pz = (b.minZ + b.maxZ) / 2
+          const cos = Math.cos(theta)
+          const sin = Math.sin(theta)
+          let edge = side === 'left' ? -Infinity : Infinity
+          for (const [x, z] of sidePts[side]) {
+            const xr = px + (x - px) * cos + (z - pz) * sin
+            edge = side === 'left' ? Math.max(edge, xr) : Math.min(edge, xr)
+          }
+          return edge
+        }
+        const leftEdge = innerEdge('left', -rotRad)
+        const rightEdge = innerEdge('right', rotRad)
+        if (leftEdge !== null && rightEdge !== null) {
+          const overlap = leftEdge - rightEdge + 2
+          if (overlap > 0) {
+            halves.left.tent.position.x -= overlap / 2
+            halves.right.tent.position.x += overlap / 2
+          }
+        }
       }
 
       // Tilt the whole board about its front bottom edge, so the front stays
@@ -364,7 +547,9 @@ export function Preview3D() {
           cz: (minZ + maxZ) / 2,
           radius: Math.max(maxX - minX, maxZ - minZ) / 2 + 30,
         }
-        const size = bounds.radius + 40
+        // Generous margin: covers the table and keeps blurred caster depths
+        // away from the map edge, where they would smear into a seam.
+        const size = bounds.radius + 300
         sun.shadow.camera.left = -size
         sun.shadow.camera.right = size
         sun.shadow.camera.top = size
@@ -410,7 +595,7 @@ export function Preview3D() {
         state.plate !== last.plate ||
         state.bezel !== last.bezel ||
         state.tilt !== last.tilt ||
-        state.colors !== last.colors
+        state.materials !== last.materials
       ) {
         scheduleRebuild()
       }
@@ -421,6 +606,8 @@ export function Preview3D() {
     const resize = () => {
       const { clientWidth: w, clientHeight: h } = wrap
       renderer.setSize(w, h)
+      composer.setPixelRatio(window.devicePixelRatio)
+      composer.setSize(w, h)
       camera.aspect = w / h
       camera.updateProjectionMatrix()
     }
@@ -432,7 +619,7 @@ export function Preview3D() {
     const animate = () => {
       frame = requestAnimationFrame(animate)
       controls.update()
-      renderer.render(scene, camera)
+      composer.render()
     }
     animate()
 
@@ -450,6 +637,7 @@ export function Preview3D() {
       ;(ground.material as THREE.Material).dispose()
       cyclo.geometry?.dispose()
       ;(cyclo.material as THREE.Material).dispose()
+      composer.dispose()
       renderer.dispose()
       wrap.removeChild(renderer.domElement)
     }

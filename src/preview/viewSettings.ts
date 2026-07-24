@@ -17,6 +17,16 @@ export interface ViewSettings {
   ambient: number
   /** Key light azimuth around the board, degrees. */
   lightAngle: number
+  /** Shadow penumbra blur radius (VSM), 0 = crisp. */
+  shadowBlur: number
+  /** Screen-space ambient occlusion. */
+  ssao: boolean
+  /** Per-part visibility in the 3D preview. */
+  showCaps: boolean
+  showSwitches: boolean
+  showCase: boolean
+  showPlate: boolean
+  showFoam: boolean
 }
 
 export const DEFAULT_VIEW: ViewSettings = {
@@ -27,6 +37,13 @@ export const DEFAULT_VIEW: ViewSettings = {
   fillLight: 0.5,
   ambient: 0.75,
   lightAngle: 50,
+  shadowBlur: 5,
+  ssao: true,
+  showCaps: true,
+  showSwitches: true,
+  showCase: true,
+  showPlate: true,
+  showFoam: true,
 }
 
 const STORAGE_KEY = 'keebforge.view'
@@ -49,13 +66,9 @@ export const useViewSettings = create<ViewStore>((set, get) => ({
   ...load(),
   update: (patch) => {
     set(patch)
-    const { fov, backdrop, backdropColor, keyLight, fillLight, ambient, lightAngle } =
-      get()
+    const { update: _update, ...settings } = get()
     try {
-      localStorage.setItem(
-        STORAGE_KEY,
-        JSON.stringify({ fov, backdrop, backdropColor, keyLight, fillLight, ambient, lightAngle }),
-      )
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(settings))
     } catch {
       // best-effort persistence
     }

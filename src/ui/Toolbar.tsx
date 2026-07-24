@@ -1,6 +1,6 @@
 import { useRef } from 'react'
 import { U, type Doc, type Key } from '../model/keys'
-import { useDocStore } from '../model/store'
+import { normalizeMaterials, useDocStore } from '../model/store'
 
 const SNAP_OPTIONS = [
   { label: 'Snap: off', value: 0 },
@@ -39,11 +39,11 @@ export function Toolbar() {
   const fileRef = useRef<HTMLInputElement>(null)
 
   const exportJson = () => {
-    const { keys, groups, mirror, plate, bezel, tilt, colors } = useDocStore.getState()
+    const { keys, groups, mirror, plate, bezel, tilt, materials } = useDocStore.getState()
     const blob = new Blob(
       [
         JSON.stringify(
-          { version: 4, keys, groups, mirror, plate, bezel, tilt, colors },
+          { version: 5, keys, groups, mirror, plate, bezel, tilt, materials },
           null,
           2,
         ),
@@ -87,10 +87,7 @@ export function Toolbar() {
             ? parsed.bezel
             : undefined,
         tilt: typeof parsed.tilt === 'number' ? parsed.tilt : undefined,
-        colors:
-          parsed.colors && typeof parsed.colors.case === 'string'
-            ? parsed.colors
-            : undefined,
+        materials: normalizeMaterials(parsed.materials, parsed.colors),
       } as Partial<Doc>)
     } catch (err) {
       alert(`Could not import layout: ${err instanceof Error ? err.message : err}`)

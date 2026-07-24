@@ -282,6 +282,35 @@ main {
   cursor: pointer;
 }
 
+.material-table {
+  margin-top: 0.6rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.material-row {
+  display: grid;
+  grid-template-columns: 3.2rem 2.6rem 1fr 1fr;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.material-row > span {
+  opacity: 0.65;
+  font-size: 0.75rem;
+}
+
+.material-row input[type='color'] {
+  width: 100%;
+  height: 1.8rem;
+  padding: 0.1rem;
+  background: var(--input-bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
 .column-table {
   margin-top: 0.6rem;
   display: flex;

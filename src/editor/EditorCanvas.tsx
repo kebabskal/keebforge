@@ -392,7 +392,7 @@ export function EditorCanvas() {
           plate: state.plate,
           bezel: state.bezel,
           tilt: state.tilt,
-          colors: state.colors,
+          materials: state.materials,
         }
         const bezelMp = state.bezel.enabled ? bezelShape(doc) : []
         for (const poly of bezelMp) {
@@ -538,6 +538,8 @@ export function EditorCanvas() {
       groupsOrig: Map<string, { x: number; y: number }>
       keysOrig: Map<string, { x: number; y: number; frameR: number }>
       primaryWorld: { x: number; y: number }
+      /** Half of the primary keycap's world-x extent, for mirror-axis snap. */
+      primaryHalfW: number
       start: { x: number; y: number }
     }
     type Mode =
@@ -590,8 +592,12 @@ export function EditorCanvas() {
         keysOrig.set(key.id, { x: key.x, y: key.y, frameR: frame.r - key.r })
       }
       const primaryWorld = keyWorldXF(primary, groups)
+      const cap = capSize(primary)
+      const rad = (primaryWorld.r * Math.PI) / 180
+      const primaryHalfW =
+        (cap.w * Math.abs(Math.cos(rad)) + cap.h * Math.abs(Math.sin(rad))) / 2
       store.getState().beginTransform()
-      mode = { kind: 'drag', groupsOrig, keysOrig, primaryWorld, start }
+      mode = { kind: 'drag', groupsOrig, keysOrig, primaryWorld, primaryHalfW, start }
     }
 
     const onPointerDown = (e: PointerEvent) => {
@@ -658,9 +664,22 @@ export function EditorCanvas() {
         const pt = toMM(e.clientX, e.clientY)
         let dx = pt.x - mode.start.x
         let dy = pt.y - mode.start.y
+        // Shift constrains the drag to the dominant axis.
+        if (e.shiftKey) {
+          if (Math.abs(dx) >= Math.abs(dy)) dy = 0
+          else dx = 0
+        }
         // Snap the primary key's resulting world position, move the rest rigidly.
         dx = snap(mode.primaryWorld.x + dx) - mode.primaryWorld.x
         dy = snap(mode.primaryWorld.y + dy) - mode.primaryWorld.y
+        // A cap straddling the mirror line centers on it (shared middle key).
+        const { mirror } = store.getState()
+        if (
+          mirror.enabled &&
+          Math.abs(mode.primaryWorld.x + dx - mirror.axis) < mode.primaryHalfW
+        ) {
+          dx = mirror.axis - mode.primaryWorld.x
+        }
         const patches: TransformPatches = {
           keys: new Map(),
           groups: new Map(),

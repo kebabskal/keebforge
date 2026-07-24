@@ -3,7 +3,7 @@
 import * as THREE from 'three'
 import {
   DEFAULT_BEZEL,
-  DEFAULT_COLORS,
+  DEFAULT_MATERIALS,
   DEFAULT_PLATE,
   DEFAULT_TILT,
   U,
@@ -25,7 +25,7 @@ const doc: Doc = {
   plate: { ...DEFAULT_PLATE, ...parsed.plate },
   bezel: { ...DEFAULT_BEZEL, ...parsed.bezel },
   tilt: parsed.tilt ?? DEFAULT_TILT,
-  colors: { ...DEFAULT_COLORS, ...parsed.colors },
+  materials: structuredClone(DEFAULT_MATERIALS),
 }
 console.log(
   `${path}: ${doc.keys.length} keys, mirror=${doc.mirror.enabled}, bezel mode=${doc.bezel.mode} radius=${doc.bezel.radius}`,

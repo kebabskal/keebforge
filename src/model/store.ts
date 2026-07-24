@@ -17,13 +17,16 @@ import {
   type Group,
   type GroupLayout,
   type BezelSettings,
-  type BoardColors,
+  type BoardMaterial,
+  type BoardMaterials,
+  type MaterialSlot,
+  MATERIAL_SLOTS,
   type Key,
   type KeyType,
   type MirrorSettings,
   type PlateSettings,
   DEFAULT_BEZEL,
-  DEFAULT_COLORS,
+  DEFAULT_MATERIALS,
   DEFAULT_PLATE,
   DEFAULT_TILT,
 } from './keys'
@@ -86,6 +89,12 @@ export interface DocState extends Doc {
    * Group-aware like align. */
   distributeSelected: (axis: 'x' | 'y') => void
 
+  /** Assign QWERTY alpha labels onto the board's structure: column clusters
+   * provide exact col/row slots (with a digit row when a cluster has 4+
+   * rows); otherwise 1u keys are banded into rows geometrically. Alphas hug
+   * the middle — extra outer pinky columns are left alone, as are thumbs. */
+  applyAlphaLabels: () => void
+
   groupSelection: () => void
   ungroupSelection: () => void
   updateGroup: (id: string, patch: Partial<Omit<Group, 'id' | 'layout'>>) => void
@@ -94,7 +103,9 @@ export interface DocState extends Doc {
   setPlate: (patch: Partial<PlateSettings>) => void
   setBezel: (patch: Partial<BezelSettings>) => void
   setTilt: (deg: number) => void
-  setColors: (patch: Partial<BoardColors>) => void
+  setMaterial: (slot: MaterialSlot, patch: Partial<BoardMaterial>) => void
+  /** Toggle linked materials; enabling copies the case material everywhere. */
+  setMaterialsLinked: (linked: boolean) => void
 
   /** Transient transform: begin snapshots the doc, transform applies patches
    * relative to that snapshot (so drags don't accumulate error), end commits
@@ -264,13 +275,34 @@ function relayoutStacks(keys: Key[], groups: Group[]): Key[] {
     let changed = false
     const next = result.map((k) => {
       const p = pos.get(k.id)
-      if (!p || (k.x === p.x && k.y === p.y)) return k
+      if (!p) return k
+      const r = p.r ?? k.r
+      if (k.x === p.x && k.y === p.y && k.r === r) return k
       changed = true
-      return { ...k, x: p.x, y: p.y }
+      return { ...k, x: p.x, y: p.y, r }
     })
     if (changed) result = next
   }
   return result
+}
+
+// ---- Auto labels ----------------------------------------------------------
+
+const ALPHA_ROWS = {
+  left: [
+    ['Q', 'W', 'E', 'R', 'T'],
+    ['A', 'S', 'D', 'F', 'G'],
+    ['Z', 'X', 'C', 'V', 'B'],
+  ],
+  right: [
+    ['Y', 'U', 'I', 'O', 'P'],
+    ['H', 'J', 'K', 'L', ';'],
+    ['N', 'M', ',', '.', '/'],
+  ],
+}
+const DIGIT_ROW = {
+  left: ['1', '2', '3', '4', '5'],
+  right: ['6', '7', '8', '9', '0'],
 }
 
 // ---- Persistence ----------------------------------------------------------
@@ -288,6 +320,26 @@ export function normalizeBezel(raw: unknown): BezelSettings {
       : {}
   const { radius: _radius, ...rest } = legacy
   return { ...DEFAULT_BEZEL, ...migrated, ...rest }
+}
+
+/** Fill in defaults; docs saved before surface finishes carried a `colors`
+ * map of plain hex strings, which migrate onto the default finishes. */
+export function normalizeMaterials(raw: unknown, legacyColors?: unknown): BoardMaterials {
+  const result = structuredClone(DEFAULT_MATERIALS)
+  if (raw && typeof raw === 'object') {
+    for (const slot of MATERIAL_SLOTS) {
+      const m = (raw as Record<string, Partial<BoardMaterial>>)[slot]
+      if (m && typeof m.color === 'string') result[slot] = { ...result[slot], ...m }
+    }
+    const linked = (raw as BoardMaterials).linked
+    if (typeof linked === 'boolean') result.linked = linked
+  } else if (legacyColors && typeof legacyColors === 'object') {
+    for (const slot of MATERIAL_SLOTS) {
+      const color = (legacyColors as Record<string, string>)[slot]
+      if (typeof color === 'string') result[slot].color = color
+    }
+  }
+  return result
 }
 
 function loadSaved(): Doc | null {
@@ -309,10 +361,7 @@ function loadSaved(): Doc | null {
           : { ...DEFAULT_PLATE },
       bezel: normalizeBezel(parsed.bezel),
       tilt: typeof parsed.tilt === 'number' ? parsed.tilt : DEFAULT_TILT,
-      colors:
-        parsed.colors && typeof parsed.colors.case === 'string'
-          ? { ...DEFAULT_COLORS, ...(parsed.colors as BoardColors) }
-          : { ...DEFAULT_COLORS },
+      materials: normalizeMaterials(parsed.materials, parsed.colors),
     }
   } catch {
     return null
@@ -346,7 +395,7 @@ const docOf = (s: Doc): Doc => ({
   plate: s.plate,
   bezel: s.bezel,
   tilt: s.tilt,
-  colors: s.colors,
+  materials: s.materials,
 })
 
 export const useDocStore = create<DocState>((set, get) => {
@@ -377,7 +426,7 @@ export const useDocStore = create<DocState>((set, get) => {
       plate: patch.plate ?? state.plate,
       bezel: patch.bezel ?? state.bezel,
       tilt: patch.tilt ?? state.tilt,
-      colors: patch.colors ?? state.colors,
+      materials: patch.materials ?? state.materials,
       past: pushPast ? [...state.past.slice(-MAX_HISTORY + 1), prev] : state.past,
       future: [],
       selection: new Set([...state.selection].filter((id) => alive.has(id))),
@@ -734,6 +783,118 @@ export const useDocStore = create<DocState>((set, get) => {
       )
     },
 
+    applyAlphaLabels: () => {
+      const state = get()
+      const groups = groupMap(state.groups)
+      const labels = new Map<string, string>()
+
+      // Column clusters carry exact col/row slots — merge every cluster's
+      // columns into one left-to-right list per hand.
+      interface AlphaCol {
+        x: number
+        byRow: Map<number, Key>
+        /** 1 when the cluster has a 4th row: row 0 becomes a digit row. */
+        rowOffset: number
+      }
+      const cols: AlphaCol[] = []
+      for (const g of state.groups) {
+        if (g.layout.kind !== 'columns') continue
+        const byCol = new Map<number, Key[]>()
+        for (const k of state.keys) {
+          if (k.groupId !== g.id || k.col === undefined || k.row === undefined) continue
+          const list = byCol.get(k.col) ?? []
+          list.push(k)
+          byCol.set(k.col, list)
+        }
+        for (const keys of byCol.values()) {
+          cols.push({
+            x: keys.reduce((s, k) => s + keyWorldXF(k, groups).x, 0) / keys.length,
+            byRow: new Map(keys.map((k) => [k.row!, k])),
+            rowOffset: g.layout.rows >= 4 ? 1 : 0,
+          })
+        }
+      }
+
+      /** Split a left-to-right list into hands at the widest gap (mirrored
+       * docs describe the left half only). */
+      const splitHands = <T,>(items: T[], xOf: (t: T) => number) => {
+        if (state.mirror.enabled) return [{ side: 'left' as const, items }]
+        let splitAt = -1
+        let widest = 1.2 * U
+        for (let i = 1; i < items.length; i++) {
+          const gap = xOf(items[i]) - xOf(items[i - 1])
+          if (gap > widest) {
+            widest = gap
+            splitAt = i
+          }
+        }
+        if (splitAt < 0) splitAt = Math.ceil(items.length / 2)
+        return [
+          { side: 'left' as const, items: items.slice(0, splitAt) },
+          { side: 'right' as const, items: items.slice(splitAt) },
+        ]
+      }
+
+      if (cols.length > 0) {
+        cols.sort((a, b) => a.x - b.x)
+        for (const hand of splitHands(cols, (c) => c.x)) {
+          // Alphas hug the middle; extra outer (pinky) columns stay as-is.
+          const n = Math.min(5, hand.items.length)
+          const picked =
+            hand.side === 'left' ? hand.items.slice(-n) : hand.items.slice(0, n)
+          picked.forEach((col, i) => {
+            for (const [row, key] of col.byRow) {
+              if (col.rowOffset === 1 && row === 0) {
+                labels.set(key.id, DIGIT_ROW[hand.side][i])
+              } else {
+                const r = row - col.rowOffset
+                if (r >= 0 && r < 3) labels.set(key.id, ALPHA_ROWS[hand.side][r][i])
+              }
+            }
+          })
+        }
+      } else {
+        // Geometric fallback: band unrotated 1u keys into rows and label the
+        // three fullest bands (thumb arcs are rotated or sparse, so they
+        // fall out naturally).
+        const cands = state.keys
+          .filter((k) => k.w <= 1.25 && k.h <= 1.25)
+          .map((k) => ({ k, w: keyWorldXF(k, groups) }))
+          .filter(({ w }) => {
+            const a = ((w.r % 360) + 360) % 360
+            return Math.min(a, 360 - a) <= 20
+          })
+          .sort((a, b) => b.w.y - a.w.y)
+        const bands: { y: number; items: typeof cands }[] = []
+        for (const c of cands) {
+          const band = bands[bands.length - 1]
+          if (band && band.y - c.w.y < 0.55 * U) band.items.push(c)
+          else bands.push({ y: c.w.y, items: [c] })
+        }
+        const rows = [...bands]
+          .sort((a, b) => b.items.length - a.items.length)
+          .slice(0, 3)
+          .sort((a, b) => b.y - a.y)
+        rows.forEach((band, r) => {
+          const items = [...band.items].sort((a, b) => a.w.x - b.w.x)
+          for (const hand of splitHands(items, (c) => c.w.x)) {
+            const n = Math.min(5, hand.items.length)
+            const picked =
+              hand.side === 'left' ? hand.items.slice(-n) : hand.items.slice(0, n)
+            picked.forEach((c, i) => labels.set(c.k.id, ALPHA_ROWS[hand.side][r][i]))
+          }
+        })
+      }
+
+      if (labels.size === 0) return
+      commit({
+        keys: state.keys.map((k) => {
+          const label = labels.get(k.id)
+          return label !== undefined && k.label !== label ? { ...k, label } : k
+        }),
+      })
+    },
+
     groupSelection: () => {
       const state = get()
       const selected = state.keys.filter((k) => state.selection.has(k.id))
@@ -801,8 +962,19 @@ export const useDocStore = create<DocState>((set, get) => {
       const group = state.groups.find((g) => g.id === id)
       if (!group) return
       const updated = { ...group, layout }
+      let keys = regenerateGroup(updated, state.keys)
+      // A curved stack owns its members' rotations; clearing the curve (or
+      // leaving stack layout) would otherwise strand the fan rotations.
+      const hadCurve =
+        group.layout.kind === 'stack' && (group.layout.curve ?? 0) !== 0
+      const hasCurve = layout.kind === 'stack' && (layout.curve ?? 0) !== 0
+      if (hadCurve && !hasCurve) {
+        keys = keys.map((k) =>
+          k.groupId === id && k.r !== 0 ? { ...k, r: 0 } : k,
+        )
+      }
       commit({
-        keys: regenerateGroup(updated, state.keys),
+        keys,
         groups: state.groups.map((g) => (g.id === id ? updated : g)),
       })
     },
@@ -823,8 +995,22 @@ export const useDocStore = create<DocState>((set, get) => {
       commit({ tilt: deg })
     },
 
-    setColors: (patch) => {
-      commit({ colors: { ...get().colors, ...patch } })
+    setMaterial: (slot, patch) => {
+      const materials = get().materials
+      const next = { ...materials }
+      for (const s of materials.linked ? MATERIAL_SLOTS : [slot]) {
+        next[s] = { ...materials[s], ...patch }
+      }
+      commit({ materials: next })
+    },
+
+    setMaterialsLinked: (linked) => {
+      const materials = get().materials
+      const next = { ...materials, linked }
+      if (linked) {
+        for (const s of MATERIAL_SLOTS) next[s] = { ...materials.case }
+      }
+      commit({ materials: next })
     },
 
     beginTransform: () => {
@@ -898,7 +1084,7 @@ export const useDocStore = create<DocState>((set, get) => {
         plate: doc.plate ?? { ...DEFAULT_PLATE },
         bezel: normalizeBezel(doc.bezel),
         tilt: doc.tilt ?? DEFAULT_TILT,
-        colors: { ...DEFAULT_COLORS, ...doc.colors },
+        materials: normalizeMaterials(doc.materials),
       })
       set({ selection: new Set() })
     },
@@ -917,7 +1103,7 @@ useDocStore.subscribe((state, prev) => {
     state.plate === prev.plate &&
     state.bezel === prev.bezel &&
     state.tilt === prev.tilt &&
-    state.colors === prev.colors
+    state.materials === prev.materials
   )
     return
   clearTimeout(saveTimer)
@@ -933,7 +1119,7 @@ useDocStore.subscribe((state, prev) => {
           plate: state.plate,
           bezel: state.bezel,
           tilt: state.tilt,
-          colors: state.colors,
+          materials: state.materials,
         }),
       )
     } catch {

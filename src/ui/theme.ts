@@ -11,6 +11,7 @@ function initialTheme(): Theme {
   } catch {
     // fall through to OS preference
   }
+  if (typeof window === 'undefined') return 'dark' // headless (dev scripts)
   return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
 }
 
@@ -28,6 +29,7 @@ export const useTheme = create<{ theme: Theme; toggle: () => void }>((set, get) 
 }))
 
 function apply(theme: Theme) {
+  if (typeof document === 'undefined') return // headless (dev scripts)
   document.documentElement.dataset.theme = theme
 }
 

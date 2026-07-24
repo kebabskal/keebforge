@@ -5,7 +5,7 @@ import {
   keyWorldXF,
   isKeyMirrored,
   DEFAULT_BEZEL,
-  DEFAULT_COLORS,
+  DEFAULT_MATERIALS,
   DEFAULT_PLATE,
   DEFAULT_TILT,
   U,
@@ -24,7 +24,7 @@ const doc: Doc = {
   plate: { ...DEFAULT_PLATE, ...parsed.plate },
   bezel: { ...DEFAULT_BEZEL, ...parsed.bezel, ...(mode ? { mode } : {}) },
   tilt: parsed.tilt ?? DEFAULT_TILT,
-  colors: { ...DEFAULT_COLORS, ...parsed.colors },
+  materials: structuredClone(DEFAULT_MATERIALS),
 }
 
 const plate = plateOutline(doc)

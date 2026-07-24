@@ -316,9 +316,13 @@ function closeGaps(mp: MultiPolygon, r: number): MultiPolygon {
 
 /** World transforms of all keys, including mirrored copies when enabled.
  * Keys or groups with mirroring turned off contribute no mirrored copy. */
-function keyWorlds(doc: Doc): { key: Key; world: XForm }[] {
+function keyWorlds(doc: Doc): { key: Key; world: XForm; mirrored: boolean }[] {
   const groups = groupMap(doc.groups)
-  const result = doc.keys.map((key) => ({ key, world: keyWorldXF(key, groups) }))
+  const result = doc.keys.map((key) => ({
+    key,
+    world: keyWorldXF(key, groups),
+    mirrored: false,
+  }))
   if (doc.mirror.enabled) {
     const axis = doc.mirror.axis
     for (const { key, world } of [...result]) {
@@ -326,10 +330,57 @@ function keyWorlds(doc: Doc): { key: Key; world: XForm }[] {
       result.push({
         key,
         world: { x: 2 * axis - world.x, y: world.y, r: -world.r },
+        mirrored: true,
       })
     }
   }
   return result
+}
+
+/** Key worlds grouped per case piece: one list for a mono-block, two (left
+ * half, mirrored half) when the case is split. */
+function keyWorldSides(doc: Doc): {
+  worlds: { key: Key; world: XForm; mirrored: boolean }[]
+  half: 'both' | 'left' | 'right'
+}[] {
+  const worlds = keyWorlds(doc)
+  if (!doc.mirror.enabled || doc.mirror.split !== true) {
+    return [{ worlds, half: 'both' }]
+  }
+  return [
+    { worlds: worlds.filter((w) => !w.mirrored), half: 'left' as const },
+    { worlds: worlds.filter((w) => w.mirrored), half: 'right' as const },
+  ].filter((side) => side.worlds.length > 0)
+}
+
+interface CaseMargins {
+  left: number
+  right: number
+  top: number
+  bottom: number
+}
+
+/** Expand a solid outward by per-direction margins (world axes), as the
+ * union of the shape with translated copies. Concavities narrower than a
+ * margin are handled by the smoothing/closing that follows. */
+function expandMargins(mp: MultiPolygon, m: CaseMargins): MultiPolygon {
+  const shifts: [number, number][] = []
+  if (m.right > 0) shifts.push([m.right, 0])
+  if (m.left > 0) shifts.push([-m.left, 0])
+  if (m.top > 0) shifts.push([0, m.top])
+  if (m.bottom > 0) shifts.push([0, -m.bottom])
+  if (shifts.length === 0) return mp
+  const parts: Polygon[] = [...mp]
+  for (const [dx, dy] of shifts) {
+    for (const poly of mp) {
+      parts.push(
+        poly.map((ring) =>
+          ring.map(([x, y]) => [snap(x + dx), snap(y + dy)] as Ring[number]),
+        ),
+      )
+    }
+  }
+  return robustClip((s) => polygonClipping.union(s), parts)
 }
 
 /** Outer plate/foam outline: the union of every key's pitch area padded by
@@ -355,17 +406,20 @@ export function plateOutline(doc: Doc): MultiPolygon {
     return plateCache.result
   }
   const pad = doc.plate.padding
-  const rects: Polygon[] = keyWorlds(doc).map(({ key, world }) => {
-    const size = keySize(key)
-    return rectPoly(world, size.w + 2 * pad, size.h + 2 * pad)
-  })
-  const result =
-    rects.length === 0
-      ? []
-      : closeGaps(
-          robustClip((s) => polygonClipping.union(s), rects),
-          MIN_FEATURE / 2,
-        )
+  const result: MultiPolygon = []
+  for (const side of keyWorldSides(doc)) {
+    const rects: Polygon[] = side.worlds.map(({ key, world }) => {
+      const size = keySize(key)
+      return rectPoly(world, size.w + 2 * pad, size.h + 2 * pad)
+    })
+    if (rects.length === 0) continue
+    result.push(
+      ...closeGaps(
+        robustClip((s) => polygonClipping.union(s), rects),
+        MIN_FEATURE / 2,
+      ),
+    )
+  }
   plateCache = {
     keys: doc.keys,
     groups: doc.groups,
@@ -423,61 +477,76 @@ export function bezelShape(doc: Doc): MultiPolygon {
 function bezelShapeUncached(doc: Doc): MultiPolygon {
   const bezel = doc.bezel
   if (!bezel.enabled || bezel.width <= 0) return []
-  const worlds = keyWorlds(doc)
-  if (worlds.length === 0) return []
-  const capRects = (pad: number): Polygon[] =>
-    worlds.map(({ key, world }) => {
-      const size = capSize(key)
-      return rectPoly(world, size.w + 2 * pad, size.h + 2 * pad)
-    })
   // Rounding (and, via its closing phase, wedge-gap filling) happens on the
   // opening and outer solids separately, each with its own radius, so the
-  // ring's two edges get exact, independent corner radii.
+  // ring's two edges get exact, independent corner radii. A split case runs
+  // the whole pipeline per half (each half gets its own box, notably).
   const sc = MIN_FEATURE / 2
   const prep = (mp: MultiPolygon, radius: number): MultiPolygon => {
     const r = Math.max(0, Math.min(radius, 6))
     return r > 0 ? smoothOutline(mp, r, sc) : closeGaps(mp, sc)
   }
-  const opening = prep(
-    robustClip((s) => polygonClipping.union(s), capRects(bezel.outset)),
-    bezel.radiusInner ?? 0,
-  )
-  let outer: MultiPolygon
-  if (bezel.mode === 'tight') {
-    outer = prep(
-      robustClip((s) => polygonClipping.union(s), capRects(bezel.outset + bezel.width)),
-      bezel.radiusOuter ?? 0,
-    )
-  } else {
-    let minX = Infinity
-    let minY = Infinity
-    let maxX = -Infinity
-    let maxY = -Infinity
-    for (const rect of capRects(0)) {
-      for (const [x, y] of rect[0]) {
-        minX = Math.min(minX, x)
-        minY = Math.min(minY, y)
-        maxX = Math.max(maxX, x)
-        maxY = Math.max(maxY, y)
-      }
+  const result: MultiPolygon = []
+  for (const side of keyWorldSides(doc)) {
+    const capRects = (pad: number): Polygon[] =>
+      side.worlds.map(({ key, world }) => {
+        const size = capSize(key)
+        return rectPoly(world, size.w + 2 * pad, size.h + 2 * pad)
+      })
+    // Split halves only take the margin on their outward edge.
+    const margins: CaseMargins = {
+      top: bezel.marginTop ?? 0,
+      bottom: bezel.marginBottom ?? 0,
+      left: side.half === 'right' ? 0 : bezel.marginLeft ?? 0,
+      right: side.half === 'left' ? 0 : bezel.marginRight ?? 0,
     }
-    const pad = bezel.outset + bezel.width
-    outer = prep(
-      [
+    const opening = prep(
+      robustClip((s) => polygonClipping.union(s), capRects(bezel.outset)),
+      bezel.radiusInner ?? 0,
+    )
+    let outer: MultiPolygon
+    if (bezel.mode === 'tight') {
+      outer = prep(
+        expandMargins(
+          robustClip((s) => polygonClipping.union(s), capRects(bezel.outset + bezel.width)),
+          margins,
+        ),
+        bezel.radiusOuter ?? 0,
+      )
+    } else {
+      let minX = Infinity
+      let minY = Infinity
+      let maxX = -Infinity
+      let maxY = -Infinity
+      for (const rect of capRects(0)) {
+        for (const [x, y] of rect[0]) {
+          minX = Math.min(minX, x)
+          minY = Math.min(minY, y)
+          maxX = Math.max(maxX, x)
+          maxY = Math.max(maxY, y)
+        }
+      }
+      const pad = bezel.outset + bezel.width
+      outer = prep(
         [
           [
-            [minX - pad, minY - pad],
-            [maxX + pad, minY - pad],
-            [maxX + pad, maxY + pad],
-            [minX - pad, maxY + pad],
-            [minX - pad, minY - pad],
+            [
+              [minX - pad - margins.left, minY - pad - margins.bottom],
+              [maxX + pad + margins.right, minY - pad - margins.bottom],
+              [maxX + pad + margins.right, maxY + pad + margins.top],
+              [minX - pad - margins.left, maxY + pad + margins.top],
+              [minX - pad - margins.left, minY - pad - margins.bottom],
+            ],
           ],
         ],
-      ],
-      bezel.radiusOuter ?? 0,
+        bezel.radiusOuter ?? 0,
+      )
+    }
+    result.push(
+      ...robustClip((s, c) => polygonClipping.difference(s, c!), outer, opening),
     )
   }
-  return robustClip((s, c) => polygonClipping.difference(s, c!), outer, opening)
+  return result
 }
 
 /** Plate (or switch foam) shape: outline minus switch cutouts. Holes appear
