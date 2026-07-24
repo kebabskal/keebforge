@@ -10,7 +10,7 @@ import {
   type KeyType,
 } from '../model/keys'
 import { alignmentItems, coalesceUndo, groupMap, useDocStore } from '../model/store'
-import { bezelShape, FOAM_CLEARANCE, plateWithCutouts } from '../model/outline'
+import { bezelShape, FOAM_CLEARANCE, foamWithCutouts, plateWithCutouts } from '../model/outline'
 import { downloadText, toDXF } from '../export/dxf'
 import { NumberField, Section, SliderField, TextField } from './fields'
 
@@ -221,6 +221,8 @@ function DocumentPanel() {
   const setBezel = useDocStore((s) => s.setBezel)
   const bottom = useDocStore((s) => s.bottom)
   const setBottom = useDocStore((s) => s.setBottom)
+  const mounting = useDocStore((s) => s.mounting)
+  const setMounting = useDocStore((s) => s.setMounting)
   const tilt = useDocStore((s) => s.tilt)
   const setTilt = useDocStore((s) => s.setTilt)
   const materials = useDocStore((s) => s.materials)
@@ -237,13 +239,11 @@ function DocumentPanel() {
     s.keys.reduce((m, k) => Math.max(m, SWITCH_CLEARANCE[k.type]), 0),
   )
 
-  const exportDXF = (clearance: number, filename: string) => {
-    const { keys, groups, mirror, plate, bezel, bottom, tilt, materials } =
+  const exportDXF = (part: 'plate' | 'foam', filename: string) => {
+    const { keys, groups, mirror, plate, bezel, bottom, mounting, tilt, materials } =
       useDocStore.getState()
-    const shapes = plateWithCutouts(
-      { keys, groups, mirror, plate, bezel, bottom, tilt, materials },
-      clearance,
-    )
+    const doc = { keys, groups, mirror, plate, bezel, bottom, mounting, tilt, materials }
+    const shapes = part === 'plate' ? plateWithCutouts(doc) : foamWithCutouts(doc)
     downloadText(filename, toDXF(shapes))
   }
 
@@ -341,9 +341,10 @@ function DocumentPanel() {
           />
         </div>
         <p className="hint">
-          The plate is the union of all key areas plus padding, with per-switch
-          cutouts (14 mm MX, 13.8 mm Choc). Foam adds {FOAM_CLEARANCE} mm
-          cutout clearance.
+          With a bezel the plate is cut to the case interior so it drops into
+          the shell; without one it is the union of all key areas plus this
+          padding. Per-switch cutouts are 14 mm MX / 13.8 mm Choc; foam adds{' '}
+          {FOAM_CLEARANCE} mm cutout clearance and sits inside the lip.
         </p>
       </Section>
       <Section id="doc-bezel" title="Bezel" defaultOpen={false}>
@@ -472,9 +473,9 @@ function DocumentPanel() {
           )}
         </div>
         <p className="hint">
-          A rim around the keycap opening: tight follows the keycap contour,
-          box is a rectangular frame. Outset is the gap around keycaps, height
-          is above the plate top.
+          The hollow top shell: tight follows the keycap contour, box is a
+          rectangular frame. Width is the wall thickness, outset the gap
+          around keycaps, height the rim above the plate top.
         </p>
       </Section>
       <Section id="doc-bottom" title="Case bottom" defaultOpen={false}>
@@ -524,6 +525,15 @@ function DocumentPanel() {
             unit="mm"
             onCommit={(clearance) => setBottom({ clearance })}
           />
+          <SliderField
+            label="Ridge"
+            value={bottom.ridge ?? 0}
+            min={0}
+            max={6}
+            step={0.5}
+            unit="mm"
+            onCommit={(ridge) => setBottom({ ridge })}
+          />
         </div>
         {bottom.enabled && neededClearance > (bottom.clearance ?? 0) && (
           <p className="hint hint-warn">
@@ -538,7 +548,41 @@ function DocumentPanel() {
           Inset pulls the bottom's edge in from the case edge. Clearance is
           the interior depth below the plate for switch bodies plus
           PCB/hotswap sockets or handwiring — MX needs {SWITCH_CLEARANCE.mx}{' '}
-          mm, Choc {SWITCH_CLEARANCE.choc} mm.
+          mm, Choc {SWITCH_CLEARANCE.choc} mm. Ridge turns the bottom into a
+          tray: an inset rim rises to the plate's underside and supports it
+          from below, sandwiching it against the top case.
+        </p>
+      </Section>
+      <Section id="doc-mounting" title="Mounting" defaultOpen={false}>
+        <div className="field-grid">
+          <label className="field field-check">
+            <span>Screws</span>
+            <input
+              type="checkbox"
+              checked={mounting.enabled}
+              onChange={(e) => setMounting({ enabled: e.target.checked })}
+            />
+          </label>
+          <SliderField
+            label="Spacing"
+            value={mounting.spacing}
+            min={30}
+            max={100}
+            step={5}
+            unit="mm"
+            onCommit={(spacing) => setMounting({ spacing })}
+          />
+        </div>
+        {mounting.enabled && (!bezel.enabled || !bottom.enabled) && (
+          <p className="hint hint-warn">
+            Screws need both a bezel (they bite into its wall) and a case
+            bottom (they come up through it) — enable both to see them.
+          </p>
+        )}
+        <p className="hint">
+          M2 self-tapping screws go up through the bottom lid into pilot holes
+          in the bezel wall, spaced evenly along the wall. Spacing sets the
+          target distance between screws.
         </p>
       </Section>
       <Section id="doc-materials" title="Materials" defaultOpen={false}>
@@ -640,8 +684,8 @@ function DocumentPanel() {
       </Section>
       <Section id="doc-export" title="Export">
         <div className="button-row">
-          <button onClick={() => exportDXF(0, 'keebforge-plate.dxf')}>Plate DXF</button>
-          <button onClick={() => exportDXF(FOAM_CLEARANCE, 'keebforge-foam.dxf')}>
+          <button onClick={() => exportDXF('plate', 'keebforge-plate.dxf')}>Plate DXF</button>
+          <button onClick={() => exportDXF('foam', 'keebforge-foam.dxf')}>
             Foam DXF
           </button>
           <button

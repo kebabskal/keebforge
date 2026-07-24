@@ -25,10 +25,12 @@ import {
   type Key,
   type KeyType,
   type MirrorSettings,
+  type MountingSettings,
   type PlateSettings,
   DEFAULT_BEZEL,
   DEFAULT_BOTTOM,
   DEFAULT_MATERIALS,
+  DEFAULT_MOUNTING,
   DEFAULT_PLATE,
   DEFAULT_TILT,
 } from './keys'
@@ -105,6 +107,7 @@ export interface DocState extends Doc {
   setPlate: (patch: Partial<PlateSettings>) => void
   setBezel: (patch: Partial<BezelSettings>) => void
   setBottom: (patch: Partial<BottomSettings>) => void
+  setMounting: (patch: Partial<MountingSettings>) => void
   setTilt: (deg: number) => void
   setMaterial: (slot: MaterialSlot, patch: Partial<BoardMaterial>) => void
   /** Replace all materials at once (color presets). */
@@ -327,6 +330,18 @@ export function normalizeBezel(raw: unknown): BezelSettings {
   return { ...DEFAULT_BEZEL, ...migrated, ...rest }
 }
 
+/** Fill in defaults for docs saved before mounting existed. */
+export function normalizeMounting(raw: unknown): MountingSettings {
+  if (
+    !raw ||
+    typeof raw !== 'object' ||
+    typeof (raw as MountingSettings).spacing !== 'number'
+  ) {
+    return { ...DEFAULT_MOUNTING }
+  }
+  return { ...DEFAULT_MOUNTING, ...(raw as Partial<MountingSettings>) }
+}
+
 /** Fill in defaults for docs saved before the bottom case existed. */
 export function normalizeBottom(raw: unknown): BottomSettings {
   if (
@@ -378,6 +393,7 @@ function loadSaved(): Doc | null {
           : { ...DEFAULT_PLATE },
       bezel: normalizeBezel(parsed.bezel),
       bottom: normalizeBottom(parsed.bottom),
+      mounting: normalizeMounting(parsed.mounting),
       tilt: typeof parsed.tilt === 'number' ? parsed.tilt : DEFAULT_TILT,
       materials: normalizeMaterials(parsed.materials, parsed.colors),
     }
@@ -413,6 +429,7 @@ const docOf = (s: Doc): Doc => ({
   plate: s.plate,
   bezel: s.bezel,
   bottom: s.bottom,
+  mounting: s.mounting,
   tilt: s.tilt,
   materials: s.materials,
 })
@@ -445,6 +462,7 @@ export const useDocStore = create<DocState>((set, get) => {
       plate: patch.plate ?? state.plate,
       bezel: patch.bezel ?? state.bezel,
       bottom: patch.bottom ?? state.bottom,
+      mounting: patch.mounting ?? state.mounting,
       tilt: patch.tilt ?? state.tilt,
       materials: patch.materials ?? state.materials,
       past: pushPast ? [...state.past.slice(-MAX_HISTORY + 1), prev] : state.past,
@@ -1007,6 +1025,10 @@ export const useDocStore = create<DocState>((set, get) => {
       commit({ bottom: { ...get().bottom, ...patch } })
     },
 
+    setMounting: (patch) => {
+      commit({ mounting: { ...get().mounting, ...patch } })
+    },
+
     setTilt: (deg) => {
       commit({ tilt: deg })
     },
@@ -1104,6 +1126,7 @@ export const useDocStore = create<DocState>((set, get) => {
         plate: doc.plate ?? { ...DEFAULT_PLATE },
         bezel: normalizeBezel(doc.bezel),
         bottom: normalizeBottom(doc.bottom),
+        mounting: normalizeMounting(doc.mounting),
         tilt: doc.tilt ?? DEFAULT_TILT,
         materials: normalizeMaterials(doc.materials),
       })
@@ -1124,6 +1147,7 @@ useDocStore.subscribe((state, prev) => {
     state.plate === prev.plate &&
     state.bezel === prev.bezel &&
     state.bottom === prev.bottom &&
+    state.mounting === prev.mounting &&
     state.tilt === prev.tilt &&
     state.materials === prev.materials
   )
@@ -1141,6 +1165,7 @@ useDocStore.subscribe((state, prev) => {
           plate: state.plate,
           bezel: state.bezel,
           bottom: state.bottom,
+          mounting: state.mounting,
           tilt: state.tilt,
           materials: state.materials,
         }),

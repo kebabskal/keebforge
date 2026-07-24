@@ -5,6 +5,7 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js'
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js'
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js'
 import { SSAOPass } from 'three/addons/postprocessing/SSAOPass.js'
+import { toCreasedNormals } from 'three/addons/utils/BufferGeometryUtils.js'
 import {
   capSize,
   DEFAULT_TENT,
@@ -14,12 +15,15 @@ import {
   type XForm,
 } from '../model/keys'
 import {
-  bezelShape,
   caseBottomOutline,
-  FOAM_CLEARANCE,
+  caseShells,
+  foamWithCutouts,
   FOAM_THICKNESS,
   PLATE_THICKNESS,
   plateWithCutouts,
+  SCREW,
+  screwPositions,
+  subtractDiscs,
   type MultiPolygon,
 } from '../model/outline'
 import { groupMap, useDocStore } from '../model/store'
@@ -118,7 +122,9 @@ export function Preview3D() {
     const controls = new OrbitControls(camera, renderer.domElement)
     controls.enableDamping = true
     controls.dampingFactor = 0.08
-    controls.maxPolarAngle = Math.PI / 2 - 0.02
+    // Orbiting below the desk is allowed for underside inspection; the
+    // backdrop hides itself when the camera goes under (see backdropVis).
+    controls.maxPolarAngle = Math.PI - 0.05
 
     const hemi = new THREE.HemisphereLight(0xcdd8f2, 0x2a251e, 0.75)
     scene.add(hemi)
@@ -137,6 +143,11 @@ export function Preview3D() {
     const fill = new THREE.DirectionalLight(0x9fb4e8, 0.5)
     fill.position.set(-60, 80, -90)
     scene.add(fill)
+    // Every other light points down, which would leave undersides pitch
+    // black when orbiting below the desk for inspection.
+    const underFill = new THREE.DirectionalLight(0xb8c4d8, 0.8)
+    underFill.position.set(40, -120, 60)
+    scene.add(underFill)
 
     // Table the keyboard rests on — a visible reference plane that makes the
     // typing-angle tilt readable. Sized/positioned per rebuild to the board
@@ -209,8 +220,33 @@ export function Preview3D() {
         foam: v.showFoam,
         bottom: v.showBottom,
       }
+      // Exploded view: raise each layer along the board normal by its place
+      // in the assembly stack (bottom lid stays on the desk). Offsets are
+      // applied on top of each mesh's recorded assembled position, so the
+      // slider is cheap (no rebuild) and idempotent.
+      // Assembly order, bottom to top: standoffs+lid stay on the desk, then
+      // foam, plate, case shell, switches, caps (switches lift out through
+      // the opened top). Uniform g gaps aren't enough around the shell — its
+      // wall spans from below the plate to above the caps — so the shell and
+      // everything above it get extra ramped clearance that separates the
+      // layers fully once the explode gap passes ~5 mm.
+      const g = v.explode
+      const r = Math.min(1, g / 5)
+      const lift = {
+        bottom: 0,
+        foam: g,
+        plate: 2 * g,
+        case: 3 * g + 12 * r,
+        switches: 4 * g + 30 * r,
+        caps: 5 * g + 30 * r,
+      }
       for (const part of Object.keys(partMeshes) as (keyof typeof partMeshes)[]) {
-        for (const mesh of partMeshes[part]) mesh.visible = shown[part]
+        for (const mesh of partMeshes[part]) {
+          mesh.visible = shown[part]
+          if (typeof mesh.userData.assembledY === 'number') {
+            mesh.position.y = mesh.userData.assembledY + lift[part]
+          }
+        }
       }
       sun.intensity = v.keyLight
       const az = (v.lightAngle * Math.PI) / 180
@@ -221,8 +257,7 @@ export function Preview3D() {
       )
       fill.intensity = v.fillLight
       hemi.intensity = v.ambient
-      ground.visible = v.backdrop === 'table'
-      cyclo.visible = v.backdrop === 'studio'
+      backdropVis()
       ;(cyclo.material as THREE.MeshStandardMaterial).color.set(v.backdropColor)
       // VSM needs at least a little blur or its variance test bands visibly.
       sun.shadow.radius = Math.max(1, v.shadowBlur)
@@ -247,6 +282,8 @@ export function Preview3D() {
         clipShadows: true,
       }),
       housing: new THREE.MeshStandardMaterial({ color: 0x1e2025, roughness: 0.55 }),
+      // Screw proxies: fixed dark steel, not doc-controlled.
+      screw: new THREE.MeshStandardMaterial({ color: 0x33363d, metalness: 0.9, roughness: 0.35 }),
       cap: new THREE.MeshStandardMaterial({ color: 0xe7e3d7, roughness: 0.85 }),
       capAccent: new THREE.MeshStandardMaterial({ color: 0x5c7d6e, roughness: 0.85 }),
     }
@@ -296,6 +333,15 @@ export function Preview3D() {
     }
 
     let bounds = { cx: 0, cz: 0, radius: 120 }
+    // Desk height (the case's resting plane), tracked per rebuild so the
+    // backdrop can hide itself when the camera orbits below it.
+    let restingY = 0
+    const backdropVis = () => {
+      const v = useViewSettings.getState()
+      const below = camera.position.y < restingY - 0.1
+      ground.visible = !below && v.backdrop === 'table'
+      cyclo.visible = !below && v.backdrop === 'studio'
+    }
 
     const rebuild = () => {
       disposeBoard()
@@ -307,6 +353,7 @@ export function Preview3D() {
         plate: state.plate,
         bezel: state.bezel,
         bottom: state.bottom,
+        mounting: state.mounting,
         tilt: state.tilt,
         materials: state.materials,
       }
@@ -322,6 +369,7 @@ export function Preview3D() {
       const caseBottomY = -PLATE_THICKNESS - cavity
       const bottomThickness = doc.bottom.enabled ? Math.max(0.5, doc.bottom.thickness) : 0
       const restY = caseBottomY - bottomThickness
+      restingY = restY
       groundClip.constant = 0.05 - restY
 
       const applyMaterial = (
@@ -397,7 +445,7 @@ export function Preview3D() {
       ) => {
         const b = Math.max(0, Math.min(bevel, thickness / 2 - 0.05))
         shapesFromPolygons(mp).forEach((shape, i) => {
-          const geo = new THREE.ExtrudeGeometry(shape, {
+          const extruded = new THREE.ExtrudeGeometry(shape, {
             depth: thickness - 2 * b,
             bevelEnabled: b > 0,
             bevelThickness: b,
@@ -406,10 +454,17 @@ export function Preview3D() {
             bevelSegments: 1,
             curveSegments: 6,
           })
+          // Extrusions come flat-shaded, so curved outline corners read as
+          // facets. Smooth normals across shallow face angles only — real
+          // edges (the 45° bevel chamfer, top/bottom rims, cutout corners)
+          // stay creased.
+          const geo = toCreasedNormals(extruded, Math.PI / 6)
+          extruded.dispose()
           slabGeos.push(geo)
           const mesh = new THREE.Mesh(geo, material)
           mesh.rotation.x = -Math.PI / 2
           mesh.position.y = y + b
+          mesh.userData.assembledY = y + b
           mesh.castShadow = shadows
           mesh.receiveShadow = true
           let sMinX = Infinity
@@ -438,34 +493,39 @@ export function Preview3D() {
         trackFront(plateMp)
         addSlab(plateMp, 'plate', PLATE_THICKNESS, -PLATE_THICKNESS, materials.plate, true)
         addSlab(
-          plateWithCutouts(doc, FOAM_CLEARANCE),
+          foamWithCutouts(doc),
           'foam',
           FOAM_THICKNESS,
           -PLATE_THICKNESS - FOAM_THICKNESS,
           materials.foam,
           false,
         )
-        // The bezel rim runs from the ground to `height` above the plate top,
-        // so it reads as the case wall around plate and foam.
-        if (doc.bezel.enabled && doc.bezel.height > 0) {
-          const bezelMp = bezelShape(doc)
-          trackFront(bezelMp)
-          addSlab(
-            bezelMp,
-            'case',
-            doc.bezel.height + PLATE_THICKNESS + cavity,
-            caseBottomY,
-            materials.bezel,
-            true,
-            Math.min(doc.bezel.bevel ?? 0, doc.bezel.width / 2 - 0.05),
-          )
+        // Hollow top shell: wall ring from the lid plane up to the plate
+        // top, rim ring (keycap opening) above it, and the supporting lip
+        // reaching up to the plate's underside. Plate and foam are cut to
+        // the cavity, so nothing interpenetrates.
+        if (doc.bezel.enabled && doc.bezel.width > 0) {
+          const bevel = Math.min(doc.bezel.bevel ?? 0, doc.bezel.width / 2 - 0.05)
+          for (const shell of caseShells(doc)) {
+            trackFront(shell.hull)
+            addSlab(shell.wall, 'case', PLATE_THICKNESS + cavity, caseBottomY, materials.bezel, true)
+            if (doc.bezel.height > 0) {
+              // Extrusion bevels are symmetric, so sink the rim by one bevel:
+              // the bottom chamfer ends up buried inside the wall band below
+              // and only the top edge shows a bevel — no seam at plate height.
+              addSlab(shell.rim, 'case', doc.bezel.height + bevel, -bevel, materials.bezel, true, bevel)
+            }
+          }
         }
         // Bottom case under the whole footprint. `tight` is a plate hugging
         // the underside (posts come later, once transforms are known);
         // `wedge` extrudes deep enough to reach the desk at full tilt/tent
         // and is cut off at it by the clipping plane.
         if (doc.bottom.enabled) {
-          const bottomMp = caseBottomOutline(doc)
+          // Lid screws go up through the lid into the bezel wall; the lid
+          // outline gets clearance holes at the generated positions.
+          const screws = screwPositions(doc)
+          const bottomMp = subtractDiscs(caseBottomOutline(doc), screws, SCREW.lidHoleR)
           trackFront(bottomMp)
           let extent = 0
           for (const poly of bottomMp) {
@@ -512,6 +572,32 @@ export function Preview3D() {
               }
             }
           }
+          // Screw proxies (shaft + countersunk head) sit in the lid holes and
+          // ride with the lid — in the exploded view they read as studs
+          // waiting to bite into the wall above.
+          if (screws.length > 0) {
+            const shaftLen = bottomThickness + SCREW.bite
+            const shaftGeo = new THREE.CylinderGeometry(SCREW.shaftR, SCREW.shaftR, shaftLen, 12)
+            const headGeo = new THREE.CylinderGeometry(SCREW.headR, SCREW.headR, SCREW.headH, 16)
+            slabGeos.push(shaftGeo, headGeo)
+            for (const [sx, sy] of screws) {
+              const shaft = new THREE.Mesh(shaftGeo, materials.screw)
+              shaft.position.set(sx, restY + shaftLen / 2, -sy)
+              shaft.userData.assembledY = shaft.position.y
+              const head = new THREE.Mesh(headGeo, materials.screw)
+              head.position.set(sx, restY + SCREW.headH / 2, -sy)
+              head.userData.assembledY = head.position.y
+              targetFor(sx).add(shaft, head)
+              partMeshes.bottom.push(shaft, head)
+            }
+          }
+          // Tray ridge: an inset rim rising from the lid to the plate's
+          // underside — the bottom becomes a tray whose lip supports the
+          // plate from below, sandwiching it against the top case's rim.
+          const ridgeMp = caseShells(doc).flatMap((s) => s.ridge)
+          if (ridgeMp.length > 0) {
+            addSlab(ridgeMp, 'bottom', cavity, caseBottomY, materials.bezel, false)
+          }
           if (doc.bottom.mode === 'tight') {
             addSlab(bottomMp, 'bottom', bottomThickness, restY, materials.bezel, true)
           } else {
@@ -554,6 +640,7 @@ export function Preview3D() {
           ),
           materials.housing,
         )
+        housing.userData.assembledY = 0
         holder.add(housing)
         partMeshes.switches.push(housing)
 
@@ -564,6 +651,7 @@ export function Preview3D() {
           materials.housing,
         )
         lower.position.y = -dims.lower
+        lower.userData.assembledY = -dims.lower
         holder.add(lower)
         partMeshes.switches.push(lower)
         const socket = new THREE.Mesh(
@@ -571,6 +659,7 @@ export function Preview3D() {
           materials.housing,
         )
         socket.position.y = -dims.lower - SOCKET_H
+        socket.userData.assembledY = -dims.lower - SOCKET_H
         holder.add(socket)
         partMeshes.switches.push(socket)
 
@@ -579,6 +668,7 @@ export function Preview3D() {
           key.label ? materials.cap : materials.capAccent,
         )
         capMesh.position.y = dims.capBottom
+        capMesh.userData.assembledY = dims.capBottom
         capMesh.castShadow = true
         holder.add(capMesh)
         partMeshes.caps.push(capMesh)
@@ -766,6 +856,7 @@ export function Preview3D() {
         state.plate !== last.plate ||
         state.bezel !== last.bezel ||
         state.bottom !== last.bottom ||
+        state.mounting !== last.mounting ||
         state.tilt !== last.tilt ||
         state.materials !== last.materials
       ) {
@@ -791,6 +882,7 @@ export function Preview3D() {
     const animate = () => {
       frame = requestAnimationFrame(animate)
       controls.update()
+      backdropVis()
       composer.render()
     }
     animate()

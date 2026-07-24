@@ -21,6 +21,8 @@ export interface ViewSettings {
   shadowBlur: number
   /** Screen-space ambient occlusion. */
   ssao: boolean
+  /** Exploded-view gap between adjacent parts, mm. 0 = assembled. */
+  explode: number
   /** Per-part visibility in the 3D preview. */
   showCaps: boolean
   showSwitches: boolean
@@ -40,6 +42,7 @@ export const DEFAULT_VIEW: ViewSettings = {
   lightAngle: 50,
   shadowBlur: 25,
   ssao: true,
+  explode: 0,
   showCaps: true,
   showSwitches: true,
   showCase: true,

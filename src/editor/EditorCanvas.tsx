@@ -433,6 +433,7 @@ export function EditorCanvas() {
           plate: state.plate,
           bezel: state.bezel,
           bottom: state.bottom,
+          mounting: state.mounting,
           tilt: state.tilt,
           materials: state.materials,
         }

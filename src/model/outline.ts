@@ -83,9 +83,11 @@ function robustClip(
 const MIN_FEATURE = 3
 
 /** Disc approximation for Minkowski offsetting. Resolution scales with the
- * radius (~0.7 mm chords) so offset arcs stay visually round. */
+ * radius (~0.7 mm chords), with a floor of 18 segments (20° per facet) so
+ * even tiny-radius arcs stay under the 3D preview's 30° normal-crease
+ * threshold and shade smoothly. */
 function discPoly(cx: number, cy: number, r: number): Polygon {
-  const segments = Math.min(36, Math.max(8, Math.ceil((2 * Math.PI * r) / 0.7)))
+  const segments = Math.min(36, Math.max(18, Math.ceil((2 * Math.PI * r) / 0.7)))
   const ring: Ring = []
   for (let i = 0; i < segments; i++) {
     const a = (i / segments) * 2 * Math.PI
@@ -482,25 +484,110 @@ function bezelSolids(doc: Doc): BezelSolids[] {
   return result
 }
 
-let bezelCache: { solids: BezelSolids[]; result: MultiPolygon } | null = null
+/** One case piece of the hollow top shell plus the bottom tray, as
+ * extrudable outlines. The plate and foam are sized to the cavity, so
+ * nothing interpenetrates: `hull` ⊃ `interior` (wall width in) ⊃ `inner`
+ * (ridge width further in). */
+export interface CaseShell {
+  /** Outer footprint with interior islands/holes discarded. */
+  hull: MultiPolygon
+  /** Cavity contour: hull eroded by the wall width. Kept sharp — this is
+   * the top case's inside face. */
+  interior: MultiPolygon
+  /** Interior with convex corners rounded for drop-in fit: the plate's
+   * outline and the tray ridge's outer contour. */
+  fit: MultiPolygon
+  /** Fit contour minus the tray ridge, also corner-rounded. Foam goes here. */
+  inner: MultiPolygon
+  /** Wall ring (hull − interior): lid plane up to the plate top. */
+  wall: MultiPolygon
+  /** Rim ring (hull − keycap opening): above the plate top. */
+  rim: MultiPolygon
+  /** Tray-ridge ring (interior − inner): part of the BOTTOM — it rises from
+   * the lid to the plate's underside, sandwiching the plate between itself
+   * and the rim above. */
+  ridge: MultiPolygon
+}
 
-export function bezelShape(doc: Doc): MultiPolygon {
+let shellCache: {
+  solids: BezelSolids[]
+  ridgeW: number
+  result: CaseShell[]
+} | null = null
+
+export function caseShells(doc: Doc): CaseShell[] {
   const solids = bezelSolids(doc)
-  if (bezelCache && bezelCache.solids === solids) return bezelCache.result
-  const result = solids.flatMap((s) =>
-    robustClip((subj, c) => polygonClipping.difference(subj, c!), s.outer, s.opening),
-  )
-  bezelCache = { solids, result }
+  const ridgeW = doc.bottom.enabled ? Math.max(0, doc.bottom.ridge ?? 0) : 0
+  if (shellCache && shellCache.solids === solids && shellCache.ridgeW === ridgeW) {
+    return shellCache.result
+  }
+  const wallW = Math.max(0.8, doc.bezel.width)
+  const diff = (a: MultiPolygon, b: MultiPolygon): MultiPolygon => {
+    if (a.length === 0) return []
+    if (b.length === 0) return a
+    try {
+      return robustClip((s, c) => polygonClipping.difference(s, c!), a, b)
+    } catch (error) {
+      console.warn('keebforge: case ring generation failed', error)
+      return a
+    }
+  }
+  // Fit rounding: morphological open — material is only ever removed, so a
+  // rounded part can never clip the sharp cavity it drops into. The wall's
+  // own inside face intentionally stays sharp.
+  const FIT_R = 1.5
+  const round = (mp: MultiPolygon): MultiPolygon => {
+    if (mp.length === 0) return mp
+    try {
+      return simplify(dilate(erode(mp, FIT_R), FIT_R), 0.05)
+    } catch (error) {
+      console.warn('keebforge: fit rounding failed', error)
+      return mp
+    }
+  }
+  const result: CaseShell[] = solids.map((s) => {
+    const hull: MultiPolygon = s.outer.map((poly) => [poly[0]])
+    let interior: MultiPolygon = []
+    try {
+      interior = simplify(erode(hull, wallW), 0.05)
+    } catch (error) {
+      console.warn('keebforge: case interior generation failed', error)
+    }
+    const fit = round(interior)
+    let inner = fit
+    if (ridgeW > 0 && fit.length > 0) {
+      try {
+        inner = round(simplify(erode(fit, ridgeW), 0.05))
+      } catch (error) {
+        console.warn('keebforge: tray ridge generation failed', error)
+      }
+    }
+    return {
+      hull,
+      interior,
+      fit,
+      inner,
+      wall: diff(hull, interior),
+      rim: diff(hull, s.opening),
+      ridge: inner === fit ? [] : diff(fit, inner),
+    }
+  })
+  shellCache = { solids, ridgeW, result }
   return result
 }
 
-/** Footprint of the case bottom: the bezel's outer solid (no keycap opening),
- * or the plate outline when there is no bezel to follow, optionally eroded
- * inward by the bottom's inset. */
+/** The bezel ring as seen from above (2D badge and DXF): hull − opening. */
+export function bezelShape(doc: Doc): MultiPolygon {
+  return caseShells(doc).flatMap((s) => s.rim)
+}
+
+/** Footprint of the case bottom: the shell hull (no keycap opening), or the
+ * plate outline when there is no bezel to follow, optionally eroded inward
+ * by the bottom's inset. */
 export function caseBottomOutline(doc: Doc): MultiPolygon {
   const outline =
     doc.bezel.enabled && doc.bezel.width > 0
-      ? bezelSolids(doc).flatMap((s) => s.outer)
+      ? caseShells(doc).flatMap((s) => s.hull)
       : plateOutline(doc)
   const inset = doc.bottom.inset ?? 0
   if (inset <= 0) return outline
@@ -585,11 +672,168 @@ function bezelSolidsUncached(doc: Doc): BezelSolids[] {
   return result
 }
 
-/** Plate (or switch foam) shape: outline minus switch cutouts. Holes appear
- * as extra rings within each polygon. */
+// ---- Mounting -------------------------------------------------------------
+
+/** M2 self-tapping screw dimensions (radii/lengths in mm): the lid gets a
+ * clearance hole, the screw bites into a pilot in the bezel wall above. */
+export const SCREW = {
+  /** Clearance-hole radius through the bottom lid. */
+  lidHoleR: 1.25,
+  /** Shaft/head radii and lengths for the 3D-preview proxy. */
+  shaftR: 0.9,
+  headR: 1.9,
+  headH: 1.4,
+  /** Thread engagement into the wall above the lid's top face. */
+  bite: 6,
+}
+
+/** Evenly spaced points along a ring's perimeter, `spacing` mm apart,
+ * phase-anchored at the vertex farthest from the ring centroid (a corner,
+ * so screws land in corners first and the layout is stable under edits). */
+function sampleRing(ring: Ring, spacing: number): [number, number][] {
+  let pts = ring as [number, number][]
+  if (
+    pts.length > 1 &&
+    pts[0][0] === pts[pts.length - 1][0] &&
+    pts[0][1] === pts[pts.length - 1][1]
+  ) {
+    pts = pts.slice(0, -1)
+  }
+  const n = pts.length
+  if (n < 3) return []
+  const cum = [0]
+  for (let i = 0; i < n; i++) {
+    const [x1, y1] = pts[i]
+    const [x2, y2] = pts[(i + 1) % n]
+    cum.push(cum[i] + Math.hypot(x2 - x1, y2 - y1))
+  }
+  const total = cum[n]
+  // Too small a piece to be worth fastening (or to fit screws at all).
+  if (total < 40) return []
+  let cx = 0
+  let cy = 0
+  for (const [x, y] of pts) {
+    cx += x / n
+    cy += y / n
+  }
+  let start = 0
+  let best = -1
+  for (let i = 0; i < n; i++) {
+    const d = (pts[i][0] - cx) ** 2 + (pts[i][1] - cy) ** 2
+    if (d > best) {
+      best = d
+      start = i
+    }
+  }
+  const count = Math.max(2, Math.round(total / spacing))
+  const out: [number, number][] = []
+  for (let k = 0; k < count; k++) {
+    const t = (cum[start] + (k * total) / count) % total
+    let i = 0
+    while (i < n - 1 && cum[i + 1] <= t) i++
+    const f = (t - cum[i]) / Math.max(1e-9, cum[i + 1] - cum[i])
+    const [x1, y1] = pts[i]
+    const [x2, y2] = pts[(i + 1) % n]
+    out.push([x1 + (x2 - x1) * f, y1 + (y2 - y1) * f])
+  }
+  return out
+}
+
+let screwCache: {
+  keys: Doc['keys']
+  groups: Doc['groups']
+  mirror: Doc['mirror']
+  bezel: Doc['bezel']
+  bottom: Doc['bottom']
+  mounting: Doc['mounting']
+  result: [number, number][]
+} | null = null
+
+/** Screw positions: evenly spaced along the bezel wall's centerline (the
+ * outer solid eroded by half the wall width), per case piece and island.
+ * The centerline is at least width/2 clear of both the keycap opening and
+ * the outer face, so an M2 pilot always has wall material around it. */
+export function screwPositions(doc: Doc): [number, number][] {
+  if (!doc.mounting.enabled || !doc.bezel.enabled || doc.bezel.width <= 0) return []
+  if (
+    screwCache &&
+    screwCache.keys === doc.keys &&
+    screwCache.groups === doc.groups &&
+    screwCache.mirror === doc.mirror &&
+    screwCache.bezel === doc.bezel &&
+    screwCache.bottom === doc.bottom &&
+    screwCache.mounting === doc.mounting
+  ) {
+    return screwCache.result
+  }
+  const result: [number, number][] = []
+  try {
+    // Deep enough into the piece that heads clear an inset lid's edge, but
+    // the pilot must stay inside the top-case wall band — the ridge further
+    // in belongs to the bottom tray, which screws pass through, not into.
+    const inset = doc.bottom.enabled ? Math.max(0, doc.bottom.inset ?? 0) : 0
+    const e = Math.max(
+      1,
+      Math.min(
+        Math.max(doc.bezel.width / 2, inset + SCREW.headR + 0.6),
+        Math.max(doc.bezel.width - 1.2, doc.bezel.width / 2),
+      ),
+    )
+    for (const shell of caseShells(doc)) {
+      const spine = simplify(erode(shell.hull, e), 0.05)
+      for (const poly of spine) {
+        result.push(...sampleRing(poly[0], Math.max(20, doc.mounting.spacing)))
+      }
+    }
+  } catch (error) {
+    console.warn('keebforge: screw placement failed', error)
+  }
+  screwCache = {
+    keys: doc.keys,
+    groups: doc.groups,
+    mirror: doc.mirror,
+    bezel: doc.bezel,
+    bottom: doc.bottom,
+    mounting: doc.mounting,
+    result,
+  }
+  return result
+}
+
+/** Punch circular holes of radius r at the given centers. Failures degrade
+ * to the unpunched outline rather than crashing the preview/export. */
+export function subtractDiscs(
+  mp: MultiPolygon,
+  centers: [number, number][],
+  r: number,
+): MultiPolygon {
+  if (mp.length === 0 || centers.length === 0 || r <= 0) return mp
+  try {
+    const discs: MultiPolygon = centers.map(([x, y]) => discPoly(x, y, r))
+    return robustClip((s, c) => polygonClipping.difference(s, c!), mp, discs)
+  } catch (error) {
+    console.warn('keebforge: hole punch failed, keeping solid outline', error)
+    return mp
+  }
+}
+
+/** Plate shape: the case cavity's contour (so the plate drops into the
+ * shell without clipping), or the padded key outline when there is no case,
+ * minus switch cutouts. Holes appear as extra rings within each polygon. */
 export function plateWithCutouts(doc: Doc, clearance = 0): MultiPolygon {
-  const outline = plateOutline(doc)
+  const fit = caseShells(doc).flatMap((s) => s.fit)
+  const outline = fit.length > 0 ? fit : plateOutline(doc)
   if (outline.length === 0) return []
   const cutouts = switchCutouts(doc, clearance)
+  return robustClip((s, c) => polygonClipping.difference(s, c!), outline, cutouts)
+}
+
+/** Foam shape: like the plate but inside the supporting lip, with extra
+ * clearance around the switch housings. */
+export function foamWithCutouts(doc: Doc): MultiPolygon {
+  const inner = caseShells(doc).flatMap((s) => s.inner)
+  const outline = inner.length > 0 ? inner : plateOutline(doc)
+  if (outline.length === 0) return []
+  const cutouts = switchCutouts(doc, FOAM_CLEARANCE)
   return robustClip((s, c) => polygonClipping.difference(s, c!), outline, cutouts)
 }

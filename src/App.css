@@ -416,6 +416,11 @@ main {
   background: var(--border);
 }
 
+.viewbar-row input.viewbar-explode {
+  width: 84px;
+  flex: none;
+}
+
 .viewbar-panel {
   width: 240px;
   max-height: 55vh;

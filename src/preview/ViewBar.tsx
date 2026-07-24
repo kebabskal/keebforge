@@ -112,6 +112,18 @@ export function ViewBar() {
           </button>
         ))}
         <span className="viewbar-sep" />
+        <input
+          className="viewbar-explode"
+          type="range"
+          min={0}
+          max={25}
+          step={0.5}
+          value={view.explode}
+          onChange={(e) => view.update({ explode: Number(e.target.value) })}
+          title="Explode view"
+          aria-label="Explode view"
+        />
+        <span className="viewbar-sep" />
         <button
           className={settingsOpen ? 'active' : ''}
           onClick={() => setSettingsOpen((v) => !v)}

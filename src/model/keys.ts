@@ -137,6 +137,10 @@ export interface BottomSettings {
   /** Interior depth below the plate's underside, mm — room for the
    * below-plate switch bodies plus PCB/hotswap sockets or handwiring. */
   clearance: number
+  /** Tray ridge: an inset rim running around the lid's edge, rising to the
+   * plate's underside so the plate is sandwiched between it and the top
+   * case's rim. Width in mm, inward from the case interior; 0 disables. */
+  ridge: number
 }
 
 /** Clearance needed below the plate's underside per switch type, mm:
@@ -150,7 +154,19 @@ export const DEFAULT_BOTTOM: BottomSettings = {
   thickness: 2.5,
   inset: 0,
   clearance: SWITCH_CLEARANCE.mx,
+  ridge: 2.5,
 }
+
+/** Case mounting: M2 self-tapping screws up through the bottom lid, biting
+ * into pilot holes in the bezel wall. Screw positions are generated evenly
+ * along the wall centerline, so mounting needs both bezel and bottom. */
+export interface MountingSettings {
+  enabled: boolean
+  /** Target spacing between screws along the wall, mm. */
+  spacing: number
+}
+
+export const DEFAULT_MOUNTING: MountingSettings = { enabled: true, spacing: 55 }
 
 /** Typing angle in degrees: positive raises the back edge. 3D-preview only
  * for now (plate/foam exports are flat projections regardless). */
@@ -253,6 +269,7 @@ export interface Doc {
   plate: PlateSettings
   bezel: BezelSettings
   bottom: BottomSettings
+  mounting: MountingSettings
   tilt: number
   materials: BoardMaterials
 }
@@ -623,6 +640,7 @@ export function defaultDoc(): Doc {
     plate: { ...DEFAULT_PLATE },
     bezel: { ...DEFAULT_BEZEL },
     bottom: { ...DEFAULT_BOTTOM },
+    mounting: { ...DEFAULT_MOUNTING },
     tilt: DEFAULT_TILT,
     materials: structuredClone(DEFAULT_MATERIALS),
   }
