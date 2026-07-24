@@ -3,6 +3,7 @@ import * as THREE from 'three'
 import {
   capSize,
   hitTest,
+  isKeyMirrored,
   keySize,
   keyWorldXF,
   mirrorXF,
@@ -118,14 +119,18 @@ export function EditorCanvas() {
       if (state.keys.length === 0) return
       const groups = groupMap(state.groups)
       let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
+      let minXMirrored = Infinity
       for (const k of state.keys) {
         const w = keyWorldXF(k, groups)
         minX = Math.min(minX, w.x - 20)
         maxX = Math.max(maxX, w.x + 20)
         minY = Math.min(minY, w.y - 20)
         maxY = Math.max(maxY, w.y + 20)
+        if (isKeyMirrored(k, groups)) minXMirrored = Math.min(minXMirrored, w.x - 20)
       }
-      if (state.mirror.enabled) maxX = Math.max(maxX, 2 * state.mirror.axis - minX)
+      if (state.mirror.enabled && minXMirrored < Infinity) {
+        maxX = Math.max(maxX, 2 * state.mirror.axis - minXMirrored)
+      }
       view.cx = (minX + maxX) / 2
       view.cy = (minY + maxY) / 2
       const { clientWidth: w, clientHeight: h } = wrap
@@ -162,7 +167,7 @@ export function EditorCanvas() {
 
     const geoCache = new Map<string, THREE.BufferGeometry>()
     const shapeGeo = (kind: string, w: number, h: number, r: number) => {
-      const cacheKey = `${kind}:${w.toFixed(2)}x${h.toFixed(2)}`
+      const cacheKey = `${kind}:${w.toFixed(2)}x${h.toFixed(2)}:${r.toFixed(2)}`
       let geo = geoCache.get(cacheKey)
       if (!geo) {
         geo = new THREE.ShapeGeometry(roundedRect(w, h, r))
@@ -170,17 +175,26 @@ export function EditorCanvas() {
       }
       return geo
     }
-    const outlineGeo = (w: number, h: number) => {
-      const cacheKey = `outline:${w.toFixed(2)}x${h.toFixed(2)}`
+    // Traces the exact pitch-area footprint (matching the base mesh), so
+    // tangent keys show touching outlines and real overlaps stay visible.
+    // Sampled with the same divisions ShapeGeometry uses, so the line hugs
+    // the fill's corner arcs exactly.
+    const outlineGeo = (w: number, h: number, r: number) => {
+      const cacheKey = `outline:${w.toFixed(2)}x${h.toFixed(2)}:${r.toFixed(2)}`
       let geo = geoCache.get(cacheKey)
       if (!geo) {
         geo = new THREE.BufferGeometry().setFromPoints(
-          roundedRect(w + 1.6, h + 1.6, 2).getPoints(4),
+          roundedRect(w, h, r).getPoints(12),
         )
         geoCache.set(cacheKey, geo)
       }
       return geo
     }
+    // Cap corner radius; the base radius grows by the cap inset so the two
+    // rounded rects are concentric.
+    const CAP_RADIUS = 1.6
+    const baseRadius = (size: { w: number }, cap: { w: number }) =>
+      CAP_RADIUS + (size.w - cap.w) / 2
 
     const materials = {
       base: new THREE.MeshBasicMaterial({ color: COLORS.base }),
@@ -240,9 +254,10 @@ export function EditorCanvas() {
       if (force || v.key.type !== key.type || v.key.w !== key.w || v.key.h !== key.h) {
         const size = keySize(key)
         const cap = capSize(key)
-        v.base.geometry = shapeGeo('base', size.w, size.h, 0.8)
-        v.cap.geometry = shapeGeo('cap', cap.w, cap.h, 1.6)
-        v.outline.geometry = outlineGeo(size.w, size.h)
+        const r = baseRadius(size, cap)
+        v.base.geometry = shapeGeo('base', size.w, size.h, r)
+        v.cap.geometry = shapeGeo('cap', cap.w, cap.h, CAP_RADIUS)
+        v.outline.geometry = outlineGeo(size.w, size.h, r)
       }
       if (force || v.key.label !== key.label) {
         disposeSprite(v)
@@ -299,8 +314,8 @@ export function EditorCanvas() {
       if (force || v.key.type !== key.type || v.key.w !== key.w || v.key.h !== key.h) {
         const size = keySize(key)
         const cap = capSize(key)
-        v.base.geometry = shapeGeo('base', size.w, size.h, 0.8)
-        v.cap.geometry = shapeGeo('cap', cap.w, cap.h, 1.6)
+        v.base.geometry = shapeGeo('base', size.w, size.h, baseRadius(size, cap))
+        v.cap.geometry = shapeGeo('cap', cap.w, cap.h, CAP_RADIUS)
       }
       v.group.position.set(world.x, world.y, -0.5)
       v.group.rotation.z = (world.r * Math.PI) / 180
@@ -353,8 +368,13 @@ export function EditorCanvas() {
           views.delete(id)
         }
       }
+      const mirrored = new Set(
+        state.mirror.enabled
+          ? state.keys.filter((k) => isKeyMirrored(k, groups)).map((k) => k.id)
+          : [],
+      )
       for (const [id, v] of ghosts) {
-        if (!alive.has(id) || !state.mirror.enabled) {
+        if (!mirrored.has(id)) {
           scene.remove(v.group)
           ghosts.delete(id)
         }
@@ -367,7 +387,7 @@ export function EditorCanvas() {
         if (!v) views.set(key.id, createView(key, world, selected))
         else updateView(v, key, world, selected, false)
 
-        if (state.mirror.enabled) {
+        if (mirrored.has(key.id)) {
           const mw = mirrorXF(world, state.mirror.axis)
           const g = ghosts.get(key.id)
           if (!g) ghosts.set(key.id, createGhost(key, mw))
@@ -645,6 +665,9 @@ export function EditorCanvas() {
         e.preventDefault()
         if (e.shiftKey) state.ungroupSelection()
         else state.groupSelection()
+      } else if (mod && e.key.toLowerCase() === 'd') {
+        e.preventDefault()
+        state.duplicateSelection()
       } else if (e.key === 'Escape') {
         state.clearSelection()
       } else if (e.key.toLowerCase() === 'r' && !mod) {

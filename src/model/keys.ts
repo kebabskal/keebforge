@@ -18,18 +18,26 @@ export interface Key {
   /** Slot in a column-layout group; used to keep identity across regeneration. */
   col?: number
   row?: number
+  /** Include this key in the mirrored half (default true). */
+  mirror?: boolean
 }
 
 export interface ColumnDef {
   /** Vertical offset of the column, mm (column stagger). */
   stagger: number
-  /** Rotation of the column about its top key, degrees CCW (splay). */
+  /** Rotation of the column relative to the previous column, degrees CCW
+   * (splay). The column pivots about the corner it shares with the previous
+   * column, keeping the two tangent, and the rotation carries over to all
+   * later columns, so the cluster fans without keys overlapping. */
   splay: number
 }
 
 export type GroupLayout =
   | { kind: 'free' }
   | { kind: 'columns'; rows: number; columns: ColumnDef[]; keyType: KeyType }
+  /** Auto layout: pack the group's keys along one axis, each taking up its
+   * pitch-area extent plus `gap` mm between neighbours. */
+  | { kind: 'stack'; axis: 'x' | 'y'; gap: number }
 
 /** A group of keys with its own frame. Groups can nest via parentId. */
 export interface Group {
@@ -40,9 +48,13 @@ export interface Group {
   y: number
   r: number
   layout: GroupLayout
+  /** Include this group's keys in the mirrored half (default true). */
+  mirror?: boolean
 }
 
 export interface MirrorSettings {
+  /** Master toggle; individual keys/groups can opt out via their `mirror`
+   * flag. */
   enabled: boolean
   /** X position of the vertical mirror axis, mm (world). */
   axis: number
@@ -154,6 +166,23 @@ export function mirrorXF(xf: XForm, axis: number): XForm {
   return { x: 2 * axis - xf.x, y: xf.y, r: -xf.r }
 }
 
+/** True if the key participates in the mirrored half: neither the key nor
+ * any ancestor group has mirroring turned off. The document-level mirror
+ * toggle still gates the whole feature. */
+export function isKeyMirrored(key: Key, groups: Map<string, Group>): boolean {
+  if (key.mirror === false) return false
+  const visited = new Set<string>()
+  let id = key.groupId ?? null
+  while (id && !visited.has(id)) {
+    visited.add(id)
+    const g = groups.get(id)
+    if (!g) break
+    if (g.mirror === false) return false
+    id = g.parentId
+  }
+  return true
+}
+
 // ---- Key geometry ---------------------------------------------------------
 
 /** Footprint (pitch-area) size of a key in mm. */
@@ -190,28 +219,101 @@ export interface ColumnSlot {
 }
 
 /** Group-local key positions for a column layout. Each column sits one pitch
- * to the right of the previous, offset vertically by its stagger, and splayed
- * (rotated) about its top key. */
+ * to the right of the previous along the running (splayed) frame, offset by
+ * its stagger along its own column axis. Splay accumulates: rotating a column
+ * also rotates the frame the following columns are placed in, so columns with
+ * the same cumulative angle stay exactly one pitch apart.
+ *
+ * A splayed column pivots about the corner of the boundary it shares with the
+ * previous column — the top corner for positive splay, the bottom corner for
+ * negative — so the wedge always opens away from the pivot and the two
+ * columns' pitch areas stay tangent instead of overlapping. */
 export function columnSlots(layout: Extract<GroupLayout, { kind: 'columns' }>): ColumnSlot[] {
   const spec = SPEC[layout.keyType]
+  const colLen = (layout.rows - 1) * spec.pitchY
   const slots: ColumnSlot[] = []
+  // Origin of the current column (top-key level before stagger) and the
+  // cumulative angle of the frame it is placed in.
+  let ox = 0
+  let oy = 0
+  let angle = 0
   for (let col = 0; col < layout.columns.length; col++) {
     const def = layout.columns[col]
-    const rad = def.splay * DEG
-    const ox = col * spec.pitchX
-    const oy = def.stagger
+    if (col > 0 && def.splay !== 0) {
+      // Pivot on the boundary half a pitch left of this column's axis, level
+      // with the higher of the two columns' top edges (positive splay) or the
+      // lower of their bottom edges (negative splay), measured in the
+      // previous column's frame. Rotating about that corner keeps every
+      // point of this column on its own side of the boundary.
+      const prev = layout.columns[col - 1]
+      const pivotY =
+        def.splay > 0
+          ? Math.min(def.stagger, prev.stagger) + spec.pitchY / 2
+          : Math.max(def.stagger, prev.stagger) - colLen - spec.pitchY / 2
+      const rad0 = angle * DEG
+      const qx = ox - (spec.pitchX / 2) * Math.cos(rad0) - pivotY * Math.sin(rad0)
+      const qy = oy - (spec.pitchX / 2) * Math.sin(rad0) + pivotY * Math.cos(rad0)
+      const rd = def.splay * DEG
+      const dx = ox - qx
+      const dy = oy - qy
+      ox = qx + dx * Math.cos(rd) - dy * Math.sin(rd)
+      oy = qy + dx * Math.sin(rd) + dy * Math.cos(rd)
+    }
+    angle += def.splay
+    const rad = angle * DEG
+    const sin = Math.sin(rad)
+    const cos = Math.cos(rad)
+    // Top key: column origin shifted by stagger along the column's own axis.
+    const topX = ox - def.stagger * sin
+    const topY = oy + def.stagger * cos
     for (let row = 0; row < layout.rows; row++) {
       const d = row * spec.pitchY
       slots.push({
         col,
         row,
-        x: ox + d * Math.sin(rad),
-        y: oy - d * Math.cos(rad),
-        r: def.splay,
+        x: topX + d * sin,
+        y: topY - d * cos,
+        r: angle,
       })
     }
+    // Advance one pitch along the rotated frame; stagger intentionally does
+    // not carry over.
+    ox += spec.pitchX * cos
+    oy += spec.pitchX * sin
   }
   return slots
+}
+
+// ---- Stack layout ---------------------------------------------------------
+
+/** Group-local centers for a stack layout: keys pack along the axis in their
+ * current order along that axis (left-to-right for x, top-to-bottom for y),
+ * each taking its pitch-area extent plus the layout gap, centered on the
+ * group origin. Rotated keys take up their rotated bounding extent, so a
+ * gap of 0 keeps footprints tangent exactly like a column cluster does. */
+export function stackPositions(
+  layout: Extract<GroupLayout, { kind: 'stack' }>,
+  members: Key[],
+): Map<string, { x: number; y: number }> {
+  const ordered = [...members].sort((a, b) =>
+    layout.axis === 'x' ? a.x - b.x : b.y - a.y,
+  )
+  const extents = ordered.map((k) => {
+    const { w, h } = keySize(k)
+    const cos = Math.abs(Math.cos(k.r * DEG))
+    const sin = Math.abs(Math.sin(k.r * DEG))
+    return layout.axis === 'x' ? w * cos + h * sin : w * sin + h * cos
+  })
+  const total =
+    extents.reduce((s, e) => s + e, 0) + layout.gap * Math.max(0, ordered.length - 1)
+  const out = new Map<string, { x: number; y: number }>()
+  let cursor = -total / 2
+  ordered.forEach((k, i) => {
+    const center = cursor + extents[i] / 2
+    out.set(k.id, layout.axis === 'x' ? { x: center, y: 0 } : { x: 0, y: -center })
+    cursor += extents[i] + layout.gap
+  })
+  return out
 }
 
 // ---- Construction ---------------------------------------------------------

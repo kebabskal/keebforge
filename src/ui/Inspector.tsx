@@ -1,18 +1,23 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
+  isKeyMirrored,
   keyWorldXF,
   type Group,
   type GroupLayout,
   type Key,
   type KeyType,
 } from '../model/keys'
-import { groupMap, useDocStore } from '../model/store'
+import { coalesceUndo, groupMap, useDocStore } from '../model/store'
 import { FOAM_CLEARANCE, plateWithCutouts } from '../model/outline'
 import { downloadText, toDXF } from '../export/dxf'
 
 const fmt = (v: number) => String(Math.round(v * 1000) / 1000)
 
-/** Numeric field that commits on blur/Enter so typing doesn't spam undo history. */
+let editSession = 0
+
+/** Numeric field that commits live on every edit. Commits from one focus
+ * session share an undo-coalescing key, so typing a value is a single undo
+ * step instead of one per keystroke. */
 function NumberField(props: {
   label: string
   value: number
@@ -20,12 +25,19 @@ function NumberField(props: {
   onCommit: (value: number) => void
 }) {
   const [text, setText] = useState(fmt(props.value))
-  useEffect(() => setText(fmt(props.value)), [props.value])
+  const session = useRef('')
+  // Sync from external changes (undo, drags), but leave the text alone while
+  // it still parses to the current value so typing "5." isn't clobbered.
+  useEffect(() => {
+    setText((t) => (Number(t) === props.value ? t : fmt(props.value)))
+  }, [props.value])
 
-  const commit = () => {
-    const parsed = Number(text)
-    if (Number.isFinite(parsed) && parsed !== props.value) props.onCommit(parsed)
-    else setText(fmt(props.value))
+  const commit = (raw: string) => {
+    if (raw.trim() === '') return
+    const parsed = Number(raw)
+    if (!Number.isFinite(parsed) || parsed === props.value) return
+    if (!session.current) session.current = `edit${++editSession}`
+    coalesceUndo(session.current, () => props.onCommit(parsed))
   }
 
   return (
@@ -35,8 +47,14 @@ function NumberField(props: {
         type="number"
         step={props.step}
         value={text}
-        onChange={(e) => setText(e.target.value)}
-        onBlur={commit}
+        onFocus={() => {
+          session.current = `edit${++editSession}`
+        }}
+        onChange={(e) => {
+          setText(e.target.value)
+          commit(e.target.value)
+        }}
+        onBlur={() => setText(fmt(props.value))}
         onKeyDown={(e) => {
           if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
         }}
@@ -51,6 +69,7 @@ function TextField(props: {
   onCommit: (value: string) => void
 }) {
   const [text, setText] = useState(props.value)
+  const session = useRef('')
   useEffect(() => setText(props.value), [props.value])
   return (
     <label className="field">
@@ -58,9 +77,16 @@ function TextField(props: {
       <input
         type="text"
         value={text}
-        onChange={(e) => setText(e.target.value)}
-        onBlur={() => {
-          if (text !== props.value) props.onCommit(text)
+        onFocus={() => {
+          session.current = `edit${++editSession}`
+        }}
+        onChange={(e) => {
+          setText(e.target.value)
+          if (e.target.value !== props.value) {
+            if (!session.current) session.current = `edit${++editSession}`
+            const value = e.target.value
+            coalesceUndo(session.current, () => props.onCommit(value))
+          }
         }}
         onKeyDown={(e) => {
           if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
@@ -118,7 +144,57 @@ function GroupPanel({ group }: { group: Group }) {
           step={1}
           onCommit={(y) => updateGroup(group.id, { y })}
         />
+        <label className="field field-check">
+          <span>Mirror</span>
+          <input
+            type="checkbox"
+            checked={group.mirror !== false}
+            onChange={(e) => updateGroup(group.id, { mirror: e.target.checked })}
+          />
+        </label>
       </div>
+      {layout.kind !== 'columns' && (
+        <>
+          <h3>Auto layout</h3>
+          <div className="field-grid">
+            <label className="field">
+              <span>Layout</span>
+              <select
+                value={layout.kind === 'stack' ? `stack-${layout.axis}` : 'free'}
+                onChange={(e) => {
+                  const v = e.target.value
+                  if (v === 'free') updateGroupLayout(group.id, { kind: 'free' })
+                  else
+                    updateGroupLayout(group.id, {
+                      kind: 'stack',
+                      axis: v === 'stack-x' ? 'x' : 'y',
+                      gap: layout.kind === 'stack' ? layout.gap : 0,
+                    })
+                }}
+              >
+                <option value="free">Free</option>
+                <option value="stack-x">Stack X (row)</option>
+                <option value="stack-y">Stack Y (column)</option>
+              </select>
+            </label>
+            {layout.kind === 'stack' && (
+              <NumberField
+                label="Gap (mm)"
+                value={layout.gap}
+                step={0.5}
+                onCommit={(gap) => updateGroupLayout(group.id, { ...layout, gap })}
+              />
+            )}
+          </div>
+          {layout.kind === 'stack' && (
+            <p className="hint">
+              Keys pack along the {layout.axis === 'x' ? 'row' : 'column'} in
+              order, each taking up its own size. Drag a key within the stack
+              to reorder; resizing re-packs automatically.
+            </p>
+          )}
+        </>
+      )}
       {layout.kind === 'columns' && (
         <>
           <h3>Column layout</h3>
@@ -186,8 +262,8 @@ function GroupPanel({ group }: { group: Group }) {
           </div>
           <p className="hint">
             Stagger is the column's vertical offset (mm); splay rotates the
-            column about its top key (°). Layout changes regenerate key
-            positions.
+            column relative to the previous one (°) and carries over, fanning
+            the columns that follow. Layout changes regenerate key positions.
           </p>
         </>
       )}
@@ -204,6 +280,11 @@ function DocumentPanel() {
   const plate = useDocStore((s) => s.plate)
   const setPlate = useDocStore((s) => s.setPlate)
   const keyCount = useDocStore((s) => s.keys.length)
+  const mirroredCount = useDocStore((s) =>
+    s.mirror.enabled
+      ? s.keys.filter((k) => isKeyMirrored(k, groupMap(s.groups))).length
+      : 0,
+  )
 
   const exportDXF = (clearance: number, filename: string) => {
     const { keys, groups, mirror, plate } = useDocStore.getState()
@@ -215,7 +296,8 @@ function DocumentPanel() {
     <>
       <h2>Document</h2>
       <p className="hint">
-        {keyCount} keys{mirror.enabled ? ` (${keyCount * 2} with mirror)` : ''}
+        {keyCount} keys
+        {mirror.enabled ? ` (${keyCount + mirroredCount} with mirror)` : ''}
       </p>
       <div className="field-grid">
         <label className="field field-check">
@@ -257,6 +339,7 @@ function DocumentPanel() {
       <ul className="hint">
         <li>Click — select key's group; <kbd>Alt</kbd>-click — single key</li>
         <li><kbd>Ctrl+G</kbd> / <kbd>Ctrl+Shift+G</kbd> — group / ungroup</li>
+        <li><kbd>Ctrl+D</kbd> — duplicate selection</li>
         <li><kbd>R</kbd> / <kbd>Shift+R</kbd> — rotate ±15°</li>
         <li><kbd>Arrows</kbd> — nudge (Shift for 0.1 mm)</li>
         <li><kbd>Del</kbd> — delete selection</li>
@@ -344,6 +427,14 @@ export function Inspector() {
           value={primary.label}
           onCommit={(label) => updateSelected({ label })}
         />
+        <label className="field field-check">
+          <span>Mirror</span>
+          <input
+            type="checkbox"
+            checked={primary.mirror !== false}
+            onChange={(e) => updateSelected({ mirror: e.target.checked })}
+          />
+        </label>
       </div>
       {selected.length > 1 && (
         <p className="hint">

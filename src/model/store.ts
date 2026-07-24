@@ -3,10 +3,12 @@ import {
   columnSlots,
   defaultDoc,
   groupWorldXF,
+  isKeyMirrored,
   keyWorldXF,
   makeKey,
   newId,
   rotateDelta,
+  stackPositions,
   worldToLocal,
   U,
   type ColumnDef,
@@ -21,7 +23,18 @@ import {
 } from './keys'
 
 const STORAGE_KEY = 'keebforge.doc.v1'
+const SNAP_KEY = 'keebforge.snap'
 const MAX_HISTORY = 200
+
+function loadSnapStep(): number {
+  try {
+    const raw = localStorage.getItem(SNAP_KEY)
+    const parsed = raw === null ? NaN : Number(raw)
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : U / 4
+  } catch {
+    return U / 4
+  }
+}
 
 export interface TransformPatches {
   keys?: Map<string, Partial<Key>>
@@ -46,6 +59,11 @@ export interface DocState extends Doc {
   addKey: (type: KeyType) => void
   addColumnCluster: () => void
   deleteSelected: () => void
+  /** Clone the selection one unit down-right and select the clones.
+   * Fully-selected top-level groups are cloned with their whole subtree;
+   * other keys are cloned individually (keys from generated column layouts
+   * become free keys, since regeneration would discard extras). */
+  duplicateSelection: () => void
   /** Patch group-local key properties (type, size, label, rotation…). */
   updateSelected: (patch: Partial<Omit<Key, 'id'>>) => void
   /** Set world-space position; converted per key into its group frame. */
@@ -129,7 +147,9 @@ export function wholeSelectedGroup(state: {
 }
 
 /** Regenerate a column-layout group's keys from its layout definition. Keys
- * keep their identity (and label/type tweaks) via their col/row slot. */
+ * keep their identity (and label/size tweaks) via their col/row slot. The
+ * layout's keyType is stamped onto every member so slot spacing and switch
+ * type can never drift apart. */
 function regenerateGroup(group: Group, keys: Key[]): Key[] {
   if (group.layout.kind !== 'columns') return keys
   const layout = group.layout
@@ -142,7 +162,7 @@ function regenerateGroup(group: Group, keys: Key[]): Key[] {
   for (const slot of slots) {
     const existing = bySlot.get(`${slot.col},${slot.row}`)
     if (existing) {
-      result.push({ ...existing, x: slot.x, y: slot.y, r: slot.r })
+      result.push({ ...existing, type: layout.keyType, x: slot.x, y: slot.y, r: slot.r })
     } else {
       result.push({
         ...makeKey(layout.keyType, slot.x, slot.y),
@@ -152,6 +172,27 @@ function regenerateGroup(group: Group, keys: Key[]): Key[] {
         row: slot.row,
       })
     }
+  }
+  return result
+}
+
+/** Re-pack the keys of every stack-layout group along its axis. Preserves
+ * object identity when nothing moves, so no-op commits stay cheap. */
+function relayoutStacks(keys: Key[], groups: Group[]): Key[] {
+  let result = keys
+  for (const g of groups) {
+    if (g.layout.kind !== 'stack') continue
+    const members = result.filter((k) => k.groupId === g.id)
+    if (members.length === 0) continue
+    const pos = stackPositions(g.layout, members)
+    let changed = false
+    const next = result.map((k) => {
+      const p = pos.get(k.id)
+      if (!p || (k.x === p.x && k.y === p.y)) return k
+      changed = true
+      return { ...k, x: p.x, y: p.y }
+    })
+    if (changed) result = next
   }
   return result
 }
@@ -185,12 +226,30 @@ function loadSaved(): Doc | null {
 
 let transformSnapshot: Doc | null = null
 
+/** Undo coalescing: commits made inside `coalesceUndo` with the same key as
+ * the immediately preceding commit collapse into one undo step, so live
+ * editing a field doesn't record every keystroke. Any commit outside
+ * `coalesceUndo` (or with a different key) starts a fresh step. */
+let pendingCoalesceKey: string | null = null
+let lastCoalesceKey: string | null = null
+
+export function coalesceUndo<T>(key: string, fn: () => T): T {
+  pendingCoalesceKey = key
+  try {
+    return fn()
+  } finally {
+    pendingCoalesceKey = null
+  }
+}
+
 const docOf = (s: Doc): Doc => ({ keys: s.keys, groups: s.groups, mirror: s.mirror, plate: s.plate })
 
 export const useDocStore = create<DocState>((set, get) => {
   const commit = (patch: Partial<Doc>) => {
     const state = get()
     const prev = docOf(state)
+    const pushPast = pendingCoalesceKey === null || pendingCoalesceKey !== lastCoalesceKey
+    lastCoalesceKey = pendingCoalesceKey
     let keys = patch.keys ?? state.keys
     let groups = patch.groups ?? state.groups
     // Garbage-collect groups that lost all their keys and child groups.
@@ -204,13 +263,14 @@ export const useDocStore = create<DocState>((set, get) => {
       const dead = new Set(empty.map((g) => g.id))
       groups = groups.filter((g) => !dead.has(g.id))
     }
+    keys = relayoutStacks(keys, groups)
     const alive = new Set(keys.map((k) => k.id))
     set({
       keys,
       groups,
       mirror: patch.mirror ?? state.mirror,
       plate: patch.plate ?? state.plate,
-      past: [...state.past.slice(-MAX_HISTORY + 1), prev],
+      past: pushPast ? [...state.past.slice(-MAX_HISTORY + 1), prev] : state.past,
       future: [],
       selection: new Set([...state.selection].filter((id) => alive.has(id))),
     })
@@ -221,9 +281,16 @@ export const useDocStore = create<DocState>((set, get) => {
     selection: new Set(),
     past: [],
     future: [],
-    snapStep: U / 4,
+    snapStep: loadSnapStep(),
 
-    setSnapStep: (step) => set({ snapStep: step }),
+    setSnapStep: (step) => {
+      set({ snapStep: step })
+      try {
+        localStorage.setItem(SNAP_KEY, String(step))
+      } catch {
+        // Storage full or unavailable — persistence is best-effort.
+      }
+    },
     setSelection: (ids) => set({ selection: new Set(ids) }),
     addToSelection: (ids) => {
       const selection = new Set(get().selection)
@@ -259,14 +326,14 @@ export const useDocStore = create<DocState>((set, get) => {
       const state = get()
       const groups = groupMap(state.groups)
       let maxX = 0
-      let minX = 0
+      let minXMirrored = 0
       for (const k of state.keys) {
         const wx = keyWorldXF(k, groups).x
         maxX = Math.max(maxX, wx)
-        minX = Math.min(minX, wx)
+        if (isKeyMirrored(k, groups)) minXMirrored = Math.min(minXMirrored, wx)
       }
       // Keep clear of the mirrored half too.
-      if (state.mirror.enabled) maxX = Math.max(maxX, 2 * state.mirror.axis - minX)
+      if (state.mirror.enabled) maxX = Math.max(maxX, 2 * state.mirror.axis - minXMirrored)
       const group: Group = {
         id: newId('g'),
         name: `Cluster ${state.groups.length + 1}`,
@@ -298,12 +365,115 @@ export const useDocStore = create<DocState>((set, get) => {
       commit({ keys: keys.filter((k) => !selection.has(k.id)) })
     },
 
-    updateSelected: (patch) => {
-      const { keys, selection } = get()
-      if (selection.size === 0) return
+    duplicateSelection: () => {
+      const state = get()
+      if (state.selection.size === 0) return
+      const groups = groupMap(state.groups)
+      const dx = U
+      const dy = -U
+      const newKeys: Key[] = []
+      const newGroups: Group[] = []
+      const cloned = new Set<string>()
+
+      // Fully-selected top-level groups: clone the whole subtree.
+      const topsSeen = new Set<string>()
+      for (const key of state.keys) {
+        if (!state.selection.has(key.id)) continue
+        const top = topGroupOf(key, groups)
+        if (!top || topsSeen.has(top.id)) continue
+        topsSeen.add(top.id)
+        const members = memberKeyIds(top.id, state.keys, state.groups)
+        if (!members.every((id) => state.selection.has(id))) continue
+        const inTree = new Set([top.id])
+        let grew = true
+        while (grew) {
+          grew = false
+          for (const g of state.groups) {
+            if (g.parentId && inTree.has(g.parentId) && !inTree.has(g.id)) {
+              inTree.add(g.id)
+              grew = true
+            }
+          }
+        }
+        const idMap = new Map<string, string>()
+        for (const gid of inTree) idMap.set(gid, newId('g'))
+        for (const g of state.groups) {
+          if (!inTree.has(g.id)) continue
+          newGroups.push({
+            ...g,
+            id: idMap.get(g.id)!,
+            parentId: g.parentId && idMap.has(g.parentId) ? idMap.get(g.parentId)! : null,
+            x: g.id === top.id ? g.x + dx : g.x,
+            y: g.id === top.id ? g.y + dy : g.y,
+          })
+        }
+        const memberSet = new Set(members)
+        for (const k of state.keys) {
+          if (!memberSet.has(k.id)) continue
+          cloned.add(k.id)
+          newKeys.push({ ...k, id: newId(), groupId: idMap.get(k.groupId!)! })
+        }
+      }
+
+      // Remaining selected keys: clone individually.
+      for (const key of state.keys) {
+        if (!state.selection.has(key.id) || cloned.has(key.id)) continue
+        const g = key.groupId ? groups.get(key.groupId) : undefined
+        if (g && g.layout.kind === 'columns') {
+          const world = keyWorldXF(key, groups)
+          newKeys.push({
+            ...key,
+            id: newId(),
+            x: world.x + dx,
+            y: world.y + dy,
+            r: world.r,
+            groupId: null,
+            col: undefined,
+            row: undefined,
+          })
+        } else {
+          const frame = groupWorldXF(groups, key.groupId)
+          const local = rotateDelta(frame.r, dx, dy)
+          newKeys.push({ ...key, id: newId(), x: key.x + local.x, y: key.y + local.y })
+        }
+      }
+
       commit({
-        keys: keys.map((k) => (selection.has(k.id) ? { ...k, ...patch } : k)),
+        keys: [...state.keys, ...newKeys],
+        groups: [...state.groups, ...newGroups],
       })
+      set({ selection: new Set(newKeys.map((k) => k.id)) })
+    },
+
+    updateSelected: (patch) => {
+      const state = get()
+      if (state.selection.size === 0) return
+      let keys = state.keys.map((k) =>
+        state.selection.has(k.id) ? { ...k, ...patch } : k,
+      )
+      let groups = state.groups
+      if (patch.type) {
+        // Switch type inside a column cluster is a group-level property:
+        // retarget the layout and regenerate so slot spacing follows.
+        const affected = new Set(
+          state.keys
+            .filter((k) => state.selection.has(k.id) && k.groupId)
+            .map((k) => k.groupId as string),
+        )
+        groups = groups.map((g) =>
+          affected.has(g.id) &&
+          g.layout.kind === 'columns' &&
+          g.layout.keyType !== patch.type
+            ? { ...g, layout: { ...g.layout, keyType: patch.type! } }
+            : g,
+        )
+        for (const g of groups) {
+          if (g.layout.kind === 'columns' && affected.has(g.id)) {
+            keys = regenerateGroup(g, keys)
+          }
+        }
+      }
+      commit({ keys, groups })
     },
 
     updateSelectedWorld: (patch) => {
@@ -473,13 +643,20 @@ export const useDocStore = create<DocState>((set, get) => {
       if (!snapshot) return
       const now = get()
       if (snapshot.keys === now.keys && snapshot.groups === now.groups) return
-      set({ past: [...now.past.slice(-MAX_HISTORY + 1), snapshot], future: [] })
+      lastCoalesceKey = null
+      set({
+        // Re-pack stacks so dragging a key within one reorders it on drop.
+        keys: relayoutStacks(now.keys, now.groups),
+        past: [...now.past.slice(-MAX_HISTORY + 1), snapshot],
+        future: [],
+      })
     },
 
     undo: () => {
       const state = get()
       const prev = state.past.at(-1)
       if (!prev) return
+      lastCoalesceKey = null
       const alive = new Set(prev.keys.map((k) => k.id))
       set({
         ...prev,
@@ -492,6 +669,7 @@ export const useDocStore = create<DocState>((set, get) => {
       const state = get()
       const next = state.future[0]
       if (!next) return
+      lastCoalesceKey = null
       const alive = new Set(next.keys.map((k) => k.id))
       set({
         ...next,

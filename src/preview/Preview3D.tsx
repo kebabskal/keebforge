@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
-import { capSize, keyWorldXF, mirrorXF, type XForm } from '../model/keys'
+import { capSize, isKeyMirrored, keyWorldXF, mirrorXF, type XForm } from '../model/keys'
 import {
   FOAM_CLEARANCE,
   FOAM_THICKNESS,
@@ -156,21 +156,27 @@ export function Preview3D() {
           board.add(mesh)
         }
       }
-      addSlab(plateWithCutouts(doc), PLATE_THICKNESS, -PLATE_THICKNESS, materials.plate, true)
-      addSlab(
-        plateWithCutouts(doc, FOAM_CLEARANCE),
-        FOAM_THICKNESS,
-        -PLATE_THICKNESS - FOAM_THICKNESS,
-        materials.foam,
-        false,
-      )
+      // A clipping failure should degrade to "no plate shown", not crash the
+      // whole app (React unmounts the tree on uncaught render errors).
+      try {
+        addSlab(plateWithCutouts(doc), PLATE_THICKNESS, -PLATE_THICKNESS, materials.plate, true)
+        addSlab(
+          plateWithCutouts(doc, FOAM_CLEARANCE),
+          FOAM_THICKNESS,
+          -PLATE_THICKNESS - FOAM_THICKNESS,
+          materials.foam,
+          false,
+        )
+      } catch (error) {
+        console.warn('keebforge: plate outline generation failed', error)
+      }
 
       // Switches and keycaps (mirrored copies included).
       const worlds: { world: XForm; key: (typeof doc.keys)[number] }[] = []
       for (const key of doc.keys) {
         const world = keyWorldXF(key, groups)
         worlds.push({ key, world })
-        if (doc.mirror.enabled) {
+        if (doc.mirror.enabled && isKeyMirrored(key, groups)) {
           worlds.push({ key, world: mirrorXF(world, doc.mirror.axis) })
         }
       }
