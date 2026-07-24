@@ -17,21 +17,39 @@ import {
   wholeSelectedGroup,
   type TransformPatches,
 } from '../model/store'
+import { useTheme } from '../ui/theme'
 
-const COLORS = {
-  bg: 0x16171d,
-  grid: 0x23252e,
-  gridCenter: 0x30333f,
-  base: 0x1e2028,
-  baseSelected: 0x263248,
-  capMx: 0x4c505f,
-  capChoc: 0x46605d,
-  capSelected: 0x5f6a8c,
-  outline: 0x6aa6ff,
-  groupOutline: 0x8f7ddb,
-  mirrorAxis: 0x50b88a,
-  ghost: 0x3b3f4d,
-  label: '#e8eaf0',
+const PALETTES = {
+  dark: {
+    bg: 0x16171d,
+    grid: 0x23252e,
+    gridCenter: 0x30333f,
+    base: 0x1e2028,
+    baseSelected: 0x263248,
+    capMx: 0x4c505f,
+    capChoc: 0x46605d,
+    capSelected: 0x5f6a8c,
+    outline: 0x6aa6ff,
+    groupOutline: 0x8f7ddb,
+    mirrorAxis: 0x50b88a,
+    ghost: 0x3b3f4d,
+    label: '#e8eaf0',
+  },
+  light: {
+    bg: 0xf2f3f6,
+    grid: 0xe1e4ea,
+    gridCenter: 0xd2d6df,
+    base: 0xd6dae2,
+    baseSelected: 0xc3d4f2,
+    capMx: 0xfdfdfb,
+    capChoc: 0xe9f2f0,
+    capSelected: 0xbfd0f0,
+    outline: 0x2f6fd0,
+    groupOutline: 0x7a5fd0,
+    mirrorAxis: 0x2e9968,
+    ghost: 0xc4c9d3,
+    label: '#2c313b',
+  },
 }
 
 function roundedRect(w: number, h: number, r: number): THREE.Shape {
@@ -50,7 +68,7 @@ function roundedRect(w: number, h: number, r: number): THREE.Shape {
   return s
 }
 
-function makeLabelTexture(label: string): THREE.CanvasTexture {
+function makeLabelTexture(label: string, color: string): THREE.CanvasTexture {
   const canvas = document.createElement('canvas')
   canvas.width = 256
   canvas.height = 128
@@ -58,7 +76,7 @@ function makeLabelTexture(label: string): THREE.CanvasTexture {
   ctx.font = '600 72px system-ui, sans-serif'
   ctx.textAlign = 'center'
   ctx.textBaseline = 'middle'
-  ctx.fillStyle = COLORS.label
+  ctx.fillStyle = color
   ctx.fillText(label, 128, 70, 240)
   const texture = new THREE.CanvasTexture(canvas)
   texture.colorSpace = THREE.SRGBColorSpace
@@ -75,6 +93,7 @@ export function EditorCanvas() {
     if (!wrap || !band) return
 
     const store = useDocStore
+    const COLORS = PALETTES[useTheme.getState().theme]
 
     const renderer = new THREE.WebGLRenderer({ antialias: true })
     renderer.setPixelRatio(window.devicePixelRatio)
@@ -229,7 +248,7 @@ export function EditorCanvas() {
         disposeSprite(v)
         if (key.label) {
           const material = new THREE.SpriteMaterial({
-            map: makeLabelTexture(key.label),
+            map: makeLabelTexture(key.label, COLORS.label),
             transparent: true,
             depthTest: false,
           })

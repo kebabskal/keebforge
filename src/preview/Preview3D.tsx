@@ -10,6 +10,7 @@ import {
   type MultiPolygon,
 } from '../model/outline'
 import { groupMap, useDocStore } from '../model/store'
+import { useTheme } from '../ui/theme'
 
 /** Simplified switch/cap dimensions per type, mm (heights above plate top). */
 const SWITCH_3D = {
@@ -50,6 +51,7 @@ export function Preview3D() {
     if (!wrap) return
 
     const store = useDocStore
+    const light = useTheme.getState().theme === 'light'
 
     const renderer = new THREE.WebGLRenderer({ antialias: true })
     renderer.setPixelRatio(window.devicePixelRatio)
@@ -58,7 +60,7 @@ export function Preview3D() {
     wrap.appendChild(renderer.domElement)
 
     const scene = new THREE.Scene()
-    scene.background = new THREE.Color(0x16171d)
+    scene.background = new THREE.Color(light ? 0xe6e9ef : 0x16171d)
 
     const camera = new THREE.PerspectiveCamera(40, 1, 1, 3000)
     const controls = new OrbitControls(camera, renderer.domElement)
@@ -78,7 +80,7 @@ export function Preview3D() {
 
     const ground = new THREE.Mesh(
       new THREE.PlaneGeometry(4000, 4000),
-      new THREE.ShadowMaterial({ opacity: 0.3 }),
+      new THREE.ShadowMaterial({ opacity: light ? 0.18 : 0.3 }),
     )
     ground.rotation.x = -Math.PI / 2
     ground.position.y = -FOAM_THICKNESS - PLATE_THICKNESS - 0.01

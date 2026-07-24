@@ -9,7 +9,7 @@ header {
   align-items: center;
   gap: 1.5rem;
   padding: 0.5rem 1rem;
-  border-bottom: 1px solid #262833;
+  border-bottom: 1px solid var(--border);
 }
 
 header h1 {
@@ -26,7 +26,7 @@ main {
 
 .view-toggle {
   display: flex;
-  border: 1px solid #32353f;
+  border: 1px solid var(--border-strong);
   border-radius: 6px;
   overflow: hidden;
 }
@@ -35,14 +35,32 @@ main {
   font: inherit;
   font-size: 0.85rem;
   color: var(--text);
-  background: #1c1e26;
+  background: var(--input-bg);
   border: none;
   padding: 0.3rem 0.8rem;
   cursor: pointer;
 }
 
 .view-toggle button.active {
-  background: #2c3a55;
+  background: var(--accent-bg);
+  color: var(--text-h);
+}
+
+.theme-btn {
+  margin-left: auto;
+  font: inherit;
+  font-size: 1rem;
+  line-height: 1;
+  color: var(--text);
+  background: var(--control);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 0.3rem 0.6rem;
+  cursor: pointer;
+}
+
+.theme-btn:hover {
+  background: var(--control-hover);
   color: var(--text-h);
 }
 
@@ -56,15 +74,15 @@ main {
   font: inherit;
   font-size: 0.85rem;
   color: var(--text);
-  background: #22242e;
-  border: 1px solid #32353f;
+  background: var(--control);
+  border: 1px solid var(--border-strong);
   border-radius: 6px;
   padding: 0.35rem 0.5rem;
   cursor: pointer;
 }
 
 .button-row button:hover {
-  background: #2b2e3a;
+  background: var(--control-hover);
   color: var(--text-h);
 }
 
@@ -83,15 +101,15 @@ main {
   font: inherit;
   font-size: 0.85rem;
   color: var(--text);
-  background: #22242e;
-  border: 1px solid #32353f;
+  background: var(--control);
+  border: 1px solid var(--border-strong);
   border-radius: 6px;
   padding: 0.3rem 0.7rem;
   cursor: pointer;
 }
 
 .toolbar button:hover:not(:disabled) {
-  background: #2b2e3a;
+  background: var(--control-hover);
   color: var(--text-h);
 }
 
@@ -101,8 +119,8 @@ main {
 }
 
 .toolbar button.active {
-  background: #2c3a55;
-  border-color: #6aa6ff;
+  background: var(--accent-bg);
+  border-color: var(--accent);
   color: var(--text-h);
 }
 
@@ -110,7 +128,7 @@ main {
   width: 1px;
   align-self: stretch;
   margin: 0.15rem 0.35rem;
-  background: #2c2e38;
+  background: var(--border);
 }
 
 /* Editor canvas */
@@ -131,8 +149,8 @@ main {
   display: none;
   position: absolute;
   pointer-events: none;
-  border: 1px solid #6aa6ff;
-  background: rgba(106, 166, 255, 0.12);
+  border: 1px solid var(--accent);
+  background: var(--accent-veil);
 }
 
 /* Inspector */
@@ -141,7 +159,7 @@ main {
   width: 270px;
   flex-shrink: 0;
   padding: 1rem;
-  border-left: 1px solid #262833;
+  border-left: 1px solid var(--border);
   overflow-y: auto;
   font-size: 0.85rem;
 }
@@ -181,8 +199,8 @@ main {
 .field select {
   font: inherit;
   color: var(--text-h);
-  background: #1c1e26;
-  border: 1px solid #32353f;
+  background: var(--input-bg);
+  border: 1px solid var(--border-strong);
   border-radius: 6px;
   padding: 0.3rem 0.5rem;
   width: 100%;
@@ -192,7 +210,7 @@ main {
 .field input:focus,
 .field select:focus {
   outline: none;
-  border-color: #6aa6ff;
+  border-color: var(--accent);
 }
 
 .field-check {
@@ -234,15 +252,15 @@ main {
   font: inherit;
   font-size: 0.85rem;
   color: var(--text);
-  background: #22242e;
-  border: 1px solid #32353f;
+  background: var(--control);
+  border: 1px solid var(--border-strong);
   border-radius: 6px;
   padding: 0.35rem 0.7rem;
   cursor: pointer;
 }
 
 .inspector button.wide:hover {
-  background: #2b2e3a;
+  background: var(--control-hover);
   color: var(--text-h);
 }
 
@@ -260,8 +278,8 @@ p.hint {
 kbd {
   font-family: inherit;
   font-size: 0.78rem;
-  background: #22242e;
-  border: 1px solid #32353f;
+  background: var(--control);
+  border: 1px solid var(--border-strong);
   border-radius: 4px;
   padding: 0 0.3rem;
 }
