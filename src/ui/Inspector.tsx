@@ -7,7 +7,7 @@ import {
   type Key,
   type KeyType,
 } from '../model/keys'
-import { coalesceUndo, groupMap, useDocStore } from '../model/store'
+import { alignmentItems, coalesceUndo, groupMap, useDocStore } from '../model/store'
 import { FOAM_CLEARANCE, plateWithCutouts } from '../model/outline'
 import { downloadText, toDXF } from '../export/dxf'
 
@@ -357,6 +357,8 @@ export function Inspector() {
   const selection = useDocStore((s) => s.selection)
   const updateSelected = useDocStore((s) => s.updateSelected)
   const updateSelectedWorld = useDocStore((s) => s.updateSelectedWorld)
+  const alignSelected = useDocStore((s) => s.alignSelected)
+  const distributeSelected = useDocStore((s) => s.distributeSelected)
 
   const selected = keys.filter((k) => selection.has(k.id))
   const primary: Key | undefined = selected[0]
@@ -371,6 +373,7 @@ export function Inspector() {
 
   const gmap = groupMap(groups)
   const world = keyWorldXF(primary, gmap)
+  const alignCount = alignmentItems({ keys, groups, selection }).length
   const sharedGroupId = selected.every((k) => k.groupId === primary.groupId)
     ? primary.groupId
     : null
@@ -440,6 +443,63 @@ export function Inspector() {
         <p className="hint">
           Values show the first selected key; edits apply to all selected keys.
         </p>
+      )}
+      {alignCount > 1 && (
+        <>
+          <h3>Align</h3>
+          <div className="align-rows">
+            <div className="button-row">
+              <button onClick={() => alignSelected('left')} title="Align left edges">
+                Left
+              </button>
+              <button
+                onClick={() => alignSelected('hcenter')}
+                title="Align horizontal centers"
+              >
+                Center
+              </button>
+              <button onClick={() => alignSelected('right')} title="Align right edges">
+                Right
+              </button>
+            </div>
+            <div className="button-row">
+              <button onClick={() => alignSelected('top')} title="Align top edges">
+                Top
+              </button>
+              <button
+                onClick={() => alignSelected('vcenter')}
+                title="Align vertical centers"
+              >
+                Middle
+              </button>
+              <button
+                onClick={() => alignSelected('bottom')}
+                title="Align bottom edges"
+              >
+                Bottom
+              </button>
+            </div>
+            {alignCount > 2 && (
+              <div className="button-row">
+                <button
+                  onClick={() => distributeSelected('x')}
+                  title="Space evenly left to right"
+                >
+                  Space H
+                </button>
+                <button
+                  onClick={() => distributeSelected('y')}
+                  title="Space evenly top to bottom"
+                >
+                  Space V
+                </button>
+              </div>
+            )}
+          </div>
+          <p className="hint">
+            Aligns in world space; a fully selected group moves as one piece.
+          </p>
+        </>
       )}
       {sharedGroup && <GroupPanel group={sharedGroup} />}
     </aside>

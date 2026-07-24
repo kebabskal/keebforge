@@ -200,6 +200,25 @@ export function capSize(key: Key): { w: number; h: number } {
   }
 }
 
+/** World axis-aligned bounding box of a key's pitch area. */
+export function keyWorldAABB(
+  key: Key,
+  groups: Map<string, Group>,
+): { minX: number; minY: number; maxX: number; maxY: number } {
+  const world = keyWorldXF(key, groups)
+  const { w, h } = keySize(key)
+  const cos = Math.abs(Math.cos(world.r * DEG))
+  const sin = Math.abs(Math.sin(world.r * DEG))
+  const ew = w * cos + h * sin
+  const eh = w * sin + h * cos
+  return {
+    minX: world.x - ew / 2,
+    minY: world.y - eh / 2,
+    maxX: world.x + ew / 2,
+    maxY: world.y + eh / 2,
+  }
+}
+
 /** True if the world point falls inside the key's pitch area, given the key's
  * world transform. */
 export function hitTest(key: Key, world: XForm, x: number, y: number): boolean {

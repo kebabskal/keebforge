@@ -69,6 +69,12 @@ main {
   gap: 0.5rem;
 }
 
+.align-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
 .button-row button {
   flex: 1;
   font: inherit;

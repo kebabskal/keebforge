@@ -4,6 +4,7 @@ import {
   defaultDoc,
   groupWorldXF,
   isKeyMirrored,
+  keyWorldAABB,
   keyWorldXF,
   makeKey,
   newId,
@@ -73,6 +74,12 @@ export interface DocState extends Doc {
   rotateSelected: (deg: number) => void
   /** Move the selection by a world-space delta (group-aware like rotate). */
   nudgeSelected: (dx: number, dy: number) => void
+  /** Align the selection's edges/centers in world space. Fully-selected
+   * top-level groups move as one rigid unit; other keys move individually. */
+  alignSelected: (mode: AlignMode) => void
+  /** Space the selection evenly along an axis; the outermost items stay put.
+   * Group-aware like align. */
+  distributeSelected: (axis: 'x' | 'y') => void
 
   groupSelection: () => void
   ungroupSelection: () => void
@@ -144,6 +151,67 @@ export function wholeSelectedGroup(state: {
   const members = memberKeyIds(top.id, state.keys, state.groups)
   if (members.length !== state.selection.size) return null
   return members.every((id) => state.selection.has(id)) ? top : null
+}
+
+export type AlignMode = 'left' | 'hcenter' | 'right' | 'top' | 'vcenter' | 'bottom'
+
+export interface AlignItem {
+  /** Fully-selected top-level group moved as one rigid unit, or null when the
+   * item is a single key. */
+  group: Group | null
+  keys: Key[]
+  minX: number
+  minY: number
+  maxX: number
+  maxY: number
+}
+
+/** Break the selection into alignable units: each fully-selected top-level
+ * group is one unit, every other selected key is its own unit. Bounds are
+ * world-space AABBs of the pitch areas. */
+export function alignmentItems(state: {
+  keys: Key[]
+  groups: Group[]
+  selection: Set<string>
+}): AlignItem[] {
+  const groups = groupMap(state.groups)
+  const items: AlignItem[] = []
+  const consumed = new Set<string>()
+  const topsSeen = new Set<string>()
+  const makeItem = (group: Group | null, keys: Key[]): AlignItem => {
+    const item = {
+      group,
+      keys,
+      minX: Infinity,
+      minY: Infinity,
+      maxX: -Infinity,
+      maxY: -Infinity,
+    }
+    for (const k of keys) {
+      const b = keyWorldAABB(k, groups)
+      item.minX = Math.min(item.minX, b.minX)
+      item.minY = Math.min(item.minY, b.minY)
+      item.maxX = Math.max(item.maxX, b.maxX)
+      item.maxY = Math.max(item.maxY, b.maxY)
+    }
+    return item
+  }
+  for (const key of state.keys) {
+    if (!state.selection.has(key.id) || consumed.has(key.id)) continue
+    const top = topGroupOf(key, groups)
+    if (top && !topsSeen.has(top.id)) {
+      topsSeen.add(top.id)
+      const members = memberKeyIds(top.id, state.keys, state.groups)
+      if (members.every((id) => state.selection.has(id))) {
+        const memberSet = new Set(members)
+        for (const id of members) consumed.add(id)
+        items.push(makeItem(top, state.keys.filter((k) => memberSet.has(k.id))))
+        continue
+      }
+    }
+    items.push(makeItem(null, [key]))
+  }
+  return items
 }
 
 /** Regenerate a column-layout group's keys from its layout definition. Keys
@@ -273,6 +341,35 @@ export const useDocStore = create<DocState>((set, get) => {
       past: pushPast ? [...state.past.slice(-MAX_HISTORY + 1), prev] : state.past,
       future: [],
       selection: new Set([...state.selection].filter((id) => alive.has(id))),
+    })
+  }
+
+  /** Move alignment items by world-space deltas and commit once. Group units
+   * are top-level, so the world delta applies to the group origin directly;
+   * loose keys get the delta rotated into their group frame. */
+  const applyItemMoves = (moves: { item: AlignItem; dx: number; dy: number }[]) => {
+    const state = get()
+    const groups = groupMap(state.groups)
+    const groupDelta = new Map<string, { dx: number; dy: number }>()
+    const keyDelta = new Map<string, { dx: number; dy: number }>()
+    for (const { item, dx, dy } of moves) {
+      if (Math.abs(dx) < 1e-9 && Math.abs(dy) < 1e-9) continue
+      if (item.group) groupDelta.set(item.group.id, { dx, dy })
+      else for (const k of item.keys) keyDelta.set(k.id, { dx, dy })
+    }
+    if (groupDelta.size === 0 && keyDelta.size === 0) return
+    commit({
+      keys: state.keys.map((k) => {
+        const d = keyDelta.get(k.id)
+        if (!d) return k
+        const frame = groupWorldXF(groups, k.groupId)
+        const local = rotateDelta(frame.r, d.dx, d.dy)
+        return { ...k, x: k.x + local.x, y: k.y + local.y }
+      }),
+      groups: state.groups.map((g) => {
+        const d = groupDelta.get(g.id)
+        return d ? { ...g, x: g.x + d.dx, y: g.y + d.dy } : g
+      }),
     })
   }
 
@@ -533,6 +630,68 @@ export const useDocStore = create<DocState>((set, get) => {
           }),
         })
       }
+    },
+
+    alignSelected: (mode) => {
+      const items = alignmentItems(get())
+      if (items.length < 2) return
+      const minX = Math.min(...items.map((i) => i.minX))
+      const maxX = Math.max(...items.map((i) => i.maxX))
+      const minY = Math.min(...items.map((i) => i.minY))
+      const maxY = Math.max(...items.map((i) => i.maxY))
+      applyItemMoves(
+        items.map((item) => {
+          let dx = 0
+          let dy = 0
+          // Editor space is y-up, so "top" is max Y.
+          switch (mode) {
+            case 'left':
+              dx = minX - item.minX
+              break
+            case 'hcenter':
+              dx = (minX + maxX) / 2 - (item.minX + item.maxX) / 2
+              break
+            case 'right':
+              dx = maxX - item.maxX
+              break
+            case 'top':
+              dy = maxY - item.maxY
+              break
+            case 'vcenter':
+              dy = (minY + maxY) / 2 - (item.minY + item.maxY) / 2
+              break
+            case 'bottom':
+              dy = minY - item.minY
+              break
+          }
+          return { item, dx, dy }
+        }),
+      )
+    },
+
+    distributeSelected: (axis) => {
+      const items = alignmentItems(get())
+      if (items.length < 3) return
+      const sorted = [...items].sort((a, b) =>
+        axis === 'x'
+          ? a.minX + a.maxX - (b.minX + b.maxX)
+          : a.minY + a.maxY - (b.minY + b.maxY),
+      )
+      const lo = axis === 'x' ? sorted[0].minX : sorted[0].minY
+      const hi = axis === 'x' ? sorted.at(-1)!.maxX : sorted.at(-1)!.maxY
+      const extents = sorted.map((i) =>
+        axis === 'x' ? i.maxX - i.minX : i.maxY - i.minY,
+      )
+      const gap =
+        (hi - lo - extents.reduce((s, e) => s + e, 0)) / (sorted.length - 1)
+      let cursor = lo
+      applyItemMoves(
+        sorted.map((item, i) => {
+          const d = cursor - (axis === 'x' ? item.minX : item.minY)
+          cursor += extents[i] + gap
+          return { item, dx: axis === 'x' ? d : 0, dy: axis === 'x' ? 0 : d }
+        }),
+      )
     },
 
     groupSelection: () => {
