@@ -445,26 +445,34 @@ export function switchCutouts(doc: Doc, clearance = 0): MultiPolygon {
  * rectangle of all keycaps padded by `outset + width`, so the rim fills the
  * whole box down to the keys. Corners on both edges are filleted by
  * `radius`. */
-let bezelCache: {
+interface BezelSolids {
+  outer: MultiPolygon
+  opening: MultiPolygon
+}
+
+let solidsCache: {
   keys: Doc['keys']
   groups: Doc['groups']
   mirror: Doc['mirror']
   bezel: Doc['bezel']
-  result: MultiPolygon
+  result: BezelSolids[]
 } | null = null
 
-export function bezelShape(doc: Doc): MultiPolygon {
+/** Per case piece: the bezel's outer solid and the keycap opening. Cached
+ * like plateOutline — the ring (bezelShape) and the bottom outline both
+ * derive from these. */
+function bezelSolids(doc: Doc): BezelSolids[] {
   if (
-    bezelCache &&
-    bezelCache.keys === doc.keys &&
-    bezelCache.groups === doc.groups &&
-    bezelCache.mirror === doc.mirror &&
-    bezelCache.bezel === doc.bezel
+    solidsCache &&
+    solidsCache.keys === doc.keys &&
+    solidsCache.groups === doc.groups &&
+    solidsCache.mirror === doc.mirror &&
+    solidsCache.bezel === doc.bezel
   ) {
-    return bezelCache.result
+    return solidsCache.result
   }
-  const result = bezelShapeUncached(doc)
-  bezelCache = {
+  const result = bezelSolidsUncached(doc)
+  solidsCache = {
     keys: doc.keys,
     groups: doc.groups,
     mirror: doc.mirror,
@@ -474,7 +482,37 @@ export function bezelShape(doc: Doc): MultiPolygon {
   return result
 }
 
-function bezelShapeUncached(doc: Doc): MultiPolygon {
+let bezelCache: { solids: BezelSolids[]; result: MultiPolygon } | null = null
+
+export function bezelShape(doc: Doc): MultiPolygon {
+  const solids = bezelSolids(doc)
+  if (bezelCache && bezelCache.solids === solids) return bezelCache.result
+  const result = solids.flatMap((s) =>
+    robustClip((subj, c) => polygonClipping.difference(subj, c!), s.outer, s.opening),
+  )
+  bezelCache = { solids, result }
+  return result
+}
+
+/** Footprint of the case bottom: the bezel's outer solid (no keycap opening),
+ * or the plate outline when there is no bezel to follow, optionally eroded
+ * inward by the bottom's inset. */
+export function caseBottomOutline(doc: Doc): MultiPolygon {
+  const outline =
+    doc.bezel.enabled && doc.bezel.width > 0
+      ? bezelSolids(doc).flatMap((s) => s.outer)
+      : plateOutline(doc)
+  const inset = doc.bottom.inset ?? 0
+  if (inset <= 0) return outline
+  try {
+    return simplify(erode(outline, inset), 0.05)
+  } catch (error) {
+    console.warn('keebforge: bottom inset failed, keeping full outline', error)
+    return outline
+  }
+}
+
+function bezelSolidsUncached(doc: Doc): BezelSolids[] {
   const bezel = doc.bezel
   if (!bezel.enabled || bezel.width <= 0) return []
   // Rounding (and, via its closing phase, wedge-gap filling) happens on the
@@ -486,7 +524,7 @@ function bezelShapeUncached(doc: Doc): MultiPolygon {
     const r = Math.max(0, Math.min(radius, 6))
     return r > 0 ? smoothOutline(mp, r, sc) : closeGaps(mp, sc)
   }
-  const result: MultiPolygon = []
+  const result: BezelSolids[] = []
   for (const side of keyWorldSides(doc)) {
     const capRects = (pad: number): Polygon[] =>
       side.worlds.map(({ key, world }) => {
@@ -542,9 +580,7 @@ function bezelShapeUncached(doc: Doc): MultiPolygon {
         bezel.radiusOuter ?? 0,
       )
     }
-    result.push(
-      ...robustClip((s, c) => polygonClipping.difference(s, c!), outer, opening),
-    )
+    result.push({ outer, opening })
   }
   return result
 }

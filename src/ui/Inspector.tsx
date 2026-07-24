@@ -3,6 +3,8 @@ import {
   DEFAULT_TENT,
   isKeyMirrored,
   keyWorldXF,
+  MATERIAL_PRESETS,
+  SWITCH_CLEARANCE,
   type Group,
   type GroupLayout,
   type Key,
@@ -296,7 +298,10 @@ function GroupPanel({ group }: { group: Group }) {
           <p className="hint">
             Stagger is the column's vertical offset (mm); splay rotates the
             column relative to the previous one (°) and carries over, fanning
-            the columns that follow. Layout changes regenerate key positions.
+            the columns that follow. You can also drag the handles above
+            (stagger) and below (splay) each column in the editor, and use the
+            +/− buttons beside the cluster. Layout changes regenerate key
+            positions.
           </p>
         </>
       )}
@@ -314,10 +319,13 @@ function DocumentPanel() {
   const setPlate = useDocStore((s) => s.setPlate)
   const bezel = useDocStore((s) => s.bezel)
   const setBezel = useDocStore((s) => s.setBezel)
+  const bottom = useDocStore((s) => s.bottom)
+  const setBottom = useDocStore((s) => s.setBottom)
   const tilt = useDocStore((s) => s.tilt)
   const setTilt = useDocStore((s) => s.setTilt)
   const materials = useDocStore((s) => s.materials)
   const setMaterial = useDocStore((s) => s.setMaterial)
+  const setMaterials = useDocStore((s) => s.setMaterials)
   const setMaterialsLinked = useDocStore((s) => s.setMaterialsLinked)
   const view = useViewSettings()
   const keyCount = useDocStore((s) => s.keys.length)
@@ -326,11 +334,15 @@ function DocumentPanel() {
       ? s.keys.filter((k) => isKeyMirrored(k, groupMap(s.groups))).length
       : 0,
   )
+  const neededClearance = useDocStore((s) =>
+    s.keys.reduce((m, k) => Math.max(m, SWITCH_CLEARANCE[k.type]), 0),
+  )
 
   const exportDXF = (clearance: number, filename: string) => {
-    const { keys, groups, mirror, plate, bezel, tilt, materials } = useDocStore.getState()
+    const { keys, groups, mirror, plate, bezel, bottom, tilt, materials } =
+      useDocStore.getState()
     const shapes = plateWithCutouts(
-      { keys, groups, mirror, plate, bezel, tilt, materials },
+      { keys, groups, mirror, plate, bezel, bottom, tilt, materials },
       clearance,
     )
     downloadText(filename, toDXF(shapes))
@@ -514,7 +526,83 @@ function DocumentPanel() {
         is a rectangular frame. Outset is the gap around keycaps, height is
         above the plate top.
       </p>
+      <h3>Bottom</h3>
+      <div className="field-grid">
+        <label className="field field-check">
+          <span>Enabled</span>
+          <input
+            type="checkbox"
+            checked={bottom.enabled}
+            onChange={(e) => setBottom({ enabled: e.target.checked })}
+          />
+        </label>
+        <label className="field">
+          <span>Mode</span>
+          <select
+            value={bottom.mode}
+            onChange={(e) => setBottom({ mode: e.target.value as 'tight' | 'wedge' })}
+          >
+            <option value="tight">Tight</option>
+            <option value="wedge">Wedge</option>
+          </select>
+        </label>
+        <NumberField
+          label="Thickness (mm)"
+          value={bottom.thickness}
+          step={0.5}
+          onCommit={(thickness) => setBottom({ thickness: Math.max(0.5, thickness) })}
+        />
+        <NumberField
+          label="Inset (mm)"
+          value={bottom.inset ?? 0}
+          step={0.5}
+          onCommit={(inset) => setBottom({ inset: Math.max(0, inset) })}
+        />
+        <NumberField
+          label="Clearance (mm)"
+          value={bottom.clearance ?? 0}
+          step={0.5}
+          onCommit={(clearance) => setBottom({ clearance: Math.max(0, clearance) })}
+        />
+      </div>
+      {bottom.enabled && neededClearance > (bottom.clearance ?? 0) && (
+        <p className="hint hint-warn">
+          Too shallow: this board's switches plus hotswap sockets/handwiring
+          need at least {neededClearance} mm of clearance.
+        </p>
+      )}
+      <p className="hint">
+        Closes the case underneath. Tight hugs the underside as a thin plate
+        and adds little posts under whatever tilt and tent lift off the desk;
+        wedge fills the whole gap down to the desk as one solid piece. Inset
+        pulls the bottom's edge in from the case edge. Clearance is the
+        interior depth below the plate for switch bodies plus PCB/hotswap
+        sockets or handwiring — MX needs {SWITCH_CLEARANCE.mx} mm, Choc{' '}
+        {SWITCH_CLEARANCE.choc} mm.
+      </p>
       <h3>Materials</h3>
+      <div className="preset-row">
+        {MATERIAL_PRESETS.map((preset) => (
+          <button
+            key={preset.name}
+            title={preset.name}
+            onClick={() => setMaterials(structuredClone(preset.materials))}
+          >
+            <span
+              className="preset-dot"
+              style={{ background: preset.materials.case.color }}
+            />
+            <span
+              className="preset-dot"
+              style={{ background: preset.materials.cap.color }}
+            />
+            <span
+              className="preset-dot"
+              style={{ background: preset.materials.capAccent.color }}
+            />
+          </button>
+        ))}
+      </div>
       <label className="field field-check">
         <span>Link (one material for everything)</span>
         <input
@@ -642,8 +730,8 @@ function DocumentPanel() {
           />
         </label>
       </div>
-      <h3>Show parts</h3>
-      <div className="field-grid">
+      <h3>Parts</h3>
+      <div className="layer-list">
         {(
           [
             ['showCaps', 'Keycaps'],
@@ -651,16 +739,18 @@ function DocumentPanel() {
             ['showCase', 'Case'],
             ['showPlate', 'Plate'],
             ['showFoam', 'Foam'],
+            ['showBottom', 'Bottom'],
           ] as const
         ).map(([field, label]) => (
-          <label className="field field-check" key={field}>
+          <button
+            key={field}
+            className={`layer-row${view[field] ? '' : ' layer-off'}`}
+            onClick={() => view.update({ [field]: !view[field] })}
+            title={view[field] ? `Hide ${label.toLowerCase()}` : `Show ${label.toLowerCase()}`}
+          >
+            <span className="layer-eye">{view[field] ? '👁' : ''}</span>
             <span>{label}</span>
-            <input
-              type="checkbox"
-              checked={view[field]}
-              onChange={(e) => view.update({ [field]: e.target.checked })}
-            />
-          </label>
+          </button>
         ))}
       </div>
       <p className="hint">
@@ -691,6 +781,7 @@ function DocumentPanel() {
       <ul className="hint">
         <li>Click — select key's group; <kbd>Alt</kbd>-click — single key</li>
         <li><kbd>Shift</kbd>-drag — constrain movement to one axis</li>
+        <li><kbd>Ctrl</kbd>-drag — duplicate the selection and drag the copy</li>
         <li><kbd>Ctrl+G</kbd> / <kbd>Ctrl+Shift+G</kbd> — group / ungroup</li>
         <li><kbd>Ctrl+D</kbd> — duplicate selection</li>
         <li><kbd>R</kbd> / <kbd>Shift+R</kbd> — rotate ±15°</li>

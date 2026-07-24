@@ -17,6 +17,7 @@ import {
   type Group,
   type GroupLayout,
   type BezelSettings,
+  type BottomSettings,
   type BoardMaterial,
   type BoardMaterials,
   type MaterialSlot,
@@ -26,6 +27,7 @@ import {
   type MirrorSettings,
   type PlateSettings,
   DEFAULT_BEZEL,
+  DEFAULT_BOTTOM,
   DEFAULT_MATERIALS,
   DEFAULT_PLATE,
   DEFAULT_TILT,
@@ -39,9 +41,9 @@ function loadSnapStep(): number {
   try {
     const raw = localStorage.getItem(SNAP_KEY)
     const parsed = raw === null ? NaN : Number(raw)
-    return Number.isFinite(parsed) && parsed >= 0 ? parsed : U / 4
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0
   } catch {
-    return U / 4
+    return 0
   }
 }
 
@@ -68,11 +70,11 @@ export interface DocState extends Doc {
   addKey: (type: KeyType) => void
   addColumnCluster: () => void
   deleteSelected: () => void
-  /** Clone the selection one unit down-right and select the clones.
-   * Fully-selected top-level groups are cloned with their whole subtree;
-   * other keys are cloned individually (keys from generated column layouts
-   * become free keys, since regeneration would discard extras). */
-  duplicateSelection: () => void
+  /** Clone the selection (offset one unit right by default) and select the
+   * clones. Fully-selected top-level groups are cloned with their whole
+   * subtree; other keys are cloned individually (keys from generated column
+   * layouts become free keys, since regeneration would discard extras). */
+  duplicateSelection: (dx?: number, dy?: number) => void
   /** Patch group-local key properties (type, size, label, rotation…). */
   updateSelected: (patch: Partial<Omit<Key, 'id'>>) => void
   /** Set world-space position; converted per key into its group frame. */
@@ -102,8 +104,11 @@ export interface DocState extends Doc {
   setMirror: (patch: Partial<MirrorSettings>) => void
   setPlate: (patch: Partial<PlateSettings>) => void
   setBezel: (patch: Partial<BezelSettings>) => void
+  setBottom: (patch: Partial<BottomSettings>) => void
   setTilt: (deg: number) => void
   setMaterial: (slot: MaterialSlot, patch: Partial<BoardMaterial>) => void
+  /** Replace all materials at once (color presets). */
+  setMaterials: (materials: BoardMaterials) => void
   /** Toggle linked materials; enabling copies the case material everywhere. */
   setMaterialsLinked: (linked: boolean) => void
 
@@ -322,6 +327,18 @@ export function normalizeBezel(raw: unknown): BezelSettings {
   return { ...DEFAULT_BEZEL, ...migrated, ...rest }
 }
 
+/** Fill in defaults for docs saved before the bottom case existed. */
+export function normalizeBottom(raw: unknown): BottomSettings {
+  if (
+    !raw ||
+    typeof raw !== 'object' ||
+    typeof (raw as BottomSettings).thickness !== 'number'
+  ) {
+    return { ...DEFAULT_BOTTOM }
+  }
+  return { ...DEFAULT_BOTTOM, ...(raw as Partial<BottomSettings>) }
+}
+
 /** Fill in defaults; docs saved before surface finishes carried a `colors`
  * map of plain hex strings, which migrate onto the default finishes. */
 export function normalizeMaterials(raw: unknown, legacyColors?: unknown): BoardMaterials {
@@ -360,6 +377,7 @@ function loadSaved(): Doc | null {
           ? (parsed.plate as PlateSettings)
           : { ...DEFAULT_PLATE },
       bezel: normalizeBezel(parsed.bezel),
+      bottom: normalizeBottom(parsed.bottom),
       tilt: typeof parsed.tilt === 'number' ? parsed.tilt : DEFAULT_TILT,
       materials: normalizeMaterials(parsed.materials, parsed.colors),
     }
@@ -394,6 +412,7 @@ const docOf = (s: Doc): Doc => ({
   mirror: s.mirror,
   plate: s.plate,
   bezel: s.bezel,
+  bottom: s.bottom,
   tilt: s.tilt,
   materials: s.materials,
 })
@@ -425,6 +444,7 @@ export const useDocStore = create<DocState>((set, get) => {
       mirror: patch.mirror ?? state.mirror,
       plate: patch.plate ?? state.plate,
       bezel: patch.bezel ?? state.bezel,
+      bottom: patch.bottom ?? state.bottom,
       tilt: patch.tilt ?? state.tilt,
       materials: patch.materials ?? state.materials,
       past: pushPast ? [...state.past.slice(-MAX_HISTORY + 1), prev] : state.past,
@@ -530,13 +550,7 @@ export const useDocStore = create<DocState>((set, get) => {
         layout: {
           kind: 'columns',
           rows: 3,
-          columns: [
-            { stagger: 0, splay: 0 },
-            { stagger: 2, splay: 0 },
-            { stagger: 6, splay: 0 },
-            { stagger: 3, splay: 0 },
-            { stagger: -1, splay: 0 },
-          ],
+          columns: Array.from({ length: 5 }, () => ({ stagger: 0, splay: 0 })),
           keyType: 'mx',
         },
       }
@@ -551,12 +565,10 @@ export const useDocStore = create<DocState>((set, get) => {
       commit({ keys: keys.filter((k) => !selection.has(k.id)) })
     },
 
-    duplicateSelection: () => {
+    duplicateSelection: (dx = U, dy = 0) => {
       const state = get()
       if (state.selection.size === 0) return
       const groups = groupMap(state.groups)
-      const dx = U
-      const dy = -U
       const newKeys: Key[] = []
       const newGroups: Group[] = []
       const cloned = new Set<string>()
@@ -991,6 +1003,10 @@ export const useDocStore = create<DocState>((set, get) => {
       commit({ bezel: { ...get().bezel, ...patch } })
     },
 
+    setBottom: (patch) => {
+      commit({ bottom: { ...get().bottom, ...patch } })
+    },
+
     setTilt: (deg) => {
       commit({ tilt: deg })
     },
@@ -1002,6 +1018,10 @@ export const useDocStore = create<DocState>((set, get) => {
         next[s] = { ...materials[s], ...patch }
       }
       commit({ materials: next })
+    },
+
+    setMaterials: (materials) => {
+      commit({ materials })
     },
 
     setMaterialsLinked: (linked) => {
@@ -1083,6 +1103,7 @@ export const useDocStore = create<DocState>((set, get) => {
         mirror: doc.mirror ?? { enabled: false, axis: 6 * U },
         plate: doc.plate ?? { ...DEFAULT_PLATE },
         bezel: normalizeBezel(doc.bezel),
+        bottom: normalizeBottom(doc.bottom),
         tilt: doc.tilt ?? DEFAULT_TILT,
         materials: normalizeMaterials(doc.materials),
       })
@@ -1102,6 +1123,7 @@ useDocStore.subscribe((state, prev) => {
     state.mirror === prev.mirror &&
     state.plate === prev.plate &&
     state.bezel === prev.bezel &&
+    state.bottom === prev.bottom &&
     state.tilt === prev.tilt &&
     state.materials === prev.materials
   )
@@ -1118,6 +1140,7 @@ useDocStore.subscribe((state, prev) => {
           mirror: state.mirror,
           plate: state.plate,
           bezel: state.bezel,
+          bottom: state.bottom,
           tilt: state.tilt,
           materials: state.materials,
         }),

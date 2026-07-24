@@ -1,4 +1,5 @@
-import { useRef } from 'react'
+import { useRef, useState } from 'react'
+import { deleteFile, listFiles, loadFile, saveFile } from '../model/files'
 import { U, type Doc, type Key } from '../model/keys'
 import { normalizeMaterials, useDocStore } from '../model/store'
 
@@ -10,6 +11,49 @@ const SNAP_OPTIONS = [
   { label: 'Snap: ½u', value: U / 2 },
   { label: 'Snap: 1u', value: U },
 ]
+
+const CURRENT_FILE_KEY = 'keebforge.file'
+
+/** Current document in the export/save JSON shape. */
+function serializeDoc() {
+  const { keys, groups, mirror, plate, bezel, bottom, tilt, materials } =
+    useDocStore.getState()
+  return { version: 5, keys, groups, mirror, plate, bezel, bottom, tilt, materials }
+}
+
+/** Validate and load a parsed layout; throws on malformed input. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function applyParsedDoc(parsed: any) {
+  const keys = Array.isArray(parsed) ? parsed : parsed.keys
+  if (!Array.isArray(keys)) throw new Error('no keys array')
+  const valid = keys.every(
+    (k: Key) =>
+      typeof k.id === 'string' &&
+      (k.type === 'mx' || k.type === 'choc') &&
+      typeof k.x === 'number' &&
+      typeof k.y === 'number',
+  )
+  if (!valid) throw new Error('malformed keys')
+  useDocStore.getState().loadDoc({
+    keys,
+    groups: Array.isArray(parsed.groups) ? parsed.groups : [],
+    mirror:
+      parsed.mirror && typeof parsed.mirror.axis === 'number'
+        ? parsed.mirror
+        : undefined,
+    plate:
+      parsed.plate && typeof parsed.plate.padding === 'number'
+        ? parsed.plate
+        : undefined,
+    bezel:
+      parsed.bezel && typeof parsed.bezel.width === 'number'
+        ? parsed.bezel
+        : undefined,
+    bottom: parsed.bottom,
+    tilt: typeof parsed.tilt === 'number' ? parsed.tilt : undefined,
+    materials: normalizeMaterials(parsed.materials, parsed.colors),
+  } as Partial<Doc>)
+}
 
 export function Toolbar() {
   const addKey = useDocStore((s) => s.addKey)
@@ -37,58 +81,69 @@ export function Toolbar() {
   )
 
   const fileRef = useRef<HTMLInputElement>(null)
+  const [files, setFiles] = useState(listFiles)
+  const [fileName, setFileName] = useState(
+    () => localStorage.getItem(CURRENT_FILE_KEY) ?? '',
+  )
+
+  const rememberName = (name: string) => {
+    setFileName(name)
+    try {
+      localStorage.setItem(CURRENT_FILE_KEY, name)
+    } catch {
+      // best-effort persistence
+    }
+  }
+
+  const saveNamed = () => {
+    const name = window.prompt('Save layout as:', fileName || 'my-keyboard')?.trim()
+    if (!name) return
+    saveFile(name, serializeDoc())
+    rememberName(name)
+    setFiles(listFiles())
+  }
+
+  const loadNamed = (name: string) => {
+    if (!name) return
+    const parsed = loadFile(name)
+    if (!parsed) return
+    try {
+      applyParsedDoc(parsed)
+      rememberName(name)
+    } catch (err) {
+      alert(`Could not load "${name}": ${err instanceof Error ? err.message : err}`)
+    }
+  }
+
+  const deleteNamed = () => {
+    if (!fileName || !files.includes(fileName)) return
+    if (!window.confirm(`Delete saved layout "${fileName}"?`)) return
+    deleteFile(fileName)
+    rememberName('')
+    setFiles(listFiles())
+  }
+
+  const clearBoard = () => {
+    useDocStore.getState().loadDoc({})
+    rememberName('')
+  }
 
   const exportJson = () => {
-    const { keys, groups, mirror, plate, bezel, tilt, materials } = useDocStore.getState()
-    const blob = new Blob(
-      [
-        JSON.stringify(
-          { version: 5, keys, groups, mirror, plate, bezel, tilt, materials },
-          null,
-          2,
-        ),
-      ],
-      { type: 'application/json' },
-    )
+    const blob = new Blob([JSON.stringify(serializeDoc(), null, 2)], {
+      type: 'application/json',
+    })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = 'keebforge-layout.json'
+    a.download = `${fileName || 'keebforge-layout'}.json`
     a.click()
     URL.revokeObjectURL(url)
   }
 
   const importJson = async (file: File) => {
     try {
-      const parsed = JSON.parse(await file.text())
-      const keys = Array.isArray(parsed) ? parsed : parsed.keys
-      if (!Array.isArray(keys)) throw new Error('no keys array')
-      const valid = keys.every(
-        (k: Key) =>
-          typeof k.id === 'string' &&
-          (k.type === 'mx' || k.type === 'choc') &&
-          typeof k.x === 'number' &&
-          typeof k.y === 'number',
-      )
-      if (!valid) throw new Error('malformed keys')
-      useDocStore.getState().loadDoc({
-        keys,
-        groups: Array.isArray(parsed.groups) ? parsed.groups : [],
-        mirror:
-          parsed.mirror && typeof parsed.mirror.axis === 'number'
-            ? parsed.mirror
-            : undefined,
-        plate:
-          parsed.plate && typeof parsed.plate.padding === 'number'
-            ? parsed.plate
-            : undefined,
-        bezel:
-          parsed.bezel && typeof parsed.bezel.width === 'number'
-            ? parsed.bezel
-            : undefined,
-        tilt: typeof parsed.tilt === 'number' ? parsed.tilt : undefined,
-        materials: normalizeMaterials(parsed.materials, parsed.colors),
-      } as Partial<Doc>)
+      applyParsedDoc(JSON.parse(await file.text()))
+      rememberName(file.name.replace(/\.json$/i, ''))
     } catch (err) {
       alert(`Could not import layout: ${err instanceof Error ? err.message : err}`)
     }
@@ -138,8 +193,38 @@ export function Toolbar() {
         Mirror
       </button>
       <span className="toolbar-sep" />
-      <button onClick={exportJson}>Export</button>
-      <button onClick={() => fileRef.current?.click()}>Import</button>
+      <select
+        value={files.includes(fileName) ? fileName : ''}
+        onChange={(e) => loadNamed(e.target.value)}
+        title="Load a layout saved in this browser"
+      >
+        {!files.includes(fileName) && <option value="">— layouts —</option>}
+        {files.map((f) => (
+          <option key={f} value={f}>
+            {f}
+          </option>
+        ))}
+      </select>
+      <button onClick={saveNamed} title="Save the layout under a name in this browser">
+        Save
+      </button>
+      <button
+        onClick={deleteNamed}
+        disabled={!fileName || !files.includes(fileName)}
+        title="Delete the current saved layout"
+      >
+        🗑
+      </button>
+      <button onClick={clearBoard} title="Start an empty board (undoable)">
+        Clear
+      </button>
+      <span className="toolbar-sep" />
+      <button onClick={exportJson} title="Download the layout as a JSON file">
+        Export
+      </button>
+      <button onClick={() => fileRef.current?.click()} title="Load a layout JSON file">
+        Import
+      </button>
       <input
         ref={fileRef}
         type="file"

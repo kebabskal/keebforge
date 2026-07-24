@@ -122,6 +122,36 @@ export const DEFAULT_BEZEL: BezelSettings = {
   marginRight: 0,
 }
 
+export interface BottomSettings {
+  enabled: boolean
+  /** `tight` is a thin plate hugging the case underside, with posts holding
+   * up whatever tilt/tent lift off the desk; `wedge` fills the whole gap down
+   * to the desk as one solid. */
+  mode: 'tight' | 'wedge'
+  /** Bottom plate thickness (also the wedge's thickness at its thinnest
+   * point), mm. */
+  thickness: number
+  /** Shrink the bottom's footprint inward from the case edge, mm — a recessed
+   * bottom reads as a shadow line around the case. */
+  inset: number
+  /** Interior depth below the plate's underside, mm — room for the
+   * below-plate switch bodies plus PCB/hotswap sockets or handwiring. */
+  clearance: number
+}
+
+/** Clearance needed below the plate's underside per switch type, mm:
+ * below-plate body (MX 5.0 / Choc 2.2 from the plate top) plus a 1.6 mm PCB
+ * and hotswap socket (or the same room for handwired pins and wires). */
+export const SWITCH_CLEARANCE: Record<KeyType, number> = { mx: 7, choc: 4.5 }
+
+export const DEFAULT_BOTTOM: BottomSettings = {
+  enabled: true,
+  mode: 'tight',
+  thickness: 2.5,
+  inset: 0,
+  clearance: SWITCH_CLEARANCE.mx,
+}
+
 /** Typing angle in degrees: positive raises the back edge. 3D-preview only
  * for now (plate/foam exports are flat projections regardless). */
 export const DEFAULT_TILT = 5
@@ -150,12 +180,71 @@ export interface BoardMaterials {
 }
 
 export const DEFAULT_MATERIALS: BoardMaterials = {
-  linked: false,
-  plate: { color: '#878d99', roughness: 0.38, specular: 0.85 },
-  case: { color: '#454b58', roughness: 0.45, specular: 0.55 },
-  cap: { color: '#e7e3d7', roughness: 0.85, specular: 0 },
-  capAccent: { color: '#5c7d6e', roughness: 0.85, specular: 0 },
+  linked: true,
+  plate: { color: '#000000', roughness: 0.55, specular: 0.55 },
+  case: { color: '#000000', roughness: 0.55, specular: 0.55 },
+  cap: { color: '#000000', roughness: 0.55, specular: 0.55 },
+  capAccent: { color: '#000000', roughness: 0.55, specular: 0.55 },
 }
+
+export interface MaterialPreset {
+  name: string
+  materials: BoardMaterials
+}
+
+/** One-click starting looks; rough color stories to tune from, not final. */
+export const MATERIAL_PRESETS: MaterialPreset[] = [
+  {
+    name: 'Stealth',
+    materials: {
+      linked: false,
+      plate: { color: '#1b1d22', roughness: 0.4, specular: 0.8 },
+      case: { color: '#17181c', roughness: 0.6, specular: 0.35 },
+      cap: { color: '#26282e', roughness: 0.85, specular: 0.1 },
+      capAccent: { color: '#454a54', roughness: 0.85, specular: 0.1 },
+    },
+  },
+  {
+    name: 'Retro',
+    materials: {
+      linked: false,
+      plate: { color: '#8a8f98', roughness: 0.35, specular: 0.85 },
+      case: { color: '#d6cfc0', roughness: 0.55, specular: 0.15 },
+      cap: { color: '#e9e4d4', roughness: 0.8, specular: 0.05 },
+      capAccent: { color: '#d2603a', roughness: 0.8, specular: 0.05 },
+    },
+  },
+  {
+    name: 'Milkshake',
+    materials: {
+      linked: false,
+      plate: { color: '#b9bec7', roughness: 0.3, specular: 0.9 },
+      case: { color: '#eceae4', roughness: 0.45, specular: 0.2 },
+      cap: { color: '#f4f2ec', roughness: 0.75, specular: 0.05 },
+      capAccent: { color: '#7fbfa4', roughness: 0.75, specular: 0.05 },
+    },
+  },
+  {
+    name: 'Deep Sea',
+    materials: {
+      linked: false,
+      plate: { color: '#b08d57', roughness: 0.35, specular: 0.9 },
+      case: { color: '#2a3a52', roughness: 0.5, specular: 0.3 },
+      cap: { color: '#dde3ea', roughness: 0.8, specular: 0.05 },
+      capAccent: { color: '#e0a458', roughness: 0.8, specular: 0.05 },
+    },
+  },
+  {
+    name: 'Bubblegum',
+    materials: {
+      linked: false,
+      plate: { color: '#d8d3de', roughness: 0.35, specular: 0.8 },
+      case: { color: '#c9b6e4', roughness: 0.5, specular: 0.2 },
+      cap: { color: '#f6f3f7', roughness: 0.75, specular: 0.05 },
+      capAccent: { color: '#e2679c', roughness: 0.75, specular: 0.05 },
+    },
+  },
+]
 
 export interface Doc {
   keys: Key[]
@@ -163,6 +252,7 @@ export interface Doc {
   mirror: MirrorSettings
   plate: PlateSettings
   bezel: BezelSettings
+  bottom: BottomSettings
   tilt: number
   materials: BoardMaterials
 }
@@ -532,6 +622,7 @@ export function defaultDoc(): Doc {
     mirror: { enabled: true, axis: 6 * U },
     plate: { ...DEFAULT_PLATE },
     bezel: { ...DEFAULT_BEZEL },
+    bottom: { ...DEFAULT_BOTTOM },
     tilt: DEFAULT_TILT,
     materials: structuredClone(DEFAULT_MATERIALS),
   }

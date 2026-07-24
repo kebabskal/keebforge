@@ -27,26 +27,29 @@ export interface ViewSettings {
   showCase: boolean
   showPlate: boolean
   showFoam: boolean
+  showBottom: boolean
 }
 
 export const DEFAULT_VIEW: ViewSettings = {
-  fov: 40,
-  backdrop: 'table',
-  backdropColor: '#e9e6df',
+  fov: 20,
+  backdrop: 'studio',
+  backdropColor: '#0d0d0d',
   keyLight: 2.4,
   fillLight: 0.5,
   ambient: 0.75,
   lightAngle: 50,
-  shadowBlur: 5,
+  shadowBlur: 25,
   ssao: true,
   showCaps: true,
   showSwitches: true,
   showCase: true,
   showPlate: true,
   showFoam: true,
+  showBottom: true,
 }
 
-const STORAGE_KEY = 'keebforge.view'
+// v2: re-seed everyone once with the studio-look defaults.
+const STORAGE_KEY = 'keebforge.view.v2'
 
 function load(): ViewSettings {
   try {

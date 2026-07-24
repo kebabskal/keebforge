@@ -15,6 +15,7 @@ import {
 } from '../model/keys'
 import {
   bezelShape,
+  caseBottomOutline,
   FOAM_CLEARANCE,
   FOAM_THICKNESS,
   PLATE_THICKNESS,
@@ -26,11 +27,30 @@ import { useTheme } from '../ui/theme'
 import { capGeo, CAP_PROFILE, frustumGeo } from './capGeometry'
 import { useViewSettings } from './viewSettings'
 
-/** Simplified switch/cap dimensions per type, mm (heights above plate top). */
+/** Simplified switch/cap dimensions per type, mm (heights above plate top;
+ * `lower` is the below-plate body depth measured down from the plate top). */
 const SWITCH_3D = {
-  mx: { housingBase: 15.6, housingTop: 11, housingH: 5.6, capBottom: 6 },
-  choc: { housingBase: 15, housingTop: 13, housingH: 2.4, capBottom: 3.5 },
+  mx: { housingBase: 15.6, housingTop: 11, housingH: 5.6, capBottom: 6, lower: 5.0 },
+  choc: { housingBase: 15, housingTop: 13, housingH: 2.4, capBottom: 3.5, lower: 2.2 },
 } as const
+
+/** PCB plus hotswap socket under the switch body: 1.6 mm board + socket. */
+const SOCKET_W = 10
+const SOCKET_D = 6.5
+const SOCKET_H = 3.4
+
+/** Even-odd point-in-ring test (ray cast along +x). */
+function pointInRing(ring: [number, number][], x: number, y: number): boolean {
+  let inside = false
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i]
+    const [xj, yj] = ring[j]
+    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) {
+      inside = !inside
+    }
+  }
+  return inside
+}
 
 function shapesFromPolygons(mp: MultiPolygon): THREE.Shape[] {
   // Shapes close implicitly; the rings' duplicated closing point (and any
@@ -68,6 +88,8 @@ export function Preview3D() {
 
     const renderer = new THREE.WebGLRenderer({ antialias: true })
     renderer.setPixelRatio(window.devicePixelRatio)
+    // The wedge bottom is extruded past the desk and cut off at it.
+    renderer.localClippingEnabled = true
     renderer.shadowMap.enabled = true
     // VSM blurs the shadow map itself, giving real soft penumbras.
     renderer.shadowMap.type = THREE.VSMShadowMap
@@ -116,8 +138,8 @@ export function Preview3D() {
     scene.add(fill)
 
     // Table the keyboard rests on — a visible reference plane that makes the
-    // typing-angle tilt readable. Sized/positioned per rebuild to the board.
-    const TABLE_TOP = -FOAM_THICKNESS - PLATE_THICKNESS - 0.01
+    // typing-angle tilt readable. Sized/positioned per rebuild to the board
+    // (its top tracks the case's resting plane, which the bottom part lowers).
     const TABLE_THICKNESS = 18
     const ground = new THREE.Mesh(
       new THREE.BoxGeometry(1, 1, 1),
@@ -136,7 +158,6 @@ export function Preview3D() {
       new THREE.MeshStandardMaterial({ color: 0xe9e6df, roughness: 1 }),
     )
     cyclo.receiveShadow = true
-    cyclo.position.y = TABLE_TOP
     scene.add(cyclo)
     const buildCyclorama = (cx: number, cz: number, radius: number) => {
       const width = Math.max(1800, radius * 5)
@@ -171,9 +192,9 @@ export function Preview3D() {
     // Meshes grouped by part, so visibility toggles apply without a rebuild.
     // Repopulated on every rebuild.
     const partMeshes: Record<
-      'caps' | 'switches' | 'case' | 'plate' | 'foam',
+      'caps' | 'switches' | 'case' | 'plate' | 'foam' | 'bottom',
       THREE.Object3D[]
-    > = { caps: [], switches: [], case: [], plate: [], foam: [] }
+    > = { caps: [], switches: [], case: [], plate: [], foam: [], bottom: [] }
 
     const applyViewSettings = () => {
       const v = useViewSettings.getState()
@@ -185,6 +206,7 @@ export function Preview3D() {
         case: v.showCase,
         plate: v.showPlate,
         foam: v.showFoam,
+        bottom: v.showBottom,
       }
       for (const part of Object.keys(partMeshes) as (keyof typeof partMeshes)[]) {
         for (const mesh of partMeshes[part]) mesh.visible = shown[part]
@@ -206,10 +228,23 @@ export function Preview3D() {
       ssaoPass.enabled = v.ssao
     }
 
+    // World-space cut at the desk surface for the wedge bottom; the constant
+    // tracks the resting plane per rebuild.
+    const groundClip = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0)
+
     const materials = {
       plate: new THREE.MeshStandardMaterial({ color: 0x878d99, metalness: 0.85, roughness: 0.38 }),
       foam: new THREE.MeshStandardMaterial({ color: 0x262a33, roughness: 1 }),
       bezel: new THREE.MeshStandardMaterial({ color: 0x454b58, metalness: 0.55, roughness: 0.45 }),
+      // Case material again, but clipped at the desk (wedge bottoms only).
+      wedge: new THREE.MeshStandardMaterial({
+        color: 0x454b58,
+        metalness: 0.55,
+        roughness: 0.45,
+        side: THREE.DoubleSide,
+        clippingPlanes: [groundClip],
+        clipShadows: true,
+      }),
       housing: new THREE.MeshStandardMaterial({ color: 0x1e2025, roughness: 0.55 }),
       cap: new THREE.MeshStandardMaterial({ color: 0xe7e3d7, roughness: 0.85 }),
       capAccent: new THREE.MeshStandardMaterial({ color: 0x5c7d6e, roughness: 0.85 }),
@@ -217,6 +252,10 @@ export function Preview3D() {
 
     const board = new THREE.Group()
     scene.add(board)
+    // Support posts stand vertically on the desk, so they live outside the
+    // tilted/tented board frames.
+    const posts = new THREE.Group()
+    scene.add(posts)
 
     // Extruded plate/foam geometries are per-rebuild; switch/cap geometries
     // live in geoCache and are only disposed on unmount.
@@ -225,6 +264,7 @@ export function Preview3D() {
       for (const geo of slabGeos) geo.dispose()
       slabGeos = []
       board.clear()
+      posts.clear()
     }
 
     const geoCache = new Map<string, THREE.BufferGeometry>()
@@ -265,10 +305,23 @@ export function Preview3D() {
         mirror: state.mirror,
         plate: state.plate,
         bezel: state.bezel,
+        bottom: state.bottom,
         tilt: state.tilt,
         materials: state.materials,
       }
       const groups = groupMap(doc.groups)
+
+      // The case interior is `clearance` deep below the plate (never less
+      // than the foam layer), leaving room for switch bodies and sockets.
+      // The case rests on the underside of the bottom part (when present),
+      // which is also the tilt/tent pivot plane and the desk height.
+      const cavity = doc.bottom.enabled
+        ? Math.max(FOAM_THICKNESS, doc.bottom.clearance ?? 0)
+        : FOAM_THICKNESS
+      const caseBottomY = -PLATE_THICKNESS - cavity
+      const bottomThickness = doc.bottom.enabled ? Math.max(0.5, doc.bottom.thickness) : 0
+      const restY = caseBottomY - bottomThickness
+      groundClip.constant = 0.05 - restY
 
       const applyMaterial = (
         target: THREE.MeshStandardMaterial,
@@ -280,6 +333,7 @@ export function Preview3D() {
       }
       applyMaterial(materials.plate, doc.materials.plate)
       applyMaterial(materials.bezel, doc.materials.case)
+      applyMaterial(materials.wedge, doc.materials.case)
       applyMaterial(materials.cap, doc.materials.cap)
       applyMaterial(materials.capAccent, doc.materials.capAccent)
 
@@ -296,6 +350,8 @@ export function Preview3D() {
       // half's outer bottom edge (inner edges rise toward the middle).
       const split = doc.mirror.enabled && doc.mirror.split === true
       const axis = doc.mirror.axis
+      const tiltRad = ((doc.tilt || 0) * Math.PI) / 180
+      const tentRad = split ? (((doc.mirror.tent ?? DEFAULT_TENT) * Math.PI) / 180) : 0
       const makeHalf = () => {
         const tent = new THREE.Group()
         const yaw = new THREE.Group()
@@ -331,7 +387,7 @@ export function Preview3D() {
 
       const addSlab = (
         mp: MultiPolygon,
-        part: 'plate' | 'foam' | 'case',
+        part: 'plate' | 'foam' | 'case' | 'bottom',
         thickness: number,
         y: number,
         material: THREE.Material,
@@ -370,6 +426,10 @@ export function Preview3D() {
           partMeshes[part].push(mesh)
         })
       }
+      // Candidate contact points for tight-bottom support posts, in each case
+      // piece's pre-tilt frame; realized once the tilt/tent transforms exist.
+      const supportPoints: { target: THREE.Object3D; x: number; z: number }[] = []
+
       // A clipping failure should degrade to "no plate shown", not crash the
       // whole app (React unmounts the tree on uncaught render errors).
       try {
@@ -392,12 +452,74 @@ export function Preview3D() {
           addSlab(
             bezelMp,
             'case',
-            doc.bezel.height + PLATE_THICKNESS + FOAM_THICKNESS,
-            -PLATE_THICKNESS - FOAM_THICKNESS,
+            doc.bezel.height + PLATE_THICKNESS + cavity,
+            caseBottomY,
             materials.bezel,
             true,
             Math.min(doc.bezel.bevel ?? 0, doc.bezel.width / 2 - 0.05),
           )
+        }
+        // Bottom case under the whole footprint. `tight` is a plate hugging
+        // the underside (posts come later, once transforms are known);
+        // `wedge` extrudes deep enough to reach the desk at full tilt/tent
+        // and is cut off at it by the clipping plane.
+        if (doc.bottom.enabled) {
+          const bottomMp = caseBottomOutline(doc)
+          trackFront(bottomMp)
+          let extent = 0
+          for (const poly of bottomMp) {
+            let minX = Infinity
+            let maxX = -Infinity
+            let minY = Infinity
+            let maxY = -Infinity
+            for (const [x, y] of poly[0]) {
+              minX = Math.min(minX, x)
+              maxX = Math.max(maxX, x)
+              minY = Math.min(minY, y)
+              maxY = Math.max(maxY, y)
+            }
+            extent = Math.max(extent, maxX - minX, maxY - minY)
+            const inset = Math.min(8, (maxX - minX) / 4, (maxY - minY) / 4)
+            const target = targetFor((minX + maxX) / 2)
+            // The outline is rarely a rectangle, so bounds corners can land
+            // in empty space; walk them toward the center until they sit
+            // under actual case, or drop them.
+            const cx = (minX + maxX) / 2
+            const cy = (minY + maxY) / 2
+            const ring = poly[0] as [number, number][]
+            for (const [px, py] of [
+              [minX + inset, minY + inset],
+              [maxX - inset, minY + inset],
+              [minX + inset, maxY - inset],
+              [maxX - inset, maxY - inset],
+            ]) {
+              // Post radius is 4; require that much clearance so a post
+              // never overhangs the case edge.
+              const fits = (x: number, y: number) =>
+                pointInRing(ring, x, y) &&
+                pointInRing(ring, x - 4, y) &&
+                pointInRing(ring, x + 4, y) &&
+                pointInRing(ring, x, y - 4) &&
+                pointInRing(ring, x, y + 4)
+              for (let t = 0; t <= 0.65; t += 0.13) {
+                const qx = px + (cx - px) * t
+                const qy = py + (cy - py) * t
+                if (fits(qx, qy)) {
+                  supportPoints.push({ target, x: qx, z: -qy })
+                  break
+                }
+              }
+            }
+          }
+          if (doc.bottom.mode === 'tight') {
+            addSlab(bottomMp, 'bottom', bottomThickness, restY, materials.bezel, true)
+          } else {
+            const depth =
+              bottomThickness +
+              Math.min(300, extent * (Math.tan(Math.abs(tiltRad)) + Math.tan(Math.abs(tentRad)))) +
+              2
+            addSlab(bottomMp, 'bottom', depth, caseBottomY - depth, materials.wedge, true)
+          }
         }
       } catch (error) {
         console.warn('keebforge: plate outline generation failed', error)
@@ -433,6 +555,23 @@ export function Preview3D() {
         )
         holder.add(housing)
         partMeshes.switches.push(housing)
+
+        // Below-plate body (through the plate cutout) and the PCB/hotswap
+        // socket under it — what the bottom clearance has to swallow.
+        const lower = new THREE.Mesh(
+          cachedFrustum('lower', 13.8, 13.8, 13.8, 13.8, dims.lower),
+          materials.housing,
+        )
+        lower.position.y = -dims.lower
+        holder.add(lower)
+        partMeshes.switches.push(lower)
+        const socket = new THREE.Mesh(
+          cachedFrustum('socket', SOCKET_W, SOCKET_D, SOCKET_W, SOCKET_D, SOCKET_H),
+          materials.housing,
+        )
+        socket.position.y = -dims.lower - SOCKET_H
+        holder.add(socket)
+        partMeshes.switches.push(socket)
 
         const capMesh = new THREE.Mesh(
           cachedCap(key.type, cap.w, cap.h, key.convex === true),
@@ -485,8 +624,7 @@ export function Preview3D() {
         applyYaw(halves.left.yaw, sideBounds.left, -rotRad)
         applyYaw(halves.right.yaw, sideBounds.right, rotRad)
 
-        const tentRad = (((doc.mirror.tent ?? DEFAULT_TENT) * Math.PI) / 180)
-        const groundY = -PLATE_THICKNESS - FOAM_THICKNESS
+        const groundY = restY
         const applyTent = (g: THREE.Group, px: number, theta: number) => {
           if (!Number.isFinite(px)) return
           const cos = Math.cos(theta)
@@ -531,8 +669,8 @@ export function Preview3D() {
 
       // Tilt the whole board about its front bottom edge, so the front stays
       // on the ground and the back rises (positive = typing angle).
-      const rad = ((doc.tilt || 0) * Math.PI) / 180
-      const pivotY = -PLATE_THICKNESS - FOAM_THICKNESS
+      const rad = tiltRad
+      const pivotY = restY
       const pivotZ = frontY === Infinity ? 0 : -frontY
       board.rotation.x = rad
       board.position.set(
@@ -540,6 +678,28 @@ export function Preview3D() {
         pivotY - (pivotY * Math.cos(rad) - pivotZ * Math.sin(rad)),
         pivotZ - (pivotY * Math.sin(rad) + pivotZ * Math.cos(rad)),
       )
+
+      // Tight bottoms rest on posts: vertical pillars from the desk up to the
+      // case underside wherever tilt/tent lift it clear. Tops are embedded a
+      // little so the inclined underside never shows a gap over the post.
+      if (doc.bottom.enabled && doc.bottom.mode === 'tight') {
+        board.updateMatrixWorld(true)
+        const embed = 1 + 4 * Math.tan(Math.abs(tiltRad) + Math.abs(tentRad))
+        for (const p of supportPoints) {
+          const world = p.target.localToWorld(new THREE.Vector3(p.x, restY, p.z))
+          const h = world.y - restY
+          if (h < 1) continue
+          // Thick where they meet the case, tapering toward the desk.
+          const geo = new THREE.CylinderGeometry(4, 3, h + embed, 20)
+          slabGeos.push(geo)
+          const mesh = new THREE.Mesh(geo, materials.bezel)
+          mesh.position.set(world.x, restY + (h + embed) / 2, world.z)
+          mesh.castShadow = true
+          mesh.receiveShadow = true
+          posts.add(mesh)
+          partMeshes.bottom.push(mesh)
+        }
+      }
 
       if (worlds.length > 0) {
         bounds = {
@@ -563,14 +723,24 @@ export function Preview3D() {
         TABLE_THICKNESS,
         Math.max(600, bounds.radius * 2 + 200),
       )
-      ground.position.set(bounds.cx, TABLE_TOP - TABLE_THICKNESS / 2, bounds.cz)
+      ground.position.set(bounds.cx, restY - 0.01 - TABLE_THICKNESS / 2, bounds.cz)
+      cyclo.position.y = restY - 0.01
       buildCyclorama(bounds.cx, bounds.cz, bounds.radius)
       applyViewSettings()
     }
 
     rebuild()
     controls.target.set(bounds.cx, 0, bounds.cz)
-    camera.position.set(bounds.cx, bounds.radius * 1.4, bounds.cz + bounds.radius * 1.7)
+    // Framing distances are tuned for a 40° FOV; narrower lenses back off
+    // proportionally so the board still fills the view.
+    const fovScale =
+      Math.tan((40 * Math.PI) / 360) /
+      Math.tan((useViewSettings.getState().fov * Math.PI) / 360)
+    camera.position.set(
+      bounds.cx,
+      bounds.radius * 1.4 * fovScale,
+      bounds.cz + bounds.radius * 1.7 * fovScale,
+    )
     controls.update()
 
     // Outline generation is too heavy for every drag frame; throttle the
@@ -594,6 +764,7 @@ export function Preview3D() {
         state.mirror !== last.mirror ||
         state.plate !== last.plate ||
         state.bezel !== last.bezel ||
+        state.bottom !== last.bottom ||
         state.tilt !== last.tilt ||
         state.materials !== last.materials
       ) {

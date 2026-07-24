@@ -2,16 +2,20 @@ import { useEffect, useRef } from 'react'
 import * as THREE from 'three'
 import {
   capSize,
+  groupWorldXF,
   hitTest,
   isKeyMirrored,
   keySize,
   keyWorldXF,
   mirrorXF,
+  SPEC,
+  worldToLocal,
   type Key,
   type XForm,
 } from '../model/keys'
 import { bezelShape, plateOutline, type MultiPolygon } from '../model/outline'
 import {
+  coalesceUndo,
   groupMap,
   memberKeyIds,
   topGroupOf,
@@ -36,6 +40,7 @@ const PALETTES = {
     mirrorAxis: 0x50b88a,
     bezel: 0x77809a,
     ghost: 0x3b3f4d,
+    snapGuide: 0xe0607e,
     label: '#e8eaf0',
   },
   light: {
@@ -52,6 +57,7 @@ const PALETTES = {
     mirrorAxis: 0x2e9968,
     bezel: 0x9aa2b5,
     ghost: 0xc4c9d3,
+    snapGuide: 0xd23a60,
     label: '#2c313b',
   },
 }
@@ -91,12 +97,14 @@ export function EditorCanvas() {
   const wrapRef = useRef<HTMLDivElement>(null)
   const bandRef = useRef<HTMLDivElement>(null)
   const dimsRef = useRef<HTMLDivElement>(null)
+  const gizmoRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     const wrap = wrapRef.current
     const band = bandRef.current
     const dims = dimsRef.current
-    if (!wrap || !band || !dims) return
+    const gizmoLayer = gizmoRef.current
+    if (!wrap || !band || !dims || !gizmoLayer) return
 
     const store = useDocStore
     const COLORS = PALETTES[useTheme.getState().theme]
@@ -144,6 +152,10 @@ export function EditorCanvas() {
       }
     }
 
+    // Assigned once the gizmo helpers exist; camera moves must reposition
+    // the HTML gizmo overlay too.
+    let positionGizmosHook: () => void = () => {}
+
     const applyCamera = () => {
       const { clientWidth: w, clientHeight: h } = wrap
       camera.left = view.cx - w / 2 / view.zoom
@@ -151,6 +163,7 @@ export function EditorCanvas() {
       camera.top = view.cy + h / 2 / view.zoom
       camera.bottom = view.cy - h / 2 / view.zoom
       camera.updateProjectionMatrix()
+      positionGizmosHook()
     }
 
     const toMM = (clientX: number, clientY: number) => {
@@ -219,6 +232,7 @@ export function EditorCanvas() {
         gapSize: 3,
       }),
       bezelLine: new THREE.LineBasicMaterial({ color: COLORS.bezel }),
+      snapGuide: new THREE.LineBasicMaterial({ color: COLORS.snapGuide }),
       ghostCap: new THREE.MeshBasicMaterial({
         color: COLORS.ghost,
         transparent: true,
@@ -352,6 +366,33 @@ export function EditorCanvas() {
     axisLine.position.z = -0.6
     scene.add(axisLine)
 
+    // Alignment guides: shown while a drag is being pulled onto a neighbour's
+    // edge/center or the mirror axis, so the snap is visible as it happens.
+    const makeGuide = (a: THREE.Vector3, b: THREE.Vector3) => {
+      const line = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([a, b]),
+        materials.snapGuide,
+      )
+      line.position.z = 0.9
+      line.visible = false
+      scene.add(line)
+      return line
+    }
+    const guideV = makeGuide(
+      new THREE.Vector3(0, -5000, 0),
+      new THREE.Vector3(0, 5000, 0),
+    )
+    const guideH = makeGuide(
+      new THREE.Vector3(-5000, 0, 0),
+      new THREE.Vector3(5000, 0, 0),
+    )
+    const setSnapGuides = (x: number | null, y: number | null) => {
+      guideV.visible = x !== null
+      if (x !== null) guideV.position.x = x
+      guideH.visible = y !== null
+      if (y !== null) guideH.position.y = y
+    }
+
     // Bezel contours and the board-size badge, rebuilt only when the
     // geometry-relevant slices of the store change — sync() also fires for
     // selection changes, which don't affect either.
@@ -391,6 +432,7 @@ export function EditorCanvas() {
           mirror: state.mirror,
           plate: state.plate,
           bezel: state.bezel,
+          bottom: state.bottom,
           tilt: state.tilt,
           materials: state.materials,
         }
@@ -455,6 +497,680 @@ export function EditorCanvas() {
       }
     }
 
+    // ---- On-canvas gizmos -------------------------------------------------
+    // HTML overlay handles: a rotation handle for the selection, and — when
+    // a whole column cluster is selected — per-column stagger/splay drag
+    // handles plus add/remove column buttons.
+
+    let gizmoSig = ''
+    let gizmoPlacers: (() => void)[] = []
+    let gizmoDragging = false
+    let gestureSeq = 0
+
+    const placeEl = (el: HTMLElement, wx: number, wy: number, dyPx = 0, dxPx = 0) => {
+      const p = mmToPx(wx, wy)
+      el.style.left = `${p.x + dxPx}px`
+      el.style.top = `${p.y + dyPx}px`
+    }
+
+    // Floating readout for the value being manipulated.
+    const dragBadge = document.createElement('div')
+    dragBadge.className = 'drag-badge'
+    wrap.appendChild(dragBadge)
+    const showDragBadge = (ev: PointerEvent, text: string) => {
+      const rect = canvas.getBoundingClientRect()
+      dragBadge.style.display = 'block'
+      dragBadge.style.left = `${ev.clientX - rect.left + 14}px`
+      dragBadge.style.top = `${ev.clientY - rect.top + 14}px`
+      dragBadge.textContent = text
+    }
+    const hideDragBadge = () => {
+      dragBadge.style.display = 'none'
+    }
+
+    /** Shift-click resets a handle's value; anything else starts its drag. */
+    const shiftResettable =
+      (reset: () => void, start: (e: PointerEvent) => void) => (e: PointerEvent) => {
+        if (e.shiftKey) {
+          e.preventDefault()
+          e.stopPropagation()
+          reset()
+          return
+        }
+        start(e)
+      }
+
+    const rotationIsZero = () => {
+      const state = store.getState()
+      const whole = wholeSelectedGroup(state)
+      if (whole) return whole.r === 0
+      return state.keys.every((k) => !state.selection.has(k.id) || k.r === 0)
+    }
+
+    const resetRotation = () => {
+      const state = store.getState()
+      const whole = wholeSelectedGroup(state)
+      if (whole) state.updateGroup(whole.id, { r: 0 })
+      else state.updateSelected({ r: 0 })
+    }
+
+    const makeHandle = (cls: string, title: string): HTMLDivElement => {
+      const el = document.createElement('div')
+      el.className = `gizmo-handle ${cls}`
+      el.title = title
+      gizmoLayer.appendChild(el)
+      return el
+    }
+
+    const selectionBounds = () => {
+      const state = store.getState()
+      const groups = groupMap(state.groups)
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
+      for (const key of state.keys) {
+        if (!state.selection.has(key.id)) continue
+        const w = keyWorldXF(key, groups)
+        const size = keySize(key)
+        const rad = (w.r * Math.PI) / 180
+        const ex = (Math.abs(Math.cos(rad)) * size.w + Math.abs(Math.sin(rad)) * size.h) / 2
+        const ey = (Math.abs(Math.sin(rad)) * size.w + Math.abs(Math.cos(rad)) * size.h) / 2
+        minX = Math.min(minX, w.x - ex)
+        maxX = Math.max(maxX, w.x + ex)
+        minY = Math.min(minY, w.y - ey)
+        maxY = Math.max(maxY, w.y + ey)
+      }
+      return minX < maxX ? { minX, maxX, minY, maxY } : null
+    }
+
+    /** Live geometry of one cluster column: its top/bottom key transforms. */
+    const columnInfo = (groupId: string, col: number) => {
+      const state = store.getState()
+      const g = state.groups.find((g) => g.id === groupId)
+      if (!g || g.layout.kind !== 'columns') return null
+      const groups = groupMap(state.groups)
+      const members = state.keys.filter((k) => k.groupId === groupId && k.col === col)
+      if (members.length === 0) return null
+      const top = members.reduce((a, b) => ((a.row ?? 0) < (b.row ?? 0) ? a : b))
+      const bottom = members.reduce((a, b) => ((a.row ?? 0) > (b.row ?? 0) ? a : b))
+      const spec = SPEC[g.layout.keyType]
+      return {
+        layout: g.layout,
+        wTop: keyWorldXF(top, groups),
+        wBot: keyWorldXF(bottom, groups),
+        pitchX: spec.pitchX,
+        pitchY: spec.pitchY,
+      }
+    }
+
+    const patchColumn = (
+      gestureKey: string,
+      groupId: string,
+      col: number,
+      patch: { stagger?: number; splay?: number },
+    ) => {
+      const state = store.getState()
+      const g = state.groups.find((g) => g.id === groupId)
+      if (!g || g.layout.kind !== 'columns') return
+      const layout = g.layout
+      coalesceUndo(gestureKey, () =>
+        state.updateGroupLayout(groupId, {
+          ...layout,
+          columns: layout.columns.map((cd, i) => (i === col ? { ...cd, ...patch } : cd)),
+        }),
+      )
+    }
+
+    const dragHandle = (
+      e: PointerEvent,
+      onMove: (ev: PointerEvent) => void,
+      onEnd?: () => void,
+    ) => {
+      e.preventDefault()
+      e.stopPropagation()
+      const el = e.currentTarget as HTMLElement
+      el.setPointerCapture(e.pointerId)
+      gizmoDragging = true
+      const move = (ev: PointerEvent) => onMove(ev)
+      const up = () => {
+        gizmoDragging = false
+        hideDragBadge()
+        el.removeEventListener('pointermove', move)
+        el.removeEventListener('pointerup', up)
+        onEnd?.()
+      }
+      el.addEventListener('pointermove', move)
+      el.addEventListener('pointerup', up)
+    }
+
+    const startRotateDrag = (e: PointerEvent) => {
+      const state = store.getState()
+      const groups = groupMap(state.groups)
+      const b = selectionBounds()
+      if (!b) return
+      const pivot = { x: (b.minX + b.maxX) / 2, y: (b.minY + b.maxY) / 2 }
+      const startPt = toMM(e.clientX, e.clientY)
+      const a0 = Math.atan2(startPt.y - pivot.y, startPt.x - pivot.x)
+      const whole = wholeSelectedGroup(state)
+      const groupOrig = whole ? { x: whole.x, y: whole.y, r: whole.r } : null
+      const keysOrig = whole
+        ? []
+        : state.keys
+            .filter((k) => state.selection.has(k.id))
+            .map((k) => ({
+              id: k.id,
+              r: k.r,
+              frame: groupWorldXF(groups, k.groupId),
+              world: keyWorldXF(k, groups),
+            }))
+      state.beginTransform()
+      dragHandle(
+        e,
+        (ev) => {
+          const pt = toMM(ev.clientX, ev.clientY)
+          let deg =
+            ((Math.atan2(pt.y - pivot.y, pt.x - pivot.x) - a0) * 180) / Math.PI
+          deg = ev.shiftKey ? Math.round(deg / 15) * 15 : Math.round(deg)
+          showDragBadge(ev, `${deg}°`)
+          const rad = (deg * Math.PI) / 180
+          const cos = Math.cos(rad)
+          const sin = Math.sin(rad)
+          const spin = (x: number, y: number) => ({
+            x: pivot.x + (x - pivot.x) * cos - (y - pivot.y) * sin,
+            y: pivot.y + (x - pivot.x) * sin + (y - pivot.y) * cos,
+          })
+          const patches: TransformPatches = { keys: new Map(), groups: new Map() }
+          if (whole && groupOrig) {
+            patches.groups!.set(whole.id, {
+              ...spin(groupOrig.x, groupOrig.y),
+              r: Math.round((groupOrig.r + deg) * 100) / 100,
+            })
+          } else {
+            for (const o of keysOrig) {
+              const w = spin(o.world.x, o.world.y)
+              const local = worldToLocal(o.frame, w.x, w.y)
+              patches.keys!.set(o.id, {
+                x: local.x,
+                y: local.y,
+                r: Math.round((o.r + deg) * 100) / 100,
+              })
+            }
+          }
+          store.getState().transform(patches)
+        },
+        () => store.getState().endTransform(),
+      )
+    }
+
+    const startStaggerDrag = (e: PointerEvent, groupId: string, col: number) => {
+      const info = columnInfo(groupId, col)
+      if (!info) return
+      const start = toMM(e.clientX, e.clientY)
+      const startStagger = info.layout.columns[col].stagger
+      const rad = (info.wTop.r * Math.PI) / 180
+      const up = { x: -Math.sin(rad), y: Math.cos(rad) }
+      // Magnetic values: the other columns' staggers (and 0), so neighbours
+      // line up without fiddling.
+      const magnets = [
+        0,
+        ...info.layout.columns.filter((_, i) => i !== col).map((c) => c.stagger),
+      ]
+      const gkey = `gizmo${++gestureSeq}`
+      let last = startStagger
+      dragHandle(e, (ev) => {
+        const pt = toMM(ev.clientX, ev.clientY)
+        const d = (pt.x - start.x) * up.x + (pt.y - start.y) * up.y
+        const step = ev.ctrlKey || ev.metaKey ? 1 : 0.1
+        let stagger = Math.round((startStagger + d) / step) * step
+        stagger = Math.round(stagger * 10) / 10
+        const threshold = 6 / view.zoom
+        let best = threshold
+        for (const m of magnets) {
+          const dist = Math.abs(stagger - m)
+          if (dist < best) {
+            best = dist
+            stagger = m
+          }
+        }
+        showDragBadge(ev, `${stagger.toFixed(1)} mm`)
+        if (stagger === last) return
+        last = stagger
+        patchColumn(gkey, groupId, col, { stagger })
+      })
+    }
+
+    const startSplayDrag = (e: PointerEvent, groupId: string, col: number) => {
+      const info = columnInfo(groupId, col)
+      if (!info) return
+      const startSplay = info.layout.columns[col].splay
+      const startX = e.clientX
+      const gkey = `gizmo${++gestureSeq}`
+      let last = startSplay
+      dragHandle(e, (ev) => {
+        // Handle sits above the splay pivot: dragging it right rotates the
+        // column clockwise = negative splay, matching the pointer.
+        const step = ev.ctrlKey || ev.metaKey ? 1 : 0.5
+        const splay =
+          Math.round((startSplay - (ev.clientX - startX) * 0.2) / step) * step
+        showDragBadge(ev, `${splay}°`)
+        if (splay === last) return
+        last = splay
+        patchColumn(gkey, groupId, col, { splay })
+      })
+    }
+
+    const setColumnCount = (groupId: string, delta: number) => {
+      const state = store.getState()
+      const g = state.groups.find((g) => g.id === groupId)
+      if (!g || g.layout.kind !== 'columns') return
+      const layout = g.layout
+      const n = layout.columns.length + delta
+      if (n < 1 || n > 12) return
+      const columns =
+        delta > 0
+          ? [...layout.columns, { ...(layout.columns.at(-1) ?? { stagger: 0, splay: 0 }) }]
+          : layout.columns.slice(0, -1)
+      state.updateGroupLayout(groupId, { ...layout, columns })
+      // Keep the whole cluster selected so the gizmos stay up.
+      const after = store.getState()
+      after.setSelection(memberKeyIds(groupId, after.keys, after.groups))
+    }
+
+    const setRowCount = (groupId: string, delta: number) => {
+      const state = store.getState()
+      const g = state.groups.find((g) => g.id === groupId)
+      if (!g || g.layout.kind !== 'columns') return
+      const rows = g.layout.rows + delta
+      if (rows < 1 || rows > 8) return
+      state.updateGroupLayout(groupId, { ...g.layout, rows })
+      const after = store.getState()
+      after.setSelection(memberKeyIds(groupId, after.keys, after.groups))
+    }
+
+    const startCurveDrag = (e: PointerEvent, groupId: string) => {
+      const state = store.getState()
+      const g = state.groups.find((g) => g.id === groupId)
+      if (!g || g.layout.kind !== 'stack') return
+      const startCurve = g.layout.curve ?? 0
+      const startX = e.clientX
+      const gkey = `gizmo${++gestureSeq}`
+      let last = startCurve
+      dragHandle(e, (ev) => {
+        const step = ev.ctrlKey || ev.metaKey ? 1 : 0.5
+        const curve =
+          Math.round((startCurve + (ev.clientX - startX) * 0.1) / step) * step
+        showDragBadge(ev, `${curve}°/key`)
+        if (curve === last) return
+        last = curve
+        const st = store.getState()
+        const layout = st.groups.find((g) => g.id === groupId)?.layout
+        if (!layout || layout.kind !== 'stack') return
+        coalesceUndo(gkey, () => st.updateGroupLayout(groupId, { ...layout, curve }))
+      })
+    }
+
+    const buildGizmos = (
+      clusterId: string | null,
+      columnCount: number,
+      stackId: string | null,
+    ) => {
+      const rot = makeHandle(
+        'gizmo-rotate',
+        'Drag to rotate the selection (Shift while dragging: 15° steps; Shift-click: reset to 0°)',
+      )
+      rot.addEventListener('pointerdown', shiftResettable(resetRotation, startRotateDrag))
+      const rotReset = makeHandle('gizmo-colbtn', 'Reset rotation to 0°')
+      rotReset.textContent = '↺'
+      rotReset.addEventListener('pointerdown', (e) => {
+        e.preventDefault()
+        e.stopPropagation()
+      })
+      rotReset.addEventListener('click', resetRotation)
+      gizmoPlacers.push(() => {
+        const b = selectionBounds()
+        rot.style.display = b ? '' : 'none'
+        rotReset.style.display = b ? '' : 'none'
+        if (!b) return
+        placeEl(rot, (b.minX + b.maxX) / 2, b.maxY, -26)
+        placeEl(rotReset, (b.minX + b.maxX) / 2, b.maxY, -26, 26)
+        const zero = rotationIsZero()
+        rot.classList.toggle('at-default', zero)
+        rotReset.classList.toggle('at-default', zero)
+      })
+
+      // Quick key-width buttons under the selection.
+      const sizeBar = document.createElement('div')
+      sizeBar.className = 'gizmo-sizebar'
+      gizmoLayer.appendChild(sizeBar)
+      const sizeButtons: [HTMLButtonElement, number][] = []
+      for (const v of [1, 1.25, 1.5, 2]) {
+        const b = document.createElement('button')
+        b.textContent = String(v)
+        b.title = `Set key width to ${v}u`
+        b.addEventListener('pointerdown', (ev) => {
+          ev.preventDefault()
+          ev.stopPropagation()
+        })
+        b.addEventListener('click', () => store.getState().updateSelected({ w: v }))
+        sizeBar.appendChild(b)
+        sizeButtons.push([b, v])
+      }
+      if (clusterId) {
+        const rc = document.createElement('button')
+        rc.textContent = 'Reset'
+        rc.title = 'Zero every column’s stagger and splay in this cluster'
+        rc.addEventListener('pointerdown', (ev) => {
+          ev.preventDefault()
+          ev.stopPropagation()
+        })
+        rc.addEventListener('click', () => {
+          const st = store.getState()
+          const layout = st.groups.find((g) => g.id === clusterId)?.layout
+          if (layout && layout.kind === 'columns') {
+            st.updateGroupLayout(clusterId, {
+              ...layout,
+              columns: layout.columns.map(() => ({ stagger: 0, splay: 0 })),
+            })
+          }
+        })
+        sizeBar.appendChild(rc)
+      }
+      gizmoPlacers.push(() => {
+        const b = selectionBounds()
+        sizeBar.style.display = b ? '' : 'none'
+        if (!b) return
+        const p = mmToPx((b.minX + b.maxX) / 2, b.minY)
+        sizeBar.style.left = `${p.x}px`
+        sizeBar.style.top = `${p.y + 24}px`
+        const st = store.getState()
+        const widths = new Set(
+          st.keys.filter((k) => st.selection.has(k.id)).map((k) => k.w),
+        )
+        const common = widths.size === 1 ? [...widths][0] : null
+        for (const [btn, v] of sizeButtons) btn.classList.toggle('active', common === v)
+      })
+
+      if (stackId) {
+        const curve = makeHandle(
+          'gizmo-splay',
+          'Drag sideways to curve the stack (°/key); Shift-click: reset',
+        )
+        curve.addEventListener(
+          'pointerdown',
+          shiftResettable(
+            () => {
+              const st = store.getState()
+              const layout = st.groups.find((g) => g.id === stackId)?.layout
+              if (layout && layout.kind === 'stack') {
+                st.updateGroupLayout(stackId, { ...layout, curve: 0 })
+              }
+            },
+            (e) => startCurveDrag(e, stackId),
+          ),
+        )
+        gizmoPlacers.push(() => {
+          const st = store.getState()
+          const g = st.groups.find((g) => g.id === stackId)
+          const b = selectionBounds()
+          const show = b && g && g.layout.kind === 'stack'
+          curve.style.display = show ? '' : 'none'
+          if (!show || !b || !g || g.layout.kind !== 'stack') return
+          if (g.layout.axis === 'x') {
+            placeEl(curve, b.maxX + 4, (b.minY + b.maxY) / 2, 0, 10)
+          } else {
+            placeEl(curve, (b.minX + b.maxX) / 2, b.minY - 4, 10)
+          }
+          curve.classList.toggle('at-default', (g.layout.curve ?? 0) === 0)
+        })
+      }
+
+      if (!clusterId) return
+      for (let col = 0; col < columnCount; col++) {
+        const stag = makeHandle(
+          'gizmo-stagger',
+          'Drag to adjust this column’s stagger; Shift-click: reset',
+        )
+        const splay = makeHandle(
+          'gizmo-splay',
+          'Drag sideways to splay this column; Shift-click: reset',
+        )
+        stag.addEventListener(
+          'pointerdown',
+          shiftResettable(
+            () => patchColumn(`gizmo${++gestureSeq}`, clusterId, col, { stagger: 0 }),
+            (e) => startStaggerDrag(e, clusterId, col),
+          ),
+        )
+        splay.addEventListener(
+          'pointerdown',
+          shiftResettable(
+            () => patchColumn(`gizmo${++gestureSeq}`, clusterId, col, { splay: 0 }),
+            (e) => startSplayDrag(e, clusterId, col),
+          ),
+        )
+        gizmoPlacers.push(() => {
+          const info = columnInfo(clusterId, col)
+          stag.style.display = info ? '' : 'none'
+          splay.style.display = info ? '' : 'none'
+          if (!info) return
+          const rad = (info.wTop.r * Math.PI) / 180
+          const up = { x: -Math.sin(rad), y: Math.cos(rad) }
+          const off = info.pitchY * 0.85
+          placeEl(splay, info.wTop.x + up.x * off, info.wTop.y + up.y * off)
+          placeEl(stag, info.wBot.x - up.x * off, info.wBot.y - up.y * off)
+          stag.classList.toggle('at-default', info.layout.columns[col].stagger === 0)
+          splay.classList.toggle('at-default', info.layout.columns[col].splay === 0)
+        })
+      }
+      const add = makeHandle('gizmo-colbtn', 'Add a column')
+      add.textContent = '+'
+      const rem = makeHandle('gizmo-colbtn', 'Remove the last column')
+      rem.textContent = '−'
+      for (const [el, delta] of [
+        [add, 1],
+        [rem, -1],
+      ] as const) {
+        el.addEventListener('pointerdown', (e) => {
+          e.preventDefault()
+          e.stopPropagation()
+        })
+        el.addEventListener('click', () => setColumnCount(clusterId, delta))
+      }
+      gizmoPlacers.push(() => {
+        const state = store.getState()
+        const g = state.groups.find((g) => g.id === clusterId)
+        const info =
+          g && g.layout.kind === 'columns'
+            ? columnInfo(clusterId, g.layout.columns.length - 1)
+            : null
+        add.style.display = info ? '' : 'none'
+        rem.style.display = info ? '' : 'none'
+        if (!info) return
+        const rad = (info.wTop.r * Math.PI) / 180
+        const wx = info.wTop.x + Math.cos(rad) * info.pitchX * 1.05
+        const wy = info.wTop.y + Math.sin(rad) * info.pitchX * 1.05
+        placeEl(add, wx, wy, -11)
+        placeEl(rem, wx, wy, 11)
+      })
+      const addRow = makeHandle('gizmo-colbtn', 'Add a row')
+      addRow.textContent = '+'
+      const remRow = makeHandle('gizmo-colbtn', 'Remove the last row')
+      remRow.textContent = '−'
+      for (const [el, delta] of [
+        [addRow, 1],
+        [remRow, -1],
+      ] as const) {
+        el.addEventListener('pointerdown', (e) => {
+          e.preventDefault()
+          e.stopPropagation()
+        })
+        el.addEventListener('click', () => setRowCount(clusterId, delta))
+      }
+      gizmoPlacers.push(() => {
+        const info = columnInfo(clusterId, 0)
+        addRow.style.display = info ? '' : 'none'
+        remRow.style.display = info ? '' : 'none'
+        if (!info) return
+        const rad = (info.wBot.r * Math.PI) / 180
+        const wx = info.wBot.x - Math.cos(rad) * info.pitchX * 1.05
+        const wy = info.wBot.y - Math.sin(rad) * info.pitchX * 1.05
+        placeEl(addRow, wx, wy, 11)
+        placeEl(remRow, wx, wy, -11)
+      })
+    }
+
+    /** World AABB of all keycaps, mirrored half included — cheap anchor for
+     * the margin handles (the real outline recomputes throttled). */
+    const capBounds = (unmirroredOnly = false) => {
+      const state = store.getState()
+      const groups = groupMap(state.groups)
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
+      const note = (w: XForm, key: Key) => {
+        const cap = capSize(key)
+        const rad = (w.r * Math.PI) / 180
+        const ex = (Math.abs(Math.cos(rad)) * cap.w + Math.abs(Math.sin(rad)) * cap.h) / 2
+        const ey = (Math.abs(Math.sin(rad)) * cap.w + Math.abs(Math.cos(rad)) * cap.h) / 2
+        minX = Math.min(minX, w.x - ex)
+        maxX = Math.max(maxX, w.x + ex)
+        minY = Math.min(minY, w.y - ey)
+        maxY = Math.max(maxY, w.y + ey)
+      }
+      for (const key of state.keys) {
+        const w = keyWorldXF(key, groups)
+        note(w, key)
+        if (!unmirroredOnly && state.mirror.enabled && isKeyMirrored(key, groups)) {
+          note(mirrorXF(w, state.mirror.axis), key)
+        }
+      }
+      return minX < maxX ? { minX, maxX, minY, maxY } : null
+    }
+
+    type MarginSide = 'top' | 'bottom' | 'left' | 'right'
+    const MARGIN_FIELD: Record<MarginSide, 'marginTop' | 'marginBottom' | 'marginLeft' | 'marginRight'> = {
+      top: 'marginTop',
+      bottom: 'marginBottom',
+      left: 'marginLeft',
+      right: 'marginRight',
+    }
+
+    const startMarginDrag = (e: PointerEvent, side: MarginSide) => {
+      const start = toMM(e.clientX, e.clientY)
+      const startVal = store.getState().bezel[MARGIN_FIELD[side]] ?? 0
+      const gkey = `gizmo${++gestureSeq}`
+      let last = startVal
+      dragHandle(e, (ev) => {
+        const pt = toMM(ev.clientX, ev.clientY)
+        const d =
+          side === 'top'
+            ? pt.y - start.y
+            : side === 'bottom'
+              ? start.y - pt.y
+              : side === 'left'
+                ? start.x - pt.x
+                : pt.x - start.x
+        const step = ev.ctrlKey || ev.metaKey ? 1 : 0.5
+        const val = Math.max(0, Math.round((startVal + d) / step) * step)
+        showDragBadge(ev, `${val} mm`)
+        if (val === last) return
+        last = val
+        const state = store.getState()
+        const patch =
+          (side === 'left' || side === 'right') && state.mirror.enabled
+            ? { marginLeft: val, marginRight: val }
+            : { [MARGIN_FIELD[side]]: val }
+        coalesceUndo(gkey, () => state.setBezel(patch))
+      })
+    }
+
+    const buildMarginHandles = () => {
+      const defs: { side: MarginSide; cls: string }[] = [
+        { side: 'top', cls: 'gizmo-margin-v' },
+        { side: 'bottom', cls: 'gizmo-margin-v' },
+        { side: 'left', cls: 'gizmo-margin-h' },
+        { side: 'right', cls: 'gizmo-margin-h' },
+      ]
+      for (const { side, cls } of defs) {
+        const el = makeHandle(
+          cls,
+          `Drag to adjust the ${side} case margin; Shift-click: reset`,
+        )
+        el.addEventListener(
+          'pointerdown',
+          shiftResettable(
+            () => {
+              const st = store.getState()
+              const patch =
+                (side === 'left' || side === 'right') && st.mirror.enabled
+                  ? { marginLeft: 0, marginRight: 0 }
+                  : { [MARGIN_FIELD[side]]: 0 }
+              st.setBezel(patch)
+            },
+            (e) => startMarginDrag(e, side),
+          ),
+        )
+        gizmoPlacers.push(() => {
+          const state = store.getState()
+          const b = capBounds()
+          const show = state.bezel.enabled && b
+          el.style.display = show ? '' : 'none'
+          if (!show || !b) return
+          const bz = state.bezel
+          const pad = bz.outset + bz.width
+          // On a split case, top/bottom handles center on the left half
+          // instead of hovering over the seam.
+          const split = state.mirror.enabled && state.mirror.split === true
+          const hb = (split && capBounds(true)) || b
+          const cx = (hb.minX + hb.maxX) / 2
+          const cy = (b.minY + b.maxY) / 2
+          if (side === 'top') placeEl(el, cx, hb.maxY + pad + (bz.marginTop ?? 0))
+          else if (side === 'bottom') placeEl(el, cx, hb.minY - pad - (bz.marginBottom ?? 0))
+          else if (side === 'left') placeEl(el, b.minX - pad - (bz.marginLeft ?? 0), cy)
+          else placeEl(el, b.maxX + pad + (bz.marginRight ?? 0), cy)
+          el.classList.toggle('at-default', (bz[MARGIN_FIELD[side]] ?? 0) === 0)
+        })
+      }
+    }
+
+    const positionGizmos = () => {
+      for (const place of gizmoPlacers) place()
+    }
+    positionGizmosHook = positionGizmos
+
+    const rebuildGizmos = () => {
+      const state = store.getState()
+      if (gizmoDragging) {
+        positionGizmos()
+        return
+      }
+      const whole = wholeSelectedGroup(state)
+      const cluster = whole && whole.layout.kind === 'columns' ? whole : null
+      const stack = whole && whole.layout.kind === 'stack' ? whole : null
+      const sig =
+        [...state.selection].sort().join(',') +
+        '|' +
+        (cluster && cluster.layout.kind === 'columns'
+          ? `${cluster.id}:${cluster.layout.columns.length}`
+          : '') +
+        '|' +
+        (stack ? `${stack.id}:stack` : '') +
+        '|' +
+        state.bezel.enabled
+      if (sig !== gizmoSig) {
+        gizmoSig = sig
+        gizmoLayer.replaceChildren()
+        gizmoPlacers = []
+        if (state.selection.size > 0) {
+          buildGizmos(
+            cluster?.id ?? null,
+            cluster && cluster.layout.kind === 'columns'
+              ? cluster.layout.columns.length
+              : 0,
+            stack?.id ?? null,
+          )
+        }
+        if (state.bezel.enabled) buildMarginHandles()
+      }
+      positionGizmos()
+    }
+
     const sync = () => {
       const state = store.getState()
       const groups = groupMap(state.groups)
@@ -502,27 +1218,39 @@ export function EditorCanvas() {
       clearGroupBox()
       const whole = wholeSelectedGroup(state)
       if (whole) {
+        // Bounds in the group's own frame, so the box rotates with the group.
+        const frame = groupWorldXF(groups, whole.id)
         const members = new Set(memberKeyIds(whole.id, state.keys, state.groups))
         let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
         for (const key of state.keys) {
           if (!members.has(key.id)) continue
           const w = keyWorldXF(key, groups)
+          const local = worldToLocal(frame, w.x, w.y)
           const size = keySize(key)
-          const rad = (w.r * Math.PI) / 180
-          const ex = (Math.abs(Math.cos(rad)) * size.w + Math.abs(Math.sin(rad)) * size.h) / 2
-          const ey = (Math.abs(Math.sin(rad)) * size.w + Math.abs(Math.cos(rad)) * size.h) / 2
-          minX = Math.min(minX, w.x - ex)
-          maxX = Math.max(maxX, w.x + ex)
-          minY = Math.min(minY, w.y - ey)
-          maxY = Math.max(maxY, w.y + ey)
+          const rel = ((w.r - frame.r) * Math.PI) / 180
+          const ex = (Math.abs(Math.cos(rel)) * size.w + Math.abs(Math.sin(rel)) * size.h) / 2
+          const ey = (Math.abs(Math.sin(rel)) * size.w + Math.abs(Math.cos(rel)) * size.h) / 2
+          minX = Math.min(minX, local.x - ex)
+          maxX = Math.max(maxX, local.x + ex)
+          minY = Math.min(minY, local.y - ey)
+          maxY = Math.max(maxY, local.y + ey)
         }
         if (minX < maxX) {
           const pad = 3
+          const rad = (frame.r * Math.PI) / 180
+          const cos = Math.cos(rad)
+          const sin = Math.sin(rad)
+          const corner = (lx: number, ly: number) =>
+            new THREE.Vector3(
+              frame.x + lx * cos - ly * sin,
+              frame.y + lx * sin + ly * cos,
+              0,
+            )
           const geo = new THREE.BufferGeometry().setFromPoints([
-            new THREE.Vector3(minX - pad, minY - pad, 0),
-            new THREE.Vector3(maxX + pad, minY - pad, 0),
-            new THREE.Vector3(maxX + pad, maxY + pad, 0),
-            new THREE.Vector3(minX - pad, maxY + pad, 0),
+            corner(minX - pad, minY - pad),
+            corner(maxX + pad, minY - pad),
+            corner(maxX + pad, maxY + pad),
+            corner(minX - pad, maxY + pad),
           ])
           groupBox = new THREE.LineLoop(geo, materials.groupOutline)
           groupBox.computeLineDistances()
@@ -530,6 +1258,8 @@ export function EditorCanvas() {
           scene.add(groupBox)
         }
       }
+
+      rebuildGizmos()
     }
 
     // ---- Interaction ------------------------------------------------------
@@ -540,6 +1270,11 @@ export function EditorCanvas() {
       primaryWorld: { x: number; y: number }
       /** Half of the primary keycap's world-x extent, for mirror-axis snap. */
       primaryHalfW: number
+      /** Selection bounds at drag start plus stationary-neighbour edge and
+       * center coordinates, for magnetic snapping. */
+      bounds0: { minX: number; maxX: number; minY: number; maxY: number } | null
+      snapX: number[]
+      snapY: number[]
       start: { x: number; y: number }
     }
     type Mode =
@@ -596,8 +1331,32 @@ export function EditorCanvas() {
       const rad = (primaryWorld.r * Math.PI) / 180
       const primaryHalfW =
         (cap.w * Math.abs(Math.cos(rad)) + cap.h * Math.abs(Math.sin(rad))) / 2
+      // Stationary neighbours' pitch-area edges and centers, snapped against
+      // the dragged selection's bounds.
+      const snapX: number[] = []
+      const snapY: number[] = []
+      for (const k of state.keys) {
+        if (state.selection.has(k.id)) continue
+        const w = keyWorldXF(k, groups)
+        const size = keySize(k)
+        const kr = (w.r * Math.PI) / 180
+        const ex = (Math.abs(Math.cos(kr)) * size.w + Math.abs(Math.sin(kr)) * size.h) / 2
+        const ey = (Math.abs(Math.sin(kr)) * size.w + Math.abs(Math.cos(kr)) * size.h) / 2
+        snapX.push(w.x - ex, w.x + ex, w.x)
+        snapY.push(w.y - ey, w.y + ey, w.y)
+      }
       store.getState().beginTransform()
-      mode = { kind: 'drag', groupsOrig, keysOrig, primaryWorld, primaryHalfW, start }
+      mode = {
+        kind: 'drag',
+        groupsOrig,
+        keysOrig,
+        primaryWorld,
+        primaryHalfW,
+        bounds0: selectionBounds(),
+        snapX,
+        snapY,
+        start,
+      }
     }
 
     const onPointerDown = (e: PointerEvent) => {
@@ -622,6 +1381,35 @@ export function EditorCanvas() {
       }
       const state = store.getState()
       const groups = groupMap(state.groups)
+      // Ctrl-drag: duplicate the selection in place and drag the clones.
+      if (e.ctrlKey || e.metaKey) {
+        const top = e.altKey ? null : topGroupOf(hit, groups)
+        if (e.altKey) state.setSelection([hit.id])
+        else if (top) {
+          const members = memberKeyIds(top.id, state.keys, state.groups)
+          if (!members.every((id) => state.selection.has(id))) {
+            state.setSelection(members)
+          }
+        } else if (!state.selection.has(hit.id)) {
+          state.setSelection([hit.id])
+        }
+        store.getState().duplicateSelection(0, 0)
+        const st = store.getState()
+        const cloneGroups = groupMap(st.groups)
+        const hw = keyWorldXF(hit, groups)
+        let primary: Key | null = null
+        for (const k of st.keys) {
+          if (!st.selection.has(k.id)) continue
+          const w = keyWorldXF(k, cloneGroups)
+          if (Math.abs(w.x - hw.x) < 0.01 && Math.abs(w.y - hw.y) < 0.01) {
+            primary = k
+            break
+          }
+        }
+        primary ??= st.keys.find((k) => st.selection.has(k.id)) ?? null
+        if (primary) beginDrag(primary, pt)
+        return
+      }
       const top = e.altKey ? null : topGroupOf(hit, groups)
       if (e.altKey) {
         // Alt: isolate the individual key even inside a group.
@@ -672,6 +1460,48 @@ export function EditorCanvas() {
         // Snap the primary key's resulting world position, move the rest rigidly.
         dx = snap(mode.primaryWorld.x + dx) - mode.primaryWorld.x
         dy = snap(mode.primaryWorld.y + dy) - mode.primaryWorld.y
+        // Magnetic snap against stationary neighbours: edges and centers of
+        // the dragged bounds pull toward theirs within a screen threshold.
+        // The matched coordinate doubles as an alignment guide line.
+        let guideX: number | null = null
+        let guideY: number | null = null
+        if (mode.bounds0) {
+          const threshold = 8 / view.zoom
+          const pull = (edges: number[], targets: number[]) => {
+            let best: { d: number; at: number } | null = null
+            for (const e of edges) {
+              for (const c of targets) {
+                const d = c - e
+                if (Math.abs(d) < (best === null ? threshold : Math.abs(best.d))) {
+                  best = { d, at: c }
+                }
+              }
+            }
+            return best
+          }
+          const b = mode.bounds0
+          const ddx = pull(
+            [b.minX + dx, b.maxX + dx, (b.minX + b.maxX) / 2 + dx],
+            mode.snapX,
+          )
+          if (ddx !== null) {
+            dx += ddx.d
+            guideX = ddx.at
+          }
+          const ddy = pull(
+            [b.minY + dy, b.maxY + dy, (b.minY + b.maxY) / 2 + dy],
+            mode.snapY,
+          )
+          if (ddy !== null) {
+            dy += ddy.d
+            guideY = ddy.at
+          }
+        }
+        // Ctrl: whole-millimeter positions.
+        if (e.ctrlKey || e.metaKey) {
+          dx = Math.round(mode.primaryWorld.x + dx) - mode.primaryWorld.x
+          dy = Math.round(mode.primaryWorld.y + dy) - mode.primaryWorld.y
+        }
         // A cap straddling the mirror line centers on it (shared middle key).
         const { mirror } = store.getState()
         if (
@@ -679,7 +1509,9 @@ export function EditorCanvas() {
           Math.abs(mode.primaryWorld.x + dx - mirror.axis) < mode.primaryHalfW
         ) {
           dx = mirror.axis - mode.primaryWorld.x
+          guideX = mirror.axis
         }
+        setSnapGuides(guideX, guideY)
         const patches: TransformPatches = {
           keys: new Map(),
           groups: new Map(),
@@ -696,6 +1528,10 @@ export function EditorCanvas() {
             y: o.y + dx * sin + dy * cos,
           })
         }
+        showDragBadge(
+          e,
+          `${(mode.primaryWorld.x + dx).toFixed(1)}, ${(mode.primaryWorld.y + dy).toFixed(1)}`,
+        )
         useDocStore.getState().transform(patches)
       } else if (mode.kind === 'band') {
         const rect = canvas.getBoundingClientRect()
@@ -712,6 +1548,8 @@ export function EditorCanvas() {
     }
 
     const onPointerUp = (e: PointerEvent) => {
+      hideDragBadge()
+      setSnapGuides(null, null)
       if (mode.kind === 'drag') {
         useDocStore.getState().endTransform()
       } else if (mode.kind === 'band') {
@@ -852,12 +1690,15 @@ export function EditorCanvas() {
       window.removeEventListener('keydown', onKeyDown)
       window.removeEventListener('keyup', onKeyUp)
       clearTimeout(outlineTimer)
+      wrap.removeChild(dragBadge)
       clearGroupBox()
       for (const line of bezelLines) line.geometry.dispose()
       for (const v of views.values()) disposeSprite(v)
       for (const geo of geoCache.values()) geo.dispose()
       for (const m of Object.values(materials)) m.dispose()
       axisLine.geometry.dispose()
+      guideV.geometry.dispose()
+      guideH.geometry.dispose()
       grid.geometry.dispose()
       renderer.dispose()
       wrap.removeChild(canvas)
@@ -867,6 +1708,7 @@ export function EditorCanvas() {
   return (
     <div className="editor" ref={wrapRef}>
       <div className="select-band" ref={bandRef} />
+      <div className="gizmo-layer" ref={gizmoRef} />
       <div className="dims-badge" ref={dimsRef} />
     </div>
   )

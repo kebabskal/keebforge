@@ -191,6 +191,146 @@ main {
   background: var(--accent-veil);
 }
 
+.gizmo-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.gizmo-handle {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  pointer-events: auto;
+  box-sizing: border-box;
+  touch-action: none;
+}
+
+.gizmo-rotate {
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  border: 2px solid var(--accent);
+  background: var(--input-bg);
+  cursor: grab;
+}
+
+.gizmo-rotate:active {
+  cursor: grabbing;
+}
+
+.gizmo-stagger {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  border: 2px solid var(--accent);
+  background: var(--input-bg);
+  cursor: ns-resize;
+}
+
+.gizmo-splay {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--accent);
+  background: var(--input-bg);
+  cursor: ew-resize;
+}
+
+.gizmo-handle:hover {
+  background: var(--accent-veil);
+}
+
+.gizmo-handle.at-default {
+  opacity: 0.7;
+  border-color: var(--border-strong);
+}
+
+.gizmo-margin-v {
+  width: 26px;
+  height: 9px;
+  border-radius: 5px;
+  border: 2px solid var(--accent);
+  background: var(--input-bg);
+  cursor: ns-resize;
+}
+
+.gizmo-margin-h {
+  width: 9px;
+  height: 26px;
+  border-radius: 5px;
+  border: 2px solid var(--accent);
+  background: var(--input-bg);
+  cursor: ew-resize;
+}
+
+.gizmo-sizebar {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  pointer-events: auto;
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--input-bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+}
+
+.gizmo-sizebar button {
+  font: inherit;
+  font-size: 0.7rem;
+  color: var(--text);
+  background: var(--control);
+  border: none;
+  border-radius: 4px;
+  padding: 0.1rem 0.3rem;
+  cursor: pointer;
+}
+
+.gizmo-sizebar button:hover {
+  background: var(--control-hover);
+  color: var(--text-h);
+}
+
+.gizmo-sizebar button.active {
+  background: var(--accent-bg);
+  color: var(--text-h);
+}
+
+.gizmo-colbtn {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  background: var(--control);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 16px;
+  text-align: center;
+  cursor: pointer;
+  user-select: none;
+}
+
+.gizmo-colbtn:hover {
+  background: var(--control-hover);
+  color: var(--text-h);
+}
+
+.drag-badge {
+  display: none;
+  position: absolute;
+  pointer-events: none;
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-h);
+  background: var(--input-bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  padding: 0.1rem 0.4rem;
+  white-space: nowrap;
+  z-index: 2;
+}
+
 .dims-badge {
   display: none;
   position: absolute;
@@ -309,6 +449,85 @@ main {
   border: 1px solid var(--border-strong);
   border-radius: 6px;
   cursor: pointer;
+}
+
+.hint.hint-warn {
+  color: #e07a3f;
+  opacity: 1;
+}
+
+.preset-row {
+  display: flex;
+  gap: 0.4rem;
+  margin-top: 0.6rem;
+}
+
+.preset-row button {
+  flex: 1;
+  display: flex;
+  gap: 0.25rem;
+  justify-content: center;
+  align-items: center;
+  padding: 0.45rem 0;
+  background: var(--control);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.preset-row button:hover {
+  background: var(--control-hover);
+}
+
+.preset-dot {
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 0, 0, 0.3);
+}
+
+.layer-list {
+  display: flex;
+  flex-direction: column;
+  margin-top: 0.6rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.layer-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font: inherit;
+  font-size: 0.85rem;
+  text-align: left;
+  color: var(--text);
+  background: var(--control);
+  border: none;
+  border-bottom: 1px solid var(--border-strong);
+  padding: 0.35rem 0.6rem;
+  cursor: pointer;
+}
+
+.layer-row:last-child {
+  border-bottom: none;
+}
+
+.layer-row:hover {
+  background: var(--control-hover);
+  color: var(--text-h);
+}
+
+.layer-row.layer-off {
+  color: var(--text);
+  opacity: 0.45;
+}
+
+.layer-eye {
+  width: 1.2rem;
+  text-align: center;
+  font-size: 0.8rem;
 }
 
 .column-table {
