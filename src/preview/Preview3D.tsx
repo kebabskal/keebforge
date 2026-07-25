@@ -30,6 +30,7 @@ import {
 import { groupMap, useDocStore } from '../model/store'
 import { useTheme } from '../ui/theme'
 import { capGeo, CAP_PROFILE, frustumGeo } from './capGeometry'
+import { loftRings, ringToVec, shapeFromRings, type LoftLevel } from './loft'
 import { ViewBar } from './ViewBar'
 import { useViewSettings } from './viewSettings'
 
@@ -59,27 +60,9 @@ function pointInRing(ring: [number, number][], x: number, y: number): boolean {
 }
 
 function shapesFromPolygons(mp: MultiPolygon): THREE.Shape[] {
-  // Shapes close implicitly; the rings' duplicated closing point (and any
-  // coincident neighbours) create zero-length edges that turn the bevel
-  // offset into NaNs, which culls the whole mesh.
-  const toVec = (ring: [number, number][]) => {
-    const pts: THREE.Vector2[] = []
-    for (const [x, y] of ring) {
-      const last = pts[pts.length - 1]
-      if (!last || Math.abs(last.x - x) > 1e-6 || Math.abs(last.y - y) > 1e-6) {
-        pts.push(new THREE.Vector2(x, y))
-      }
-    }
-    while (pts.length > 1 && pts[0].distanceTo(pts[pts.length - 1]) < 1e-6) pts.pop()
-    return pts
-  }
-  return mp.map((poly) => {
-    const shape = new THREE.Shape(toVec(poly[0] as [number, number][]))
-    for (let i = 1; i < poly.length; i++) {
-      shape.holes.push(new THREE.Path(toVec(poly[i] as [number, number][])))
-    }
-    return shape
-  })
+  return mp.map((poly) =>
+    shapeFromRings(poly.map((ring) => ringToVec(ring as [number, number][]))),
+  )
 }
 
 export function Preview3D() {
@@ -448,6 +431,83 @@ export function Preview3D() {
         partMeshes[part] = []
       }
 
+      /** Orient, place and register one built part. Raw geometry is authored
+       * in the XY plane rising along +Z, the way an extrusion comes out. */
+      const placePart = (
+        raw: THREE.BufferGeometry,
+        ring: [number, number][],
+        part: 'plate' | 'foam' | 'case' | 'bottom',
+        y: number,
+        material: THREE.Material,
+        shadows: boolean,
+        preCreased = false,
+      ) => {
+        // Extrusions come flat-shaded, so curved outline corners read as
+        // facets. Smooth normals across shallow face angles only — real
+        // edges (the 45° bevel chamfer, top/bottom rims, cutout corners)
+        // stay creased. Lofted parts crease per band as they are built, so
+        // they arrive already normalled.
+        const geo = preCreased ? raw : toCreasedNormals(raw, Math.PI / 6)
+        if (!preCreased) raw.dispose()
+        slabGeos.push(geo)
+        const mesh = new THREE.Mesh(geo, material)
+        mesh.rotation.x = -Math.PI / 2
+        mesh.position.y = y
+        mesh.userData.assembledY = y
+        mesh.castShadow = shadows
+        mesh.receiveShadow = true
+        let sMinX = Infinity
+        let sMaxX = -Infinity
+        for (const [x] of ring) {
+          sMinX = Math.min(sMinX, x)
+          sMaxX = Math.max(sMaxX, x)
+        }
+        noteX(sMinX, sMaxX)
+        if (split) {
+          const pts = sidePts[(sMinX + sMaxX) / 2 < axis ? 'left' : 'right']
+          for (const [x, y] of ring) pts.push([x, -y])
+        }
+        targetFor((sMinX + sMaxX) / 2).add(mesh)
+        partMeshes[part].push(mesh)
+      }
+
+      /** A part whose outer face tapers with height. `insetAt` gives the
+       * outer pull-in at any world height, so parts stacked along the case
+       * continue one unbroken profile. `breaks` are world heights where that
+       * profile changes slope — a level is planted at each one falling inside
+       * this band, so the break lands exactly where asked even mid-part.
+       * `bevel` chamfers the top edge, opening included. */
+      const addTaperedSlab = (
+        mp: MultiPolygon,
+        part: 'case',
+        thickness: number,
+        y: number,
+        material: THREE.Material,
+        shadows: boolean,
+        insetAt: (worldY: number) => number,
+        breaks: number[],
+        bevel = 0,
+      ) => {
+        const b = Math.max(0, Math.min(bevel, thickness / 2 - 0.05))
+        const top = y + thickness - b
+        const levels: LoftLevel[] = [{ z: 0, outer: insetAt(y), hole: 0 }]
+        for (const at of breaks) {
+          if (at > y + 1e-6 && at < top - 1e-6) levels.push({ z: at - y, outer: insetAt(at), hole: 0 })
+        }
+        levels.push({ z: top - y, outer: insetAt(top), hole: 0 })
+        // The chamfer pulls both boundaries in on top of whatever draft has
+        // already accumulated.
+        if (b > 0) levels.push({ z: thickness, outer: insetAt(top) + b, hole: b })
+        for (const poly of mp) {
+          const rings = poly.map((ring) => ringToVec(ring as [number, number][]))
+          if (rings[0].length < 3) continue
+          placePart(
+            loftRings(rings, levels), poly[0] as [number, number][],
+            part, y, material, shadows, true,
+          )
+        }
+      }
+
       const addSlab = (
         mp: MultiPolygon,
         part: 'plate' | 'foam' | 'case' | 'bottom',
@@ -468,32 +528,7 @@ export function Preview3D() {
             bevelSegments: 1,
             curveSegments: 6,
           })
-          // Extrusions come flat-shaded, so curved outline corners read as
-          // facets. Smooth normals across shallow face angles only — real
-          // edges (the 45° bevel chamfer, top/bottom rims, cutout corners)
-          // stay creased.
-          const geo = toCreasedNormals(extruded, Math.PI / 6)
-          extruded.dispose()
-          slabGeos.push(geo)
-          const mesh = new THREE.Mesh(geo, material)
-          mesh.rotation.x = -Math.PI / 2
-          mesh.position.y = y + b
-          mesh.userData.assembledY = y + b
-          mesh.castShadow = shadows
-          mesh.receiveShadow = true
-          let sMinX = Infinity
-          let sMaxX = -Infinity
-          for (const [x] of mp[i][0]) {
-            sMinX = Math.min(sMinX, x)
-            sMaxX = Math.max(sMaxX, x)
-          }
-          noteX(sMinX, sMaxX)
-          if (split) {
-            const pts = sidePts[(sMinX + sMaxX) / 2 < axis ? 'left' : 'right']
-            for (const [x, y] of mp[i][0]) pts.push([x, -y])
-          }
-          targetFor((sMinX + sMaxX) / 2).add(mesh)
-          partMeshes[part].push(mesh)
+          placePart(extruded, mp[i][0] as [number, number][], part, y + b, material, shadows)
         })
       }
       // Candidate contact points for tight-bottom support posts, in each case
@@ -526,29 +561,42 @@ export function Preview3D() {
           // so the wall still reads solid from inside the case. Splitting the
           // band at that depth is how an extruded outline gets a blind hole.
           const pilotH = Math.min(SCREW.bite, wallH)
+          // The wall and rim share the hull, so their outer faces form one
+          // continuous surface from the lid plane to the top of the rim. The
+          // draft is spread over that whole height and each band picks up the
+          // slice it spans, so the slope never breaks at a seam.
+          const rimH = doc.bezel.height > 0 ? doc.bezel.height : 0
+          const outerH = wallH + rimH
+          const draft = Math.max(0, doc.bezel.draft ?? 0)
+          // The face stays vertical up to the break, then tapers the rest of
+          // the way to the top of the rim.
+          const breakY = caseBottomY + Math.max(0, Math.min(doc.bezel.draftStart ?? 0, outerH))
+          const taperH = caseBottomY + outerH - breakY
+          const insetAt = (y: number) =>
+            taperH > 1e-6 ? (draft * Math.max(0, y - breakY)) / taperH : 0
+          const breaks = [breakY]
           for (const shell of caseShells(doc)) {
             trackFront(shell.hull)
             if (screws.length > 0) {
               const drilled = subtractDiscs(shell.wall, screws, SCREW.pilotR)
-              addSlab(drilled, 'case', pilotH, caseBottomY, materials.bezel, true)
+              const splitY = caseBottomY + pilotH
+              addTaperedSlab(
+                drilled, 'case', pilotH, caseBottomY, materials.bezel, true, insetAt, breaks,
+              )
               if (wallH > pilotH) {
-                addSlab(
-                  shell.wall,
-                  'case',
-                  wallH - pilotH,
-                  caseBottomY + pilotH,
-                  materials.bezel,
-                  true,
+                addTaperedSlab(
+                  shell.wall, 'case', wallH - pilotH, splitY, materials.bezel, true, insetAt, breaks,
                 )
               }
             } else {
-              addSlab(shell.wall, 'case', wallH, caseBottomY, materials.bezel, true)
+              addTaperedSlab(
+                shell.wall, 'case', wallH, caseBottomY, materials.bezel, true, insetAt, breaks,
+              )
             }
-            if (doc.bezel.height > 0) {
-              // Extrusion bevels are symmetric, so sink the rim by one bevel:
-              // the bottom chamfer ends up buried inside the wall band below
-              // and only the top edge shows a bevel — no seam at plate height.
-              addSlab(shell.rim, 'case', doc.bezel.height + bevel, -bevel, materials.bezel, true, bevel)
+            if (rimH > 0) {
+              addTaperedSlab(
+                shell.rim, 'case', rimH, 0, materials.bezel, true, insetAt, breaks, bevel,
+              )
             }
           }
         }

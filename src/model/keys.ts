@@ -99,6 +99,14 @@ export interface BezelSettings {
   radiusInner: number
   /** Chamfer on the bezel's top and bottom edges (3D preview), mm. */
   bevel: number
+  /** Draft: how far the case's outer face pulls in between where the taper
+   * starts and the top of the rim (3D preview), mm. The taper is continuous
+   * across the wall and rim; the cavity stays vertical, so the plate still
+   * drops in. */
+  draft: number
+  /** Height above the lid plane where the draft begins, mm. The face below
+   * stays vertical, so this sets the break line around the case. */
+  draftStart: number
   /** Extra outward case margins per world direction, mm. On split cases the
    * left/right margins apply to each half's outward edge only. */
   marginTop: number
@@ -116,6 +124,8 @@ export const DEFAULT_BEZEL: BezelSettings = {
   radiusOuter: 4,
   radiusInner: 1,
   bevel: 1.5,
+  draft: 0,
+  draftStart: 0,
   marginTop: 0,
   marginBottom: 0,
   marginLeft: 0,

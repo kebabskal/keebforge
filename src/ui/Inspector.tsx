@@ -428,6 +428,24 @@ function DocumentPanel() {
             onCommit={(bevel) => setBezel({ bevel })}
           />
           <SliderField
+            label="Draft"
+            value={bezel.draft ?? 0}
+            min={0}
+            max={6}
+            step={0.1}
+            unit="mm"
+            onCommit={(draft) => setBezel({ draft })}
+          />
+          <SliderField
+            label="Draft start"
+            value={bezel.draftStart ?? 0}
+            min={0}
+            max={20}
+            step={0.5}
+            unit="mm"
+            onCommit={(draftStart) => setBezel({ draftStart })}
+          />
+          <SliderField
             label="Margin top"
             value={bezel.marginTop ?? 0}
             min={0}
@@ -481,7 +499,13 @@ function DocumentPanel() {
         <p className="hint">
           The hollow top shell: tight follows the keycap contour, box is a
           rectangular frame. Width is the wall thickness, outset the gap
-          around keycaps, height the rim above the plate top.
+          around keycaps, height the rim above the plate top. Draft tapers the
+          outside of the case, pulling the top of the rim in by that much
+          while the base keeps the outline — the cavity stays straight, so the
+          plate still drops in. Draft start holds the face vertical for that
+          many mm above the lid plane first, putting a break line around the
+          case. Like bevel, both shape the 3D preview only; exported outlines
+          are the footprint at the base.
         </p>
       </Section>
       <Section id="doc-bottom" title="Case bottom" defaultOpen={false}>
