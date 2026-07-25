@@ -281,6 +281,215 @@ function dropDebris(mp: MultiPolygon, minArea: number): MultiPolygon {
   return out
 }
 
+interface Vec {
+  x: number
+  y: number
+}
+
+/** A key's world rectangle as a local frame: axes plus a local→world map. */
+function keyFrame(world: XForm, w: number, h: number) {
+  const rad = (world.r * Math.PI) / 180
+  const ux: Vec = { x: Math.cos(rad), y: Math.sin(rad) }
+  const uy: Vec = { x: -Math.sin(rad), y: Math.cos(rad) }
+  return {
+    ux,
+    uy,
+    w,
+    h,
+    c: { x: world.x, y: world.y } as Vec,
+    at: (lx: number, ly: number): Vec => ({
+      x: world.x + ux.x * lx + uy.x * ly,
+      y: world.y + ux.y * lx + uy.y * ly,
+    }),
+  }
+}
+
+const dot = (a: Vec, b: Vec) => a.x * b.x + a.y * b.y
+
+/** Where two infinite lines cross, or null if they are parallel. */
+function lineCross(p0: Vec, d0: Vec, p1: Vec, d1: Vec): Vec | null {
+  const den = d0.x * d1.y - d0.y * d1.x
+  if (Math.abs(den) < 1e-9) return null
+  const t = ((p1.x - p0.x) * d1.y - (p1.y - p0.y) * d1.x) / den
+  return { x: p0.x + d0.x * t, y: p0.y + d0.y * t }
+}
+
+/** Close the notch where two neighbouring columns meet at different heights.
+ * Splay and stagger leave the shorter column's end edge hanging in mid-air,
+ * and the union dips into the slot between the two — the nub. Instead of
+ * bridging straight across (which pulls the boundary off the keys), run the
+ * shorter column's end edge on until it meets the taller column's facing
+ * side and fill only what that encloses, so the outline steps cleanly from
+ * one column up to the next.
+ *
+ * Built per end of each adjacent column pair, and per mirrored copy, since
+ * mirroring flips which side of a key faces its neighbour. */
+function columnJoinFills(
+  doc: Doc,
+  worlds: { key: Key; world: XForm; mirrored: boolean }[],
+  sizeOf: (key: Key) => { w: number; h: number },
+  pad: number,
+): Polygon[] {
+  const out: Polygon[] = []
+  for (const group of doc.groups) {
+    if (group.layout.kind !== 'columns') continue
+    const byCol = new Map<number, Key[]>()
+    for (const key of doc.keys) {
+      if (key.groupId !== group.id) continue
+      const col = key.col ?? 0
+      byCol.set(col, [...(byCol.get(col) ?? []), key])
+    }
+    const cols = [...byCol.keys()].sort((a, b) => a - b)
+    if (cols.length < 2) continue
+    for (const mirrored of [false, true]) {
+      const byId = new Map(
+        worlds.filter((w) => w.mirrored === mirrored).map((w) => [w.key.id, w.world] as const),
+      )
+      if (byId.size === 0) continue
+      for (let i = 0; i + 1 < cols.length; i++) {
+        const pair = [byCol.get(cols[i])!, byCol.get(cols[i + 1])!]
+        // end = +1 is the columns' local top, -1 their bottom.
+        for (const end of [1, -1] as const) {
+          const ends = pair.map((col) =>
+            col.reduce((best, k) =>
+              end > 0
+                ? (k.row ?? 0) < (best.row ?? 0)
+                  ? k
+                  : best
+                : (k.row ?? 0) > (best.row ?? 0)
+                  ? k
+                  : best,
+            ),
+          )
+          const frames = ends.map((k) => {
+            const world = byId.get(k.id)
+            if (!world) return null
+            const size = sizeOf(k)
+            return keyFrame(world, size.w + 2 * pad, size.h + 2 * pad)
+          })
+          if (!frames[0] || !frames[1]) continue
+          const [fa, fb] = frames as [ReturnType<typeof keyFrame>, ReturnType<typeof keyFrame>]
+          const toB: Vec = { x: fb.c.x - fa.c.x, y: fb.c.y - fa.c.y }
+          const span = Math.hypot(toB.x, toB.y)
+          if (span < 1e-6) continue
+          const dir: Vec = { x: toB.x / span, y: toB.y / span }
+          // Local +y survives mirroring, but local +x flips with it, so pick
+          // each facing side by which one actually points at the neighbour.
+          const sideA = dot(fa.ux, dir) > 0 ? 1 : -1
+          const sideB = dot(fb.ux, dir) > 0 ? -1 : 1
+          // Whichever end edge sits lower along the shared up axis is the one
+          // that gets extended.
+          const up: Vec = end > 0 ? fa.uy : { x: -fa.uy.x, y: -fa.uy.y }
+          const midA = fa.at(0, (end * fa.h) / 2)
+          const midB = fb.at(0, (end * fb.h) / 2)
+          const aIsLower = dot(midA, up) <= dot(midB, up)
+          const low = aIsLower ? fa : fb
+          const tall = aIsLower ? fb : fa
+          const lowSide = aIsLower ? sideA : sideB
+          const tallSide = aIsLower ? sideB : sideA
+          const lowCol = aIsLower ? pair[0] : pair[1]
+
+          const corner = low.at((lowSide * low.w) / 2, (end * low.h) / 2)
+          const cross = lineCross(corner, low.ux, tall.at((tallSide * tall.w) / 2, 0), tall.uy)
+          if (!cross) continue
+          const reach: Vec = { x: cross.x - corner.x, y: cross.y - corner.y }
+          const run = Math.hypot(reach.x, reach.y)
+          const toTall = aIsLower ? dir : { x: -dir.x, y: -dir.y }
+          // The extension has to run from the shorter column toward the
+          // taller one. Where it points the other way the shorter column's
+          // corner already reaches past its neighbour's side, so there is no
+          // notch — filling there would extend the taller column instead.
+          if (run < 1e-6 || dot(reach, toTall) <= 0 || run > span) continue
+
+          // Deep enough to land in material the two columns already share.
+          let depth = low.h
+          for (const k of lowCol) {
+            const w = byId.get(k.id)
+            if (w) depth = Math.max(depth, Math.hypot(w.x - low.c.x, w.y - low.c.y) + low.h)
+          }
+          const downLow: Vec = { x: -end * low.uy.x * depth, y: -end * low.uy.y * depth }
+          const downTall: Vec = { x: -end * tall.uy.x * depth, y: -end * tall.uy.y * depth }
+          const quad: Vec[] = [
+            corner,
+            cross,
+            { x: cross.x + downTall.x, y: cross.y + downTall.y },
+            { x: corner.x + downLow.x, y: corner.y + downLow.y },
+          ]
+          let area = 0
+          for (let v = 0; v < quad.length; v++) {
+            const p = quad[v]
+            const q = quad[(v + 1) % quad.length]
+            area += p.x * q.y - q.x * p.y
+          }
+          const ordered = area < 0 ? [...quad].reverse() : quad
+          const ring: Ring = ordered.map((p) => [snap(p.x), snap(p.y)])
+          ring.push(ring[0])
+          out.push([ring])
+        }
+      }
+    }
+  }
+  return out
+}
+
+/** How far a corner must stand proud to count as a feature rather than a
+ * sliver, mm. Where two angled pitch areas cross — splayed columns, a curved
+ * stack — the union leaves saw teeth a fraction of a millimetre tall (0.33 mm
+ * at worst across splay angles up to 30°), while a real key corner stands
+ * 13 mm or more out, so there is a wide band to sit in. Trimming a little
+ * past the teeth also lets the chords they leave behind collapse, which is
+ * what turns a stepped run into a clean one. */
+const NUB_HEIGHT = 1
+
+/** Cut protruding slivers off an outline. A convex corner poking less than
+ * `maxHeight` past the straight line between its neighbours is dropped and
+ * the boundary takes that chord instead — precisely the little triangle
+ * between two angled keys.
+ *
+ * Deliberately one-sided: it only ever removes material, so concave detail
+ * survives and the outline still follows the keys. Filling the concave side
+ * as well would bridge the valley where splayed columns fan apart, which is
+ * real shape rather than an artefact. */
+function trimSpikes(mp: MultiPolygon, maxHeight: number): MultiPolygon {
+  return mp.map((poly) => poly.map((ring) => trimSpikeRing(ring, maxHeight)))
+}
+
+function trimSpikeRing(ring: Ring, maxHeight: number): Ring {
+  let pts = ring as [number, number][]
+  if (
+    pts.length > 1 &&
+    pts[0][0] === pts[pts.length - 1][0] &&
+    pts[0][1] === pts[pts.length - 1][1]
+  ) {
+    pts = pts.slice(0, -1)
+  }
+  if (pts.length < 4) return ring
+  for (let pass = 0; pass < 8 && pts.length > 3; pass++) {
+    const drop = new Set<number>()
+    const n = pts.length
+    for (let i = 0; i < n; i++) {
+      // Never collapse two neighbouring corners at once; the next pass can
+      // take the second one once the chord has settled.
+      if (drop.has((i - 1 + n) % n)) continue
+      const p = pts[(i - 1 + n) % n]
+      const v = pts[i]
+      const q = pts[(i + 1) % n]
+      // Canonical winding puts material to the left of the traversal for
+      // outer rings and holes alike, so a left turn is a protrusion in both.
+      const cross = (v[0] - p[0]) * (q[1] - v[1]) - (v[1] - p[1]) * (q[0] - v[0])
+      if (cross <= 0) continue
+      const chord = Math.hypot(q[0] - p[0], q[1] - p[1])
+      // |cross| / chord is the corner's perpendicular height over the chord.
+      if (chord > 1e-9 && cross / chord < maxHeight) drop.add(i)
+    }
+    if (drop.size === 0) break
+    pts = pts.filter((_, i) => !drop.has(i))
+  }
+  const out: Ring = pts.map(([x, y]) => [snap(x), snap(y)])
+  out.push(out[0])
+  return out
+}
+
 /** Round convex corners with radius r and concave ones with `sc`, while also
  * filling concave gaps narrower than 2*sc: morphological open(r) followed by
  * close(sc), fused into erode(r) → dilate(r + sc) → erode(sc). Unlike
@@ -419,7 +628,13 @@ export function plateOutline(doc: Doc): MultiPolygon {
     if (rects.length === 0) continue
     result.push(
       ...closeGaps(
-        robustClip((s) => polygonClipping.union(s), rects),
+        trimSpikes(
+          robustClip((s) => polygonClipping.union(s), [
+            ...rects,
+            ...columnJoinFills(doc, side.worlds, keySize, pad),
+          ]),
+          NUB_HEIGHT,
+        ),
         MIN_FEATURE / 2,
       ),
     )
@@ -671,17 +886,25 @@ function bezelSolidsUncached(doc: Doc): BezelSolids[] {
         return rectPoly(world, size.w + 2 * pad, size.h + 2 * pad)
       })
     const margins = marginsFor(side.half, bezel)
+    const capUnion = (pad: number, trim: number) =>
+      trimSpikes(
+        robustClip((s) => polygonClipping.union(s), [
+          ...capRects(pad),
+          ...columnJoinFills(doc, side.worlds, capSize, pad),
+        ]),
+        trim,
+      )
+    // Trimming the opening eats into the keycap clearance, so it never cuts
+    // deeper than half the outset. The outer edge has nothing to clear and
+    // takes the full height.
     const opening = prep(
-      robustClip((s) => polygonClipping.union(s), capRects(bezel.outset)),
+      capUnion(bezel.outset, Math.min(NUB_HEIGHT, bezel.outset / 2)),
       bezel.radiusInner ?? 0,
     )
     let outer: MultiPolygon
     if (bezel.mode === 'tight') {
       outer = prep(
-        expandMargins(
-          robustClip((s) => polygonClipping.union(s), capRects(bezel.outset + bezel.width)),
-          margins,
-        ),
+        expandMargins(capUnion(bezel.outset + bezel.width, NUB_HEIGHT), margins),
         bezel.radiusOuter ?? 0,
       )
     } else {
