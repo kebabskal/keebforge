@@ -20,6 +20,8 @@ import {
   CSK_DEPTH,
   foamWithCutouts,
   FOAM_THICKNESS,
+  PCB_THICKNESS,
+  pcbOutline,
   PLATE_THICKNESS,
   plateWithCutouts,
   SCREW,
@@ -41,10 +43,12 @@ const SWITCH_3D = {
   choc: { housingBase: 15, housingTop: 13, housingH: 2.4, capBottom: 3.5, lower: 2.2 },
 } as const
 
-/** PCB plus hotswap socket under the switch body: 1.6 mm board + socket. */
+/** Hotswap socket hanging under the PCB. The board itself is modelled
+ * separately, so this is just the socket body; together they still take the
+ * 3.4 mm the bottom clearance was sized around. */
 const SOCKET_W = 10
 const SOCKET_D = 6.5
-const SOCKET_H = 3.4
+const SOCKET_H = 1.8
 
 /** Even-odd point-in-ring test (ray cast along +x). */
 function pointInRing(ring: [number, number][], x: number, y: number): boolean {
@@ -197,9 +201,9 @@ export function Preview3D() {
     // Meshes grouped by part, so visibility toggles apply without a rebuild.
     // Repopulated on every rebuild.
     const partMeshes: Record<
-      'caps' | 'switches' | 'case' | 'plate' | 'foam' | 'bottom' | 'screws',
+      'caps' | 'switches' | 'case' | 'plate' | 'pcb' | 'foam' | 'bottom' | 'screws',
       THREE.Object3D[]
-    > = { caps: [], switches: [], case: [], plate: [], foam: [], bottom: [], screws: [] }
+    > = { caps: [], switches: [], case: [], plate: [], pcb: [], foam: [], bottom: [], screws: [] }
 
     const applyViewSettings = () => {
       const v = useViewSettings.getState()
@@ -210,6 +214,7 @@ export function Preview3D() {
         switches: v.showSwitches,
         case: v.showCase,
         plate: v.showPlate,
+        pcb: v.showPcb,
         foam: v.showFoam,
         bottom: v.showBottom,
         screws: v.showScrews,
@@ -219,7 +224,7 @@ export function Preview3D() {
       // applied on top of each mesh's recorded assembled position, so the
       // slider is cheap (no rebuild) and idempotent.
       // Assembly order, bottom to top: standoffs+lid stay on the desk, then
-      // foam, plate, case shell, switches, caps (switches lift out through
+      // PCB, foam, plate, case shell, switches, caps (switches lift out through
       // the opened top). Uniform g gaps aren't enough around the shell — its
       // wall spans from below the plate to above the caps — so the shell and
       // everything above it get extra ramped clearance that separates the
@@ -230,11 +235,12 @@ export function Preview3D() {
         bottom: 0,
         // Screws ride with the lid they pass through.
         screws: 0,
-        foam: g,
-        plate: 2 * g,
-        case: 3 * g + 12 * r,
-        switches: 4 * g + 30 * r,
-        caps: 5 * g + 30 * r,
+        pcb: g,
+        foam: 2 * g,
+        plate: 3 * g,
+        case: 4 * g + 12 * r,
+        switches: 5 * g + 30 * r,
+        caps: 6 * g + 30 * r,
       }
       for (const part of Object.keys(partMeshes) as (keyof typeof partMeshes)[]) {
         for (const mesh of partMeshes[part]) {
@@ -279,6 +285,8 @@ export function Preview3D() {
         clipShadows: true,
       }),
       housing: new THREE.MeshStandardMaterial({ color: 0x1e2025, roughness: 0.55 }),
+      // Solder-mask green, fixed rather than doc-controlled like the foam.
+      pcb: new THREE.MeshStandardMaterial({ color: 0x1f5c3a, roughness: 0.6 }),
       // Screw proxies: fixed dark steel, not doc-controlled.
       screw: new THREE.MeshStandardMaterial({ color: 0x33363d, metalness: 0.9, roughness: 0.35 }),
       cap: new THREE.MeshStandardMaterial({ color: 0xe7e3d7, roughness: 0.85 }),
@@ -436,7 +444,7 @@ export function Preview3D() {
       const placePart = (
         raw: THREE.BufferGeometry,
         ring: [number, number][],
-        part: 'plate' | 'foam' | 'case' | 'bottom',
+        part: 'plate' | 'pcb' | 'foam' | 'case' | 'bottom',
         y: number,
         material: THREE.Material,
         shadows: boolean,
@@ -510,7 +518,7 @@ export function Preview3D() {
 
       const addSlab = (
         mp: MultiPolygon,
-        part: 'plate' | 'foam' | 'case' | 'bottom',
+        part: 'plate' | 'pcb' | 'foam' | 'case' | 'bottom',
         thickness: number,
         y: number,
         material: THREE.Material,
@@ -535,19 +543,35 @@ export function Preview3D() {
       // piece's pre-tilt frame; realized once the tilt/tent transforms exist.
       const supportPoints: { target: THREE.Object3D; x: number; z: number }[] = []
 
+      // The board sits against the underside of the switch bodies. A mixed
+      // board only gets one depth, so it clears the deepest type present and
+      // shallower switches stand off it.
+      const pcbTop = -Math.max(
+        PLATE_THICKNESS,
+        ...doc.keys.map((k) => SWITCH_3D[k.type].lower),
+      )
+      // Plate foam fills what is left between the plate and the board, rather
+      // than a fixed depth — on Choc a nominal 3.5 mm layer would reach below
+      // the switches and swallow the board. On MX the gap is exactly the
+      // nominal thickness, so those boards are unchanged.
+      const foamH = Math.max(0, -PLATE_THICKNESS - pcbTop)
+
       // A clipping failure should degrade to "no plate shown", not crash the
       // whole app (React unmounts the tree on uncaught render errors).
       try {
         const plateMp = plateWithCutouts(doc)
         trackFront(plateMp)
         addSlab(plateMp, 'plate', PLATE_THICKNESS, -PLATE_THICKNESS, materials.plate, true)
+        if (foamH > 0.05) {
+          addSlab(foamWithCutouts(doc), 'foam', foamH, pcbTop, materials.foam, false)
+        }
         addSlab(
-          foamWithCutouts(doc),
-          'foam',
-          FOAM_THICKNESS,
-          -PLATE_THICKNESS - FOAM_THICKNESS,
-          materials.foam,
-          false,
+          pcbOutline(doc),
+          'pcb',
+          PCB_THICKNESS,
+          pcbTop - PCB_THICKNESS,
+          materials.pcb,
+          true,
         )
         // Hollow top shell: wall ring from the lid plane up to the plate
         // top, rim ring (keycap opening) above it, and the supporting lip
@@ -759,8 +783,8 @@ export function Preview3D() {
         holder.add(housing)
         partMeshes.switches.push(housing)
 
-        // Below-plate body (through the plate cutout) and the PCB/hotswap
-        // socket under it — what the bottom clearance has to swallow.
+        // Below-plate body, through the plate cutout — this plus the board
+        // and socket under it is what the bottom clearance has to swallow.
         const lower = new THREE.Mesh(
           cachedFrustum('lower', 13.8, 13.8, 13.8, 13.8, dims.lower),
           materials.housing,
@@ -769,14 +793,17 @@ export function Preview3D() {
         lower.userData.assembledY = -dims.lower
         holder.add(lower)
         partMeshes.switches.push(lower)
+        // Hotswap sockets mount on the board's underside, so they hang off
+        // the PCB rather than off each switch.
         const socket = new THREE.Mesh(
           cachedFrustum('socket', SOCKET_W, SOCKET_D, SOCKET_W, SOCKET_D, SOCKET_H),
           materials.housing,
         )
-        socket.position.y = -dims.lower - SOCKET_H
-        socket.userData.assembledY = -dims.lower - SOCKET_H
+        const socketY = pcbTop - PCB_THICKNESS - SOCKET_H
+        socket.position.y = socketY
+        socket.userData.assembledY = socketY
         holder.add(socket)
-        partMeshes.switches.push(socket)
+        partMeshes.pcb.push(socket)
 
         const capMesh = new THREE.Mesh(
           cachedCap(key.type, cap.w, cap.h, key.convex === true),

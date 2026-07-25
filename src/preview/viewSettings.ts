@@ -28,6 +28,7 @@ export interface ViewSettings {
   showSwitches: boolean
   showCase: boolean
   showPlate: boolean
+  showPcb: boolean
   showFoam: boolean
   showBottom: boolean
   /** Hiding the screws exposes the countersunk holes they sit in. */
@@ -49,6 +50,7 @@ export const DEFAULT_VIEW: ViewSettings = {
   showSwitches: true,
   showCase: true,
   showPlate: true,
+  showPcb: true,
   showFoam: true,
   showBottom: true,
   showScrews: true,

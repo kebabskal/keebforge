@@ -21,6 +21,8 @@ const CUTOUT: Record<Key['type'], number> = {
 
 export const PLATE_THICKNESS = 1.5
 export const FOAM_THICKNESS = 3.5
+/** Standard 1.6 mm FR-4. */
+export const PCB_THICKNESS = 1.6
 /** Extra clearance per side around switch housings in the foam, mm. */
 export const FOAM_CLEARANCE = 0.5
 
@@ -955,6 +957,14 @@ export function plateWithCutouts(doc: Doc, clearance = 0): MultiPolygon {
   if (outline.length === 0) return []
   const cutouts = switchCutouts(doc, clearance)
   return robustClip((s, c) => polygonClipping.difference(s, c!), outline, cutouts)
+}
+
+/** PCB shape: the foam's footprint — inside the tray ridge, so the board
+ * drops past the supporting lip — but solid, since a board is only pierced
+ * by switch pins rather than cut away. */
+export function pcbOutline(doc: Doc): MultiPolygon {
+  const inner = caseShells(doc).flatMap((s) => s.inner)
+  return inner.length > 0 ? inner : plateOutline(doc)
 }
 
 /** Foam shape: like the plate but inside the supporting lip, with extra

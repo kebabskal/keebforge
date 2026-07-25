@@ -7,6 +7,7 @@ const PARTS = [
   ['showSwitches', 'Switches'],
   ['showCase', 'Case'],
   ['showPlate', 'Plate'],
+  ['showPcb', 'PCB'],
   ['showFoam', 'Foam'],
   ['showBottom', 'Bottom'],
   ['showScrews', 'Screws'],
