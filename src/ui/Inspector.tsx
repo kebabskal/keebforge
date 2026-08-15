@@ -11,6 +11,7 @@ import {
   keyWorldXF,
   MATERIAL_PRESETS,
   MCU_PRESETS,
+  PORT_INSET,
   SWITCH_CLEARANCE,
   USB_OPENING,
   type Group,
@@ -22,6 +23,7 @@ import { alignmentItems, coalesceUndo, docOf, groupMap, useDocStore } from '../m
 import {
   bezelShape,
   controllerOverlaps,
+  controllerSlotDepth,
   controllerPortReaches,
   FOAM_CLEARANCE,
   foamWithCutouts,
@@ -263,6 +265,7 @@ function DocumentPanel() {
   // Keyed on a deferred copy of the controller instead, so a drag is not
   // paying for a case rebuild per frame to keep a warning current.
   const deferredController = useDeferredValue(controller)
+  const slotDepth = controller.enabled ? controllerSlotDepth(docOf(useDocStore.getState())) : 0
   const bezelEnabled = bezel.enabled
   const { portReaches, overlaps } = useMemo(() => {
     if (!deferredController.enabled) return { portReaches: true, overlaps: false }
@@ -827,6 +830,15 @@ function DocumentPanel() {
           <p className="hint hint-warn">
             The opening is cut through the case wall, so it needs a bezel to
             cut through — enable one to see it.
+          </p>
+        )}
+        {controller.enabled && bezel.enabled && slotDepth <= 0 && (
+          <p className="hint hint-warn">
+            The case is too thin here to bury the board's connector end in:
+            the wall and tray ridge come to less than the{' '}
+            {((controller.portOverhang ?? 1) + PORT_INSET).toFixed(1)} mm the
+            connector needs to sit {PORT_INSET} mm inside the outer face.
+            Widen the bezel wall, or the board will poke out of the case.
           </p>
         )}
         {controller.enabled && overlaps && (

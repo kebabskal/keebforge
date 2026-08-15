@@ -23,6 +23,8 @@ import {
   caseShells,
   controllerBoards,
   controllerBrackets,
+  controllerConnectorHeight,
+  controllerConnectors,
   controllerPortCuts,
   controllerPortSpan,
   CSK_DEPTH,
@@ -296,6 +298,13 @@ export function Preview3D() {
       housing: new THREE.MeshStandardMaterial({ color: 0x1e2025, roughness: 0.55 }),
       // Solder-mask green, fixed rather than doc-controlled like the foam.
       pcb: new THREE.MeshStandardMaterial({ color: 0x1f5c3a, roughness: 0.6 }),
+      // The connector's shell: bright plated steel, so it reads against the
+      // board it stands on and through the hole cut for it.
+      connector: new THREE.MeshStandardMaterial({
+        color: 0xb9c0c9,
+        metalness: 0.9,
+        roughness: 0.25,
+      }),
       // Screw proxies: fixed dark steel, not doc-controlled.
       screw: new THREE.MeshStandardMaterial({ color: 0x33363d, metalness: 0.9, roughness: 0.35 }),
       cap: new THREE.MeshStandardMaterial({ color: 0xe7e3d7, roughness: 0.85 }),
@@ -759,6 +768,12 @@ export function Preview3D() {
             )
             addSlab(
               controllerBoards(doc), 'bottom', MCU_THICKNESS, caseBottomY, materials.pcb, false,
+            )
+            // The receptacle stands on the board's top face and pokes out
+            // through the opening cut for it.
+            addSlab(
+              controllerConnectors(doc), 'bottom', controllerConnectorHeight(doc),
+              caseBottomY + MCU_THICKNESS, materials.connector, false,
             )
           }
           const ridgeMp = caseShells(doc).flatMap((s) => s.ridge)

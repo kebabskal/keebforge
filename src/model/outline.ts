@@ -6,6 +6,10 @@ import {
   keySize,
   keyWorldXF,
   MCU_THICKNESS,
+  PORT_INSET,
+  PORT_SLOT_FIT,
+  USB_SHELL,
+  controllerUsb,
   SWITCH_LOWER,
   type ControllerSettings,
   type Doc,
@@ -1235,16 +1239,28 @@ function controllerHullPad(
     half === 'both' ? frames : half === 'left' ? frames.slice(0, 1) : frames.slice(1)
   if (picked.length === 0) return []
   const pad = c.fit + BRACKET.wall
-  const solid = robustClip((s) => polygonClipping.union(s), [
-    ...picked.map((f) => rectPoly(f.xf, c.width + 2 * pad, c.length + 2 * pad)),
-  ])
   // Past the wall *and* the tray ridge. Clearing only the wall grows the case
   // so that the ridge — which sits inboard of it — lands right back on top of
   // the board, and the collision check then flags a ridge that exists only
   // because the module is there. Measured at 103 mm² of self-inflicted
   // overlap on a default board.
   const ridge = doc.bottom.enabled ? Math.max(0, doc.bottom.ridge ?? 0) : 0
-  return dilate(solid, wall + ridge + 0.5)
+  const grow = wall + ridge + 0.5
+  // Not past the connector, though. The board is placed so its port sits a
+  // millimetre inside the outer face, and growing the case forward of that
+  // would push the face back out and bury the connector again — the padding
+  // and the placement would each undo the other. So the front edge is pulled
+  // back by exactly what the dilation will add, landing the hull on the
+  // connector rather than beyond it.
+  const front = c.length / 2 + (c.portOverhang ?? 1) + PORT_INSET - grow
+  const back = -(c.length / 2 + pad)
+  if (front <= back) return []
+  const solid = robustClip((s) => polygonClipping.union(s), [
+    ...picked.map((f) =>
+      rectPoly(f.at((front + back) / 2, 0), c.width + 2 * pad, front - back),
+    ),
+  ])
+  return dilate(solid, grow)
 }
 
 function bezelSolidsUncached(doc: Doc): BezelSolids[] {
@@ -1887,11 +1903,43 @@ export function controllerBoards(doc: Doc): MultiPolygon {
  * port end out through the wall. */
 export function controllerPortCuts(doc: Doc): MultiPolygon {
   const c = doc.controller
-  const inset = 3
-  const depth = inset + PORT_REACH
-  return controllerFrames(doc).map((f) =>
-    rectPoly(f.at(f.halfLength - inset + depth / 2, 0), c.portWidth, depth),
-  )
+  if (!c?.enabled) return []
+  const out: MultiPolygon = []
+  for (const f of controllerFrames(doc)) {
+    // A slot for the board itself, from well inside the cavity out to its
+    // leading edge. The board now finishes inside the wall rather than short
+    // of it, so the wall and the tray ridge both have to be let past — and
+    // the board is twice the width of its connector, so the connector's own
+    // opening will not do it.
+    const slotFrom = f.halfLength - PORT_REACH
+    const slotTo = f.halfLength
+    out.push(
+      rectPoly(
+        f.at((slotFrom + slotTo) / 2, 0),
+        c.width + 2 * PORT_SLOT_FIT,
+        slotTo - slotFrom,
+      ),
+    )
+    // The connector's own opening carries on out through the last of the
+    // case, so what shows from outside is a port-sized hole, not the slot.
+    const portTo = f.halfLength + (c.portOverhang ?? 1) + PORT_INSET + PORT_REACH
+    out.push(
+      rectPoly(f.at((slotTo + portTo) / 2, 0), c.portWidth, portTo - slotTo),
+    )
+  }
+  return out
+}
+
+/** How much case the board's leading section has to be let through, mm: the
+ * wall plus the tray ridge, less the part of the board that sticks out past
+ * them. Positive is the depth of the slot; zero or less means the case is too
+ * thin to bury the connector end in and the board would poke out of it. */
+export function controllerSlotDepth(doc: Doc): number {
+  const c = doc.controller
+  if (!c?.enabled) return 0
+  const wall = doc.bezel.enabled ? doc.bezel.width : 0
+  const ridge = doc.bottom.enabled ? Math.max(0, doc.bottom.ridge ?? 0) : 0
+  return wall + ridge - ((c.portOverhang ?? 1) + PORT_INSET)
 }
 
 /** Plan-view footprint of the corner brackets.
@@ -1909,7 +1957,10 @@ export function controllerBrackets(doc: Doc): MultiPolygon {
   for (const f of controllerFrames(doc)) {
     const a = f.halfLength + c.fit
     const b = f.halfWidth + c.fit
-    for (const su of [1, -1] as const) {
+    // Rear corners only. The board's connector end is buried in the wall so
+    // the port comes out where a plug can reach it, and a bracket there would
+    // be inside the wall too — the slot the board passes through holds it.
+    for (const su of [-1] as const) {
       for (const sv of [1, -1] as const) {
         // Along the long edge, sitting just outside it. The long edges run
         // along `out`, which is the frame's local y, so the leg's length is
@@ -1917,14 +1968,7 @@ export function controllerBrackets(doc: Doc): MultiPolygon {
         parts.push(
           rectPoly(f.at(su * (a - BRACKET.legLong / 2), sv * (b + t / 2)), t, BRACKET.legLong),
         )
-        // Across the short edge. At the connector end it has to stop clear of
-        // the opening, and if that leaves nothing worth printing it is
-        // dropped — the case wall is right there to stop the board anyway.
-        const legShort =
-          su > 0
-            ? Math.min(BRACKET.legShort, b - c.portWidth / 2 - 0.5)
-            : BRACKET.legShort
-        if (legShort <= 0.5) continue
+        const legShort = BRACKET.legShort
         parts.push(
           rectPoly(
             f.at(su * (a + t / 2), sv * (b + (t - legShort) / 2)),
@@ -2020,15 +2064,20 @@ export interface WallSegment {
 export function controllerReach(doc: Doc): number {
   const c = doc.controller
   if (!c) return 0
-  return c.length / 2 + (c.mode === 'mcu' ? c.fit + BRACKET.wall : 0) + 0.2
+  // Measured to the case's *outer* face, not the cavity floor: the board is
+  // pushed forward until its connector sits PORT_INSET inside the outside of
+  // the case, which is the whole point of where it goes.
+  return c.length / 2 + (c.portOverhang ?? 1) + PORT_INSET
 }
 
-/** The floor's boundary as plain segments.
+/** The case's outer boundary as plain segments.
  *
- * `inner`, not `interior`: the tray ridge stands on the floor between the
- * two, so a board pushed flat against the cavity wall would be sitting on top
- * of it. `inner` is the floor the board can actually reach, and the two are
- * the same contour when there is no ridge.
+ * The hull, not the cavity: the board is positioned by where its connector
+ * has to end up, which is a millimetre inside the outside of the case, and
+ * its front section passes through the wall and tray ridge in a slot cut for
+ * it. Placing it against the cavity floor instead left the connector as deep
+ * inside as the wall and ridge are thick — 6.1 mm on a 4 mm wall, against a
+ * plug that reaches about 6.5.
  *
  * Handed out as raw segments because the caller is a drag loop. Asking for
  * the case on every pointer move costs two full rebuilds — the snapshot being
@@ -2039,7 +2088,7 @@ export function controllerReach(doc: Doc): number {
 export function innerWallSegments(doc: Doc): WallSegment[] {
   const out: WallSegment[] = []
   for (const shell of caseShells(doc)) {
-    for (const poly of shell.inner) {
+    for (const poly of shell.hull) {
       // Outer ring only: a hole's faces look into the material, not out of it.
       const ring = poly[0]
       for (let i = 0; i < ring.length - 1; i++) {
@@ -2108,9 +2157,17 @@ export function controllerOverlaps(doc: Doc): boolean {
   const bracketTop = caseDims(doc).caseBottomY + MCU_THICKNESS + BRACKET.rise
   // Switch bodies hang below y = 0, the plate's top face.
   const deepest = doc.keys.reduce((m, k) => Math.max(m, SWITCH_LOWER[k.type]), 0)
+  // The ridge counts, but not where the board is meant to go through it: the
+  // connector end is buried in the wall on purpose and the ridge is slotted
+  // for it, so testing against the un-slotted ring flags every correct
+  // placement.
+  const slotted = subtractShapes(
+    caseShells(doc).flatMap((s) => s.ridge),
+    controllerPortCuts(doc),
+  )
   const obstacles: MultiPolygon = [
     ...(-deepest < bracketTop ? switchCutouts(doc) : []),
-    ...caseShells(doc).flatMap((s) => s.ridge),
+    ...slotted,
   ]
   if (obstacles.length === 0) return false
   try {
@@ -2147,4 +2204,26 @@ export function controllerPortSpan(doc: Doc): number {
   return doc.controller && controllerPortCuts(doc).length > 0
     ? MCU_THICKNESS + doc.controller.portHeight
     : 0
+}
+
+/** The connector body sitting on the board's top face, in plan.
+ *
+ * Drawn rather than merely cut for: it is what the opening exists to serve,
+ * and seeing it makes obvious whether it lines up with the hole and how much
+ * case is left in front of it. Its front face stands `portOverhang` proud of
+ * the board's edge, which is the overhang the placement is measured from. */
+export function controllerConnectors(doc: Doc): MultiPolygon {
+  const c = doc.controller
+  if (!c?.enabled) return []
+  const shell = USB_SHELL[controllerUsb(c)]
+  const face = c.length / 2 + (c.portOverhang ?? 1)
+  return controllerFrames(doc).map((f) =>
+    rectPoly(f.at(face - shell.depth / 2, 0), shell.width, shell.depth),
+  )
+}
+
+/** Height of the connector body above the board's top face, mm. */
+export function controllerConnectorHeight(doc: Doc): number {
+  const c = doc.controller
+  return c?.enabled ? USB_SHELL[controllerUsb(c)].height : 0
 }

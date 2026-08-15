@@ -212,6 +212,30 @@ export const USB_OPENING: Record<McuPreset['usb'], { width: number; height: numb
   micro: { width: 9.5, height: 4 },
 }
 
+/** The receptacle actually sitting on the board, mm — the metal shell, not
+ * the hole cut for it. A USB-C receptacle is 8.94 x 3.16 across and about
+ * 7.35 deep; the opening in `USB_OPENING` is that plus clearance. */
+export const USB_SHELL: Record<McuPreset['usb'], { width: number; height: number; depth: number }> = {
+  c: { width: 8.94, height: 3.16, depth: 7.35 },
+  micro: { width: 7.5, height: 2.6, depth: 5.5 },
+}
+
+/** Which connector a controller carries. Custom boards have no preset to ask,
+ * and USB-C is the safe guess for anything current. */
+export function controllerUsb(c: ControllerSettings): McuPreset['usb'] {
+  return MCU_PRESETS.find((p) => p.id === c.preset)?.usb ?? 'c'
+}
+
+/** How far the connector's face sits inside the case's outer surface, mm.
+ * The board is placed to hit this rather than the case being carved back to
+ * reach the board: a plug only enters so far, and its moulded body has to sit
+ * near enough the face to close on it. A millimetre leaves a lip to print
+ * against without the receptacle standing proud. */
+export const PORT_INSET = 1
+
+/** Slack around the board where it passes through the wall, mm per side. */
+export const PORT_SLOT_FIT = 0.4
+
 export interface ControllerSettings {
   enabled: boolean
   /** `mcu` is a discrete module held in the case by corner brackets; `pcb`
@@ -230,6 +254,10 @@ export interface ControllerSettings {
   /** Connector opening in the case face. */
   portWidth: number
   portHeight: number
+  /** How far the connector's shell stands proud of the board's edge, mm. A
+   * USB-C receptacle overhangs by about a millimetre, and that millimetre is
+   * a millimetre less wall for a cable to reach through. */
+  portOverhang: number
   /** Slack between the board's edge and the brackets holding it, per side.
    * Printed brackets come out a little fat, and a board that has to be
    * forced in is one that cannot come out again. */
@@ -247,6 +275,7 @@ export const DEFAULT_CONTROLLER: ControllerSettings = {
   r: 0,
   portWidth: USB_OPENING.micro.width,
   portHeight: USB_OPENING.micro.height,
+  portOverhang: 1,
   fit: 0.3,
 }
 

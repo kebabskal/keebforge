@@ -18,6 +18,7 @@ import {
   bezelShape,
   controllerBoards,
   controllerBrackets,
+  controllerConnectors,
   controllerHit,
   controllerOverlaps,
   controllerPortCuts,
@@ -543,6 +544,7 @@ export function EditorCanvas() {
           mcuClashed = controllerOverlaps(doc)
           for (const mp of [
             controllerBoards(doc),
+            controllerConnectors(doc),
             controllerBrackets(doc),
             controllerPortCuts(doc),
           ]) {
