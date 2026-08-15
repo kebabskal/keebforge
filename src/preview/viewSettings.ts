@@ -85,3 +85,43 @@ export const useViewSettings = create<ViewStore>((set, get) => ({
     }
   },
 }))
+
+/** Where the camera was last left. Kept apart from ViewSettings: it changes
+ * on every orbit rather than on a deliberate setting change, and it is tied
+ * to a board's size rather than to a preference. */
+export interface SavedCamera {
+  px: number
+  py: number
+  pz: number
+  tx: number
+  ty: number
+  tz: number
+}
+
+const CAMERA_KEY = 'keebforge.camera.v1'
+
+export function loadCamera(): SavedCamera | null {
+  try {
+    const raw = localStorage.getItem(CAMERA_KEY)
+    if (!raw) return null
+    const c = JSON.parse(raw) as SavedCamera
+    const ok = (['px', 'py', 'pz', 'tx', 'ty', 'tz'] as const).every(
+      (k) => typeof c?.[k] === 'number' && Number.isFinite(c[k]),
+    )
+    // A camera at the target has no direction to look in and would leave the
+    // view black, so a degenerate pair is treated as nothing saved.
+    if (!ok) return null
+    const d = Math.hypot(c.px - c.tx, c.py - c.ty, c.pz - c.tz)
+    return d > 1 ? c : null
+  } catch {
+    return null
+  }
+}
+
+export function saveCamera(c: SavedCamera) {
+  try {
+    localStorage.setItem(CAMERA_KEY, JSON.stringify(c))
+  } catch {
+    // best-effort persistence
+  }
+}

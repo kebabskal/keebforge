@@ -28,6 +28,7 @@ import {
   FOAM_CLEARANCE,
   foamWithCutouts,
   maxScrewInset,
+  minimumClearance,
   plateWithCutouts,
 } from '../model/outline'
 import { downloadText, toDXF } from '../export/dxf'
@@ -267,19 +268,26 @@ function DocumentPanel() {
   const deferredController = useDeferredValue(controller)
   const slotDepth = controller.enabled ? controllerSlotDepth(docOf(useDocStore.getState())) : 0
   const bezelEnabled = bezel.enabled
-  const { portReaches, overlaps } = useMemo(() => {
-    if (!deferredController.enabled) return { portReaches: true, overlaps: false }
+  // Clearance falls back on the switch types when there is no module, so the
+  // keys are a real input here, not just a change signal.
+  const keys = useDocStore((s) => s.keys)
+  const { portReaches, overlaps, neededClearance } = useMemo(() => {
     // The rest of the document is read live; only the controller is taken
     // from the deferred copy, so what is measured is what the deps say.
-    const doc = { ...docOf(useDocStore.getState()), controller: deferredController }
+    const doc = { ...docOf(useDocStore.getState()), keys, controller: deferredController }
+    // Clearance counts the module's own stack, so it clips too — deferred
+    // with the rest rather than run from a selector, which would fire on
+    // every pointer move of a drag.
+    const clearance = minimumClearance(doc)
+    if (!deferredController.enabled) {
+      return { portReaches: true, overlaps: false, neededClearance: clearance }
+    }
     return {
       portReaches: bezelEnabled ? controllerPortReaches(doc) : true,
       overlaps: controllerOverlaps(doc),
+      neededClearance: clearance,
     }
-  }, [deferredController, bezelEnabled])
-  const neededClearance = useDocStore((s) =>
-    s.keys.reduce((m, k) => Math.max(m, SWITCH_CLEARANCE[k.type]), 0),
-  )
+  }, [deferredController, bezelEnabled, keys])
 
   const exportDXF = (part: 'plate' | 'foam', filename: string) => {
     const { keys, groups, mirror, plate, bezel, bottom, mounting, controller, tilt, materials } =
@@ -616,7 +624,11 @@ function DocumentPanel() {
           <SliderField
             label="Clearance"
             value={bottom.clearance ?? 0}
-            min={0}
+            // Floored at what the board actually needs, so the slider cannot
+            // be dragged into a case the switches or the controller will not
+            // fit in. A document saved below it still reads back as it was —
+            // the warning below is what catches that.
+            min={neededClearance}
             max={15}
             step={0.5}
             unit="mm"
@@ -636,8 +648,11 @@ function DocumentPanel() {
         </div>
         {bottom.enabled && neededClearance > (bottom.clearance ?? 0) && (
           <p className="hint hint-warn">
-            Too shallow: this board's switches plus hotswap sockets/handwiring
-            need at least {neededClearance} mm of clearance.
+            Saved shallower than this board allows: it needs at least{' '}
+            {neededClearance} mm of clearance{controller.enabled && controller.mode === 'mcu'
+              ? ', counting the controller board and the connector standing on it'
+              : ' for its switches plus hotswap sockets or handwiring'}. Nudge
+            the slider, or shift-click it, to take the minimum.
           </p>
         )}
         <p className="hint">

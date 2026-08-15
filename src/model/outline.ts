@@ -10,6 +10,7 @@ import {
   PORT_SLOT_FIT,
   USB_SHELL,
   controllerUsb,
+  SWITCH_CLEARANCE,
   SWITCH_LOWER,
   type ControllerSettings,
   type Doc,
@@ -2226,4 +2227,190 @@ export function controllerConnectors(doc: Doc): MultiPolygon {
 export function controllerConnectorHeight(doc: Doc): number {
   const c = doc.controller
   return c?.enabled ? USB_SHELL[controllerUsb(c)].height : 0
+}
+
+/** How far the opening's top corners are rounded, mm. */
+const PORT_ARCH = 1.5
+
+/** The corner pieces that turn the square opening into a rounded one.
+ *
+ * The opening is a rectangle driven through the wall, so it cannot be rounded
+ * by cutting differently — a cut is a plan-view shape and the roundness lives
+ * in the *face* of the case, a vertical plane. It can be rounded by putting
+ * material back: the difference between the rectangle and the rounded profile
+ * is four corner slivers, and adding those leaves a rounded hole.
+ *
+ * Cheap, because the slivers are tiny and there is no third dimension to
+ * approximate: rings come back in the opening's own plane, `u` across it and
+ * `v` up from the base of the cut, for the caller to extrude along the board's
+ * axis and stand in place. */
+export function controllerPortFillets(doc: Doc): [number, number][][] {
+  const c = doc.controller
+  if (!c?.enabled) return []
+  const w = c.portWidth
+  const h = MCU_THICKNESS + c.portHeight
+  // An arch, not a pill. The top case prints the right way up, lid plane on
+  // the bed and opening upward, so the wall below the hole is laid down
+  // first and the hole's *upper* edge is the material that has to span the
+  // void. Arching it keeps every layer supported by the one under it. The
+  // lower edge needs nothing — the print simply stops there — so it stays
+  // square rather than giving away opening.
+  // Corner radius, not a half-round roof. A full arch spans the whole width
+  // and gives away a quarter of the opening's height to save a bridge the
+  // printer would have managed anyway: the flat left between these corners is
+  // a few millimetres, well inside what bridges cleanly. This just takes the
+  // sharp corners off the span.
+  const r = Math.max(0, Math.min(PORT_ARCH, w / 2, h / 2))
+  if (r <= 0.05) return []
+  const square: MultiPolygon = [[[
+    [-w / 2, 0], [w / 2, 0], [w / 2, h], [-w / 2, h], [-w / 2, 0],
+  ]]]
+  const seg = Math.max(3, Math.ceil(Math.PI / 2 / arcStep(r)))
+  // Up the right side, round the two top corners, back down the left.
+  const ring: Ring = [[snap(w / 2), snap(0)]]
+  const corner = (cx: number, from: number) => {
+    for (let i = 0; i <= seg; i++) {
+      const a = from + (i / seg) * (Math.PI / 2)
+      ring.push([snap(cx + r * Math.cos(a)), snap(h - r + r * Math.sin(a))])
+    }
+  }
+  corner(w / 2 - r, 0)
+  corner(-w / 2 + r, Math.PI / 2)
+  ring.push([snap(-w / 2), snap(0)])
+  ring.push(ring[0])
+  const rounded: MultiPolygon = [[ring]]
+  try {
+    return robustClip((s, cl) => polygonClipping.difference(s, cl!), square, rounded)
+      .flatMap((poly) => poly.map((r2) => r2.map(([x, y]) => [x, y] as [number, number])))
+  } catch {
+    return []
+  }
+}
+
+/** Where a set of fillets stands: the opening's own plane in world terms. */
+export interface PortFilletPlacement {
+  /** Rings in the opening's plane, `u` across and `v` up from `base`. */
+  rings: [number, number][][]
+  /** Centre of the opening's inner edge, world mm. */
+  x: number
+  y: number
+  /** Unit vectors for `u` and for the direction the fill is extruded. */
+  sideX: number
+  sideY: number
+  outX: number
+  outY: number
+  /** World height of `v` = 0. */
+  base: number
+  /** How far the fill reaches at a given height above `base`. A drafted case
+   * pulls its outer face in as it rises, so this shortens with height rather
+   * than being one number. */
+  depthAt: (v: number) => number
+}
+
+/** How far forward the case actually extends past a point, along `out`.
+ *
+ * Measured rather than assumed. The nominal answer is the connector overhang
+ * plus PORT_INSET, but the pad that grows the case around the module rounds
+ * its front corner, so the real face can sit a little further out — 0.6 mm on
+ * a measured board, which is exactly enough to leave a square lip standing in
+ * front of a rounded opening. */
+function forwardToHull(doc: Doc, f: ControllerFrame, fromU: number): number {
+  const ox = f.out.x
+  const oy = f.out.y
+  const px = f.xf.x + ox * fromU
+  const py = f.xf.y + oy * fromU
+  let best = Infinity
+  for (const shell of caseShells(doc)) {
+    for (const poly of shell.hull) {
+      const ring = poly[0]
+      for (let i = 0; i < ring.length - 1; i++) {
+        const [ax, ay] = ring[i]
+        const [bx, by] = ring[i + 1]
+        const ex = bx - ax
+        const ey = by - ay
+        // Ray (p + t*out) against segment (a + s*e), 0 <= s <= 1, t > 0.
+        const denom = ox * ey - oy * ex
+        if (Math.abs(denom) < 1e-12) continue
+        const t = ((ax - px) * ey - (ay - py) * ex) / denom
+        const sPos = ((ax - px) * oy - (ay - py) * ox) / denom
+        if (t > 1e-6 && sPos >= 0 && sPos <= 1) best = Math.min(best, t)
+      }
+    }
+  }
+  return Number.isFinite(best) ? best : 0
+}
+
+/** Fillets placed against every controller.
+ *
+ * The reach is exactly the port-sized part of the hole — from the board's
+ * leading edge out to the case's outer face — so the fill can never stand
+ * proud of the case. Behind that the opening is the wider slot the board
+ * passes through, which wants no rounding. */
+export function controllerPortFilletPlacements(doc: Doc): PortFilletPlacement[] {
+  const rings = controllerPortFillets(doc)
+  if (rings.length === 0) return []
+  const dims = caseDims(doc)
+  const base = dims.caseBottomY
+  return controllerFrames(doc).map((f) => {
+    const at = f.at(f.halfLength, 0)
+    // Out to the case's real face, then back off by however far the draft
+    // has pulled that face in at each height.
+    const flat = forwardToHull(doc, f, f.halfLength)
+    const depthAt = (v: number) => Math.max(0, flat - dims.insetAt(base + v))
+    return {
+      rings,
+      x: at.x,
+      y: at.y,
+      sideX: f.side.x,
+      sideY: f.side.y,
+      outX: f.out.x,
+      outY: f.out.y,
+      base,
+      depthAt,
+    }
+  })
+}
+
+/** Does the module's footprint sit under any switch, in plan? Height is not
+ * the question here — this is what decides whether the two have to pass each
+ * other at all. */
+export function controllerUnderSwitches(doc: Doc): boolean {
+  const c = doc.controller
+  if (!c?.enabled || c.mode !== 'mcu') return false
+  const foot = robustClip((s) => polygonClipping.union(s), [
+    ...controllerBoards(doc),
+    ...controllerBrackets(doc),
+  ])
+  const cutouts = switchCutouts(doc)
+  if (foot.length === 0 || cutouts.length === 0) return false
+  try {
+    return (
+      robustClip((s, cl) => polygonClipping.intersection(s, cl!), foot, cutouts).length > 0
+    )
+  } catch {
+    return false
+  }
+}
+
+/** The shallowest cavity everything still fits in, mm.
+ *
+ * The switches set a floor on their own: body, PCB and hotswap socket. A
+ * controller module adds its own stack — board plus the connector standing on
+ * it — and where that stack sits under a switch the two have to pass each
+ * other, which costs the switch's depth on top. Parked clear of the keys it
+ * only has to fit under the plate, which is a good deal shallower, so a case
+ * need not be built for the worst placement of a board that is not there. */
+export function minimumClearance(doc: Doc): number {
+  let need = doc.keys.reduce((m, k) => Math.max(m, SWITCH_CLEARANCE[k.type]), 0)
+  const c = doc.controller
+  if (c?.enabled && c.mode === 'mcu') {
+    const stack = MCU_THICKNESS + USB_SHELL[controllerUsb(c)].height
+    // Under the plate at the very least.
+    need = Math.max(need, stack)
+    if (controllerUnderSwitches(doc)) {
+      const deepest = doc.keys.reduce((m, k) => Math.max(m, SWITCH_LOWER[k.type]), 0)
+      need = Math.max(need, stack + deepest - PLATE_THICKNESS)
+    }
+  }
+  return Math.round(need * 100) / 100
 }

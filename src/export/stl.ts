@@ -7,6 +7,7 @@ import {
   caseShells,
   controllerBrackets,
   controllerPortCuts,
+  controllerPortFilletPlacements,
   controllerPortSpan,
   CSK_DEPTH,
   PLATE_THICKNESS,
@@ -23,6 +24,7 @@ import {
   loftRings,
   ringToVec,
   shapeFromRings,
+  slantedPrism,
   taperedLevels,
   taperedSolid,
   type LoftLevel,
@@ -124,6 +126,25 @@ export function topCaseSolids(doc: Doc): Solid[] {
       from = to
     }
     if (dims.rimH > 0) tapered(shell.rim, dims.rimH, 0, dims.bevel)
+  }
+  // Corner fill that rounds the connector opening. Built in the opening's own
+  // plane — vertical, unlike everything else here — and rotated into it. The
+  // slicer unions it with the wall it sits against.
+  for (const fill of controllerPortFilletPlacements(doc)) {
+    if (fill.rings.length === 0) continue
+    const geo = slantedPrism(fill.rings, fill.depthAt)
+    // Solids here rise along +Z from a base at `z`, so the opening's `u` runs
+    // along the board's side, `v` along +Z, and the extrusion along its axis.
+    geo.applyMatrix4(
+      new THREE.Matrix4()
+        .makeBasis(
+          new THREE.Vector3(fill.sideX, fill.sideY, 0),
+          new THREE.Vector3(0, 0, 1),
+          new THREE.Vector3(fill.outX, fill.outY, 0),
+        )
+        .setPosition(fill.x, fill.y, 0),
+    )
+    solids.push({ geo, z: 0 })
   }
   return solids
 }

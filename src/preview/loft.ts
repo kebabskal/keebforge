@@ -471,3 +471,51 @@ export function taperedSolid(
   flatRegion(finish, safeDiff(mpOf(outers), holesMp), zTop)
   return concat()
 }
+
+/** A prism whose far face is slanted rather than flat: the cross-section is
+ * given in (u, v) and swept along +Z, but the sweep length varies with `v`.
+ *
+ * The connector opening's corner fill needs this. A drafted case pulls its
+ * outer face inward as it rises, so fill swept a constant distance stands
+ * proud of the taper — 0.74 mm at the top of the hole on a 2 mm draft. Asking
+ * the caller for a depth per height lands the far face on the tapered surface
+ * instead. */
+export function slantedPrism(
+  rings: [number, number][][],
+  depthAt: (v: number) => number,
+): THREE.BufferGeometry {
+  const position: number[] = []
+  const push = (p: [number, number], z: number) => position.push(p[0], p[1], z)
+  for (const raw of rings) {
+    // Rings arrive closed; the repeated point would make a zero-area facet.
+    const ring =
+      raw.length > 1 &&
+      raw[0][0] === raw[raw.length - 1][0] &&
+      raw[0][1] === raw[raw.length - 1][1]
+        ? raw.slice(0, -1)
+        : raw
+    if (ring.length < 3) continue
+    const pts = ring.map(([u, v]) => new THREE.Vector2(u, v))
+    const faces = THREE.ShapeUtils.triangulateShape(pts, [])
+    const ccw = THREE.ShapeUtils.isClockWise(pts) ? -1 : 1
+    for (const [a, b, c] of faces) {
+      // Near face looks back along the sweep, far face along it.
+      const near = ccw > 0 ? [c, b, a] : [a, b, c]
+      const far = ccw > 0 ? [a, b, c] : [c, b, a]
+      for (const i of near) push(ring[i], 0)
+      for (const i of far) push(ring[i], depthAt(ring[i][1]))
+    }
+    for (let i = 0; i < ring.length; i++) {
+      const j = (i + 1) % ring.length
+      const [a, b] = ccw > 0 ? [ring[i], ring[j]] : [ring[j], ring[i]]
+      const za = depthAt(a[1])
+      const zb = depthAt(b[1])
+      push(a, 0); push(b, 0); push(b, zb)
+      push(a, 0); push(b, zb); push(a, za)
+    }
+  }
+  const geo = new THREE.BufferGeometry()
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(position, 3))
+  geo.computeVertexNormals()
+  return geo
+}

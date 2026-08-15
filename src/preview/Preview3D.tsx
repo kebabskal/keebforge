@@ -26,6 +26,7 @@ import {
   controllerConnectorHeight,
   controllerConnectors,
   controllerPortCuts,
+  controllerPortFilletPlacements,
   controllerPortSpan,
   CSK_DEPTH,
   foamWithCutouts,
@@ -43,9 +44,9 @@ import {
 import { groupMap, useDocStore } from '../model/store'
 import { useTheme } from '../ui/theme'
 import { capGeo, CAP_PROFILE, frustumGeo } from './capGeometry'
-import { clampBevel, ringToVec, shapeFromRings, taperedLevels, taperedSolid } from './loft'
+import { clampBevel, ringToVec, shapeFromRings, slantedPrism, taperedLevels, taperedSolid } from './loft'
 import { ViewBar } from './ViewBar'
-import { useViewSettings } from './viewSettings'
+import { loadCamera, saveCamera, useViewSettings } from './viewSettings'
 
 /** Simplified switch/cap dimensions per type, mm (heights above plate top;
  * `lower` is the below-plate body depth measured down from the plate top). */
@@ -769,6 +770,40 @@ export function Preview3D() {
             addSlab(
               controllerBoards(doc), 'bottom', MCU_THICKNESS, caseBottomY, materials.pcb, false,
             )
+            // Corner fill that rounds the square opening. The cut is a
+            // plan-view shape, so the roundness cannot come from cutting; it
+            // comes from putting these four slivers back into the corners.
+            // They stand in the opening's own plane, which is vertical, so
+            // they are built there and rotated into it.
+            for (const fill of controllerPortFilletPlacements(doc)) {
+              if (fill.rings.length === 0) continue
+              const geo = slantedPrism(fill.rings, fill.depthAt)
+              slabGeos.push(geo)
+              const mesh = new THREE.Mesh(geo, materials.bezel)
+              // Scene axes are x right, y up, z back-to-front, so a world
+              // (x, y) lands at (x, height, -y). Unlike every other part this
+              // one is built in a vertical plane, so its orientation comes
+              // from a basis rather than the usual lie-flat-and-tip-up
+              // rotation — but it goes in as a quaternion, not as a baked
+              // matrix. Freezing the matrix makes the mesh deaf to every
+              // later position write, and the explode view moves parts by
+              // exactly that, so the fill would sit still while the wall it
+              // rounds lifted away from it.
+              mesh.quaternion.setFromRotationMatrix(
+                new THREE.Matrix4().makeBasis(
+                  new THREE.Vector3(fill.sideX, 0, -fill.sideY),
+                  new THREE.Vector3(0, 1, 0),
+                  new THREE.Vector3(fill.outX, 0, -fill.outY),
+                ),
+              )
+              mesh.position.set(fill.x, fill.base, -fill.y)
+              mesh.userData.assembledY = fill.base
+              mesh.castShadow = true
+              mesh.receiveShadow = true
+              // Part of the case, so it hides and explodes with it.
+              targetFor(fill.x).add(mesh)
+              partMeshes.case.push(mesh)
+            }
             // The receptacle stands on the board's top face and pokes out
             // through the opening cut for it.
             addSlab(
@@ -1022,18 +1057,40 @@ export function Preview3D() {
     }
 
     rebuild()
-    controls.target.set(bounds.cx, 0, bounds.cz)
-    // Framing distances are tuned for a 40° FOV; narrower lenses back off
-    // proportionally so the board still fills the view.
-    const fovScale =
-      Math.tan((40 * Math.PI) / 360) /
-      Math.tan((useViewSettings.getState().fov * Math.PI) / 360)
-    camera.position.set(
-      bounds.cx,
-      bounds.radius * 1.4 * fovScale,
-      bounds.cz + bounds.radius * 1.7 * fovScale,
-    )
+    // Where you left the camera, if you left one. Restored before the default
+    // framing so a reload picks up the view you were working from rather than
+    // spinning you back to the front every time.
+    const saved = loadCamera()
+    if (saved) {
+      camera.position.set(saved.px, saved.py, saved.pz)
+      controls.target.set(saved.tx, saved.ty, saved.tz)
+    } else {
+      controls.target.set(bounds.cx, 0, bounds.cz)
+      // Framing distances are tuned for a 40° FOV; narrower lenses back off
+      // proportionally so the board still fills the view.
+      const fovScale =
+        Math.tan((40 * Math.PI) / 360) /
+        Math.tan((useViewSettings.getState().fov * Math.PI) / 360)
+      camera.position.set(
+        bounds.cx,
+        bounds.radius * 1.4 * fovScale,
+        bounds.cz + bounds.radius * 1.7 * fovScale,
+      )
+    }
     controls.update()
+    // Saved on a trailing timer: orbiting fires 'change' every frame, and
+    // this only has to survive a reload.
+    let saveTimer: ReturnType<typeof setTimeout> | undefined
+    const rememberCamera = () => {
+      clearTimeout(saveTimer)
+      saveTimer = setTimeout(() => {
+        saveCamera({
+          px: camera.position.x, py: camera.position.y, pz: camera.position.z,
+          tx: controls.target.x, ty: controls.target.y, tz: controls.target.z,
+        })
+      }, 400)
+    }
+    controls.addEventListener('change', rememberCamera)
 
     // Outline generation is too heavy for every drag frame; throttle the
     // scene rebuild. Single edits still rebuild near-instantly.
