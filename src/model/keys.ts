@@ -516,12 +516,25 @@ export function columnSlots(layout: Extract<GroupLayout, { kind: 'columns' }>): 
 
 /** Group-local centers for a stack layout: keys pack along the axis in their
  * current order along that axis (left-to-right for x, top-to-bottom for y),
- * each taking its pitch-area extent plus the layout gap, centered on the
- * group origin. Rotated keys take up their rotated bounding extent, so a
- * gap of 0 keeps footprints tangent exactly like a column cluster does.
- * With a non-zero curve, keys additionally get rotations fanning around the
- * middle of the stack, and the packing direction follows the fan (a thumb
- * arc); keys' own rotations are overridden in that case. */
+ * each taking its pitch-area extent plus the layout gap.
+ *
+ * The first key along the axis stays put, at the group origin and unrotated,
+ * and the rest are packed away from it. A thumb cluster is positioned by its
+ * inboard key — the one that has to stay reachable from the home row — so
+ * that is the one a curve or a gap change must not move; centering the run
+ * instead slid the whole cluster every time it was adjusted.
+ *
+ * With a non-zero curve the keys lie on a genuine circular arc, `curve`
+ * being the angle a 1u key turns through. Each key takes the angle its own
+ * width earns at the arc's tight radius, so a 2u key turns through twice as
+ * much as a 1u one and the curvature stays constant across a run of mixed
+ * sizes — the fan is a property of the arc, not of how many keys are on it.
+ * Keys' own rotations are overridden in that case, since each has to sit
+ * tangent to the arc.
+ *
+ * `gap` is clearance at the tight side of the arc, where neighbours are
+ * closest, so a gap of 0 keeps footprints tangent exactly like a column
+ * cluster does however hard the arc bends. */
 export function stackPositions(
   layout: Extract<GroupLayout, { kind: 'stack' }>,
   members: Key[],
@@ -531,46 +544,56 @@ export function stackPositions(
   )
   const curve = layout.curve ?? 0
   const n = ordered.length
-  const angleOf = (i: number) => (i - (n - 1) / 2) * curve
-  const extents = ordered.map((k, i) => {
-    const { w, h } = keySize(k)
-    const r = curve !== 0 ? angleOf(i) : k.r
-    const cos = Math.abs(Math.cos(r * DEG))
-    const sin = Math.abs(Math.sin(r * DEG))
-    return layout.axis === 'x' ? w * cos + h * sin : w * sin + h * cos
-  })
   const out = new Map<string, { x: number; y: number; r?: number }>()
+  if (n === 0) return out
+
+  /** Extent along the packing direction, and across it. */
+  const along = (k: Key) => (layout.axis === 'x' ? keySize(k).w : keySize(k).h)
+  const across = (k: Key) => (layout.axis === 'x' ? keySize(k).h : keySize(k).w)
+  // Forward is the packing direction; left is forward turned 90° CCW, which
+  // is the side the arc's centre sits on for a positive curve.
+  const fwd = layout.axis === 'x' ? { x: 1, y: 0 } : { x: 0, y: -1 }
+  const left = layout.axis === 'x' ? { x: 0, y: 1 } : { x: 1, y: 0 }
+
   if (curve === 0) {
-    const total =
-      extents.reduce((s, e) => s + e, 0) + layout.gap * Math.max(0, n - 1)
-    let cursor = -total / 2
+    // Unrotated keys take their own extent; a key carrying a rotation of its
+    // own takes the extent of its rotated bounding box, so it still cannot
+    // collide with its neighbours.
+    const extents = ordered.map((k) => {
+      const { w, h } = keySize(k)
+      const cos = Math.abs(Math.cos(k.r * DEG))
+      const sin = Math.abs(Math.sin(k.r * DEG))
+      return layout.axis === 'x' ? w * cos + h * sin : w * sin + h * cos
+    })
+    let cursor = 0
     ordered.forEach((k, i) => {
-      const center = cursor + extents[i] / 2
-      out.set(k.id, layout.axis === 'x' ? { x: center, y: 0 } : { x: 0, y: -center })
-      cursor += extents[i] + layout.gap
+      if (i > 0) cursor += extents[i - 1] / 2 + layout.gap + extents[i] / 2
+      out.set(k.id, { x: fwd.x * cursor, y: fwd.y * cursor })
     })
     return out
   }
-  // Curved: chain the centers, advancing between neighbours along the mean
-  // of their fan angles, then re-center on the group origin.
-  const centers: { x: number; y: number }[] = [{ x: 0, y: 0 }]
-  for (let i = 1; i < n; i++) {
-    const step = extents[i - 1] / 2 + layout.gap + extents[i] / 2
-    const mid = ((angleOf(i - 1) + angleOf(i)) / 2) * DEG
-    const prev = centers[i - 1]
-    const dir =
-      layout.axis === 'x'
-        ? { x: Math.cos(mid), y: Math.sin(mid) }
-        : { x: Math.sin(mid), y: -Math.cos(mid) }
-    centers.push({ x: prev.x + dir.x * step, y: prev.y + dir.y * step })
-  }
-  const cx = centers.reduce((s, c) => s + c.x, 0) / n
-  const cy = centers.reduce((s, c) => s + c.y, 0) / n
+
+  const dir = Math.sign(curve)
+  // Radius at which a 1u key subtends `curve` degrees. Steps are measured
+  // here, at the inside of the bend, because that is where neighbouring
+  // footprints close on each other.
+  const tight = U / (Math.abs(curve) * DEG)
+  const halfAcross = Math.max(...ordered.map((k) => across(k) / 2))
+  // Centre-line radius, signed so the arc bends left for a positive curve.
+  const radius = dir * (tight + halfAcross)
+
+  let angle = 0
   ordered.forEach((k, i) => {
+    if (i > 0) {
+      const step = along(ordered[i - 1]) / 2 + layout.gap + along(k) / 2
+      angle += (dir * step) / tight
+    }
+    const advance = radius * Math.sin(angle)
+    const sweep = radius * (1 - Math.cos(angle))
     out.set(k.id, {
-      x: centers[i].x - cx,
-      y: centers[i].y - cy,
-      r: Math.round(angleOf(i) * 100) / 100,
+      x: fwd.x * advance + left.x * sweep,
+      y: fwd.y * advance + left.y * sweep,
+      r: Math.round((angle / DEG) * 100) / 100,
     })
   })
   return out

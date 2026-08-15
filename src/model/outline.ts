@@ -596,6 +596,140 @@ function columnJoinFills(
   return out
 }
 
+/** The annular sector a curved stack sweeps, as one polygon.
+ *
+ * A curved stack is one arc, and it should read as one: unioning the keys'
+ * own footprints instead leaves a scallop at every junction, because two
+ * tangent rectangles at different angles meet at a point and fall away from
+ * each other either side of it. That is the row of little notches along a
+ * thumb cluster's edge, and no amount of gap tuning removes them — they are
+ * what a polygon approximation of an arc looks like.
+ *
+ * So the arc is described directly. The band runs from the inner faces of the
+ * keys to their outer corners, across the whole sweep, and unions with the
+ * keys' own rectangles to square off the two ends. Its angular reach stops
+ * exactly at the end keys' outer corners, so the arc meets the straight end
+ * faces without a step.
+ *
+ * The arc is recovered from the placed keys rather than read off the layout:
+ * each key sits tangent, so its across-axis is a radius, and two of them
+ * cross at the centre. That way the group can be nested, rotated or mirrored
+ * and the band still lands on it. */
+function stackArcFills(
+  doc: Doc,
+  worlds: { key: Key; world: XForm; mirrored: boolean }[],
+  sizeOf: (key: Key) => { w: number; h: number },
+  pad: number,
+): Polygon[] {
+  const out: Polygon[] = []
+  for (const group of doc.groups) {
+    if (group.layout.kind !== 'stack') continue
+    if (!group.layout.curve) continue
+    const alongX = group.layout.axis === 'x'
+    const members = doc.keys
+      .filter((k) => k.groupId === group.id)
+      .sort((a, b) => (alongX ? a.x - b.x : b.y - a.y))
+    if (members.length < 2) continue
+
+    for (const mirrored of [false, true]) {
+      const byId = new Map(
+        worlds.filter((w) => w.mirrored === mirrored).map((w) => [w.key.id, w.world] as const),
+      )
+      if (byId.size === 0) continue
+      const placed = members.flatMap((key) => {
+        const world = byId.get(key.id)
+        if (!world) return []
+        const size = sizeOf(key)
+        const frame = keyFrame(world, size.w, size.h)
+        return [{
+          c: frame.c,
+          // The key's across-axis points along a radius of the arc.
+          radial: alongX ? frame.uy : frame.ux,
+          along: (alongX ? size.w : size.h) / 2 + pad,
+          across: (alongX ? size.h : size.w) / 2 + pad,
+        }]
+      })
+      if (placed.length < 2) continue
+
+      const first = placed[0]
+      const last = placed[placed.length - 1]
+      const centre = lineCross(first.c, first.radial, last.c, last.radial)
+      if (!centre) continue
+
+      const radiusOf = (p: (typeof placed)[number]) =>
+        Math.hypot(p.c.x - centre.x, p.c.y - centre.y)
+      let inner = Infinity
+      let outer = 0
+      for (const p of placed) {
+        const r = radiusOf(p)
+        inner = Math.min(inner, r - p.across)
+        outer = Math.max(outer, Math.hypot(r + p.across, p.along))
+      }
+      // An arc tighter than the keys standing on it has no band to draw.
+      if (!(inner > 0.5) || !(outer > inner)) continue
+
+      const angleOf = (p: (typeof placed)[number]) =>
+        Math.atan2(p.c.y - centre.y, p.c.x - centre.x)
+      // Unwrap against the first key so a sweep across ±π stays monotonic.
+      const base = angleOf(first)
+      const wrapped = placed.map((p) => {
+        let a = angleOf(p) - base
+        while (a > Math.PI) a -= 2 * Math.PI
+        while (a < -Math.PI) a += 2 * Math.PI
+        return a
+      })
+      // Reach past the outermost keys' centres to where their outer corners
+      // sit, and no further: that is where the band's arc has to hand over to
+      // the straight end face. Mirroring reverses the sweep, so the ends are
+      // found by angle rather than by position in the list.
+      let loAt = 0
+      let hiAt = 0
+      wrapped.forEach((a, i) => {
+        if (a < wrapped[loAt]) loAt = i
+        if (a > wrapped[hiAt]) hiAt = i
+      })
+      const overhang = (p: (typeof placed)[number]) =>
+        Math.atan2(p.along, radiusOf(p) + p.across)
+      const lo = wrapped[loAt] - overhang(placed[loAt])
+      const hi = wrapped[hiAt] + overhang(placed[hiAt])
+      const sweep = hi - lo
+      if (sweep <= 1e-6 || sweep >= 2 * Math.PI) continue
+
+      const ring: Ring = []
+      const arc = (radius: number, from: number, to: number) => {
+        const steps = Math.max(1, Math.ceil(Math.abs(to - from) / arcStep(radius)))
+        for (let i = 0; i <= steps; i++) {
+          const a = base + from + ((to - from) * i) / steps
+          ring.push([
+            snap(centre.x + radius * Math.cos(a)),
+            snap(centre.y + radius * Math.sin(a)),
+          ])
+        }
+      }
+      arc(outer, lo, hi)
+      arc(inner, hi, lo)
+      ring.push(ring[0])
+      out.push([ring])
+    }
+  }
+  return out
+}
+
+/** Union the arc bands onto an outline that has already been despiked.
+ *
+ * Order matters. `trimSpikes` drops any convex corner standing less than
+ * `NUB_HEIGHT` proud of its neighbours' chord, and every vertex of a smoothly
+ * tessellated arc does exactly that — it would decimate a 65-vertex band into
+ * a nine-sided polygon a good half-millimetre inside its own radius, which is
+ * the opposite of drawing the arc directly. Worse, the decimation runs in ring
+ * order, so a board and its mirror image lose different vertices and the two
+ * halves stop matching. The bands are clean by construction and have nothing
+ * to despike, so they go on afterwards. */
+function withArcBands(mp: MultiPolygon, bands: Polygon[]): MultiPolygon {
+  if (bands.length === 0) return mp
+  return robustClip((s) => polygonClipping.union(s), [...mp, ...bands])
+}
+
 /** How far a corner must stand proud to count as a feature rather than a
  * sliver, mm. Where two angled pitch areas cross — splayed columns, a curved
  * stack — the union leaves saw teeth a fraction of a millimetre tall (0.33 mm
@@ -792,12 +926,15 @@ export function plateOutline(doc: Doc): MultiPolygon {
     if (rects.length === 0) continue
     result.push(
       ...closeGaps(
-        trimSpikes(
-          robustClip((s) => polygonClipping.union(s), [
-            ...rects,
-            ...columnJoinFills(doc, side.worlds, keySize, pad),
-          ]),
-          NUB_HEIGHT,
+        withArcBands(
+          trimSpikes(
+            robustClip((s) => polygonClipping.union(s), [
+              ...rects,
+              ...columnJoinFills(doc, side.worlds, keySize, pad),
+            ]),
+            NUB_HEIGHT,
+          ),
+          stackArcFills(doc, side.worlds, keySize, pad),
         ),
         MIN_FEATURE / 2,
       ),
@@ -1087,12 +1224,15 @@ function bezelSolidsUncached(doc: Doc): BezelSolids[] {
       })
     const margins = marginsFor(side.half, bezel)
     const capUnion = (pad: number, trim: number) =>
-      trimSpikes(
-        robustClip((s) => polygonClipping.union(s), [
-          ...capRects(pad),
-          ...columnJoinFills(doc, side.worlds, capSize, pad),
-        ]),
-        trim,
+      withArcBands(
+        trimSpikes(
+          robustClip((s) => polygonClipping.union(s), [
+            ...capRects(pad),
+            ...columnJoinFills(doc, side.worlds, capSize, pad),
+          ]),
+          trim,
+        ),
+        stackArcFills(doc, side.worlds, capSize, pad),
       )
     // Trimming the opening eats into the keycap clearance, so it never cuts
     // deeper than half the outset. The outer edge has nothing to clear and

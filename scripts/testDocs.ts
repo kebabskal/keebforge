@@ -11,6 +11,7 @@ import {
   columnSlots,
   defaultDoc,
   makeKey,
+  stackPositions,
   U,
   type Doc,
 } from '../src/model/keys'
@@ -63,6 +64,32 @@ export function splayed(deg: number, rows = 3): Doc {
     g.layout.columns = g.layout.columns.map((c, i) => ({ ...c, splay: (i - 2) * deg }))
   }
   return regenerate(doc)
+}
+
+/** A curved thumb stack of mixed key widths, which is the shape the arc band
+ * in outline.ts exists for. `gap` matters: with the keys tangent the union of
+ * their footprints is already smooth and the band changes nothing, but once
+ * they are held apart the junctions notch, and at 4 mm they cut 17 mm into
+ * the outline. Nothing else in this set exercises a stack layout at all. */
+export function thumbArc(curve: number, gap: number): Doc {
+  const doc = defaultDoc()
+  const thumbs = doc.groups.find((g) => g.layout.kind === 'free')
+  if (!thumbs) return doc
+  thumbs.layout = { kind: 'stack', axis: 'x', gap, curve }
+  const made = [1, 1.25, 1.5, 1, 1].map((w, i) => ({
+    ...makeKey('mx', i * U, 0),
+    w,
+    groupId: thumbs.id,
+  }))
+  const placed = stackPositions(thumbs.layout, made)
+  doc.keys = [
+    ...doc.keys.filter((k) => k.groupId !== thumbs.id),
+    ...made.map((k) => {
+      const p = placed.get(k.id)
+      return p ? { ...k, x: p.x, y: p.y, r: p.r ?? k.r } : k
+    }),
+  ]
+  return doc
 }
 
 /** A wide board: more keys means a longer outline, which is what the clipper's
@@ -125,6 +152,7 @@ export const DOCS: [string, () => Doc][] = [
     'default(nobezel)',
     () => ({ ...defaultDoc(), bezel: { ...DEFAULT_BEZEL, enabled: false } }),
   ],
+  ['thumbarc(gap4)', () => thumbArc(12, 4)],
   ['splay8', () => splayed(8)],
   ['splay20', () => splayed(20)],
   ['wide(8x4)', () => wide(8, 4)],
