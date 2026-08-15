@@ -13,8 +13,10 @@ import {
   type Key,
   type XForm,
 } from '../model/keys'
+import { noteEdit, onSettled } from '../model/editQuality'
 import {
   bezelShape,
+  outlineQuality,
   plateOutline,
   SCREW,
   screwPositions,
@@ -428,8 +430,13 @@ export function EditorCanvas() {
         'keys' | 'groups' | 'mirror' | 'plate' | 'bezel' | 'bottom' | 'mounting'
       >
     > = {}
+    // Outlines built at draft resolution have to be rebuilt when editing
+    // settles even though nothing in the document changed, so the resolution
+    // they were built at is part of what makes them stale.
+    let bezelQuality: string | null = null
     const rebuildOutlines = (state: ReturnType<typeof store.getState>) => {
       if (
+        outlineQuality() === bezelQuality &&
         state.keys === bezelDeps.keys &&
         state.groups === bezelDeps.groups &&
         state.mirror === bezelDeps.mirror &&
@@ -439,6 +446,7 @@ export function EditorCanvas() {
         state.mounting === bezelDeps.mounting
       )
         return
+      bezelQuality = outlineQuality()
       bezelDeps = {
         keys: state.keys,
         groups: state.groups,
@@ -525,6 +533,7 @@ export function EditorCanvas() {
     let outlineTimer: ReturnType<typeof setTimeout> | undefined
     let outlineLastRun = 0
     const scheduleOutlines = () => {
+      noteEdit()
       const wait = Math.max(0, 150 - (performance.now() - outlineLastRun))
       clearTimeout(outlineTimer)
       outlineTimer = setTimeout(() => {
@@ -533,6 +542,11 @@ export function EditorCanvas() {
         invalidate()
       }, wait)
     }
+    // Once editing stops, redraw whatever was left at draft resolution.
+    const unsubscribeSettle = onSettled(() => {
+      rebuildOutlines(store.getState())
+      invalidate()
+    })
 
     // Dashed outline around a fully-selected group.
     let groupBox: THREE.LineLoop | null = null
@@ -1759,6 +1773,7 @@ export function EditorCanvas() {
     return () => {
       cancelAnimationFrame(frame)
       unsubscribe()
+      unsubscribeSettle()
       observer.disconnect()
       canvas.removeEventListener('pointerdown', onPointerDown)
       canvas.removeEventListener('pointermove', onPointerMove)

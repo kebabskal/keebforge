@@ -14,12 +14,14 @@ import {
   mirrorXF,
   type XForm,
 } from '../model/keys'
+import { noteEdit, onSettled } from '../model/editQuality'
 import {
   caseBottomOutline,
   caseDims,
   caseShells,
   CSK_DEPTH,
   foamWithCutouts,
+  outlineQuality,
   PCB_THICKNESS,
   pcbOutline,
   PLATE_THICKNESS,
@@ -350,6 +352,10 @@ export function Preview3D() {
 
     const rebuild = () => {
       disposeBoard()
+      // Draft rebuilds drop the edge chamfers and the normal-creasing pass
+      // too: both are per-vertex work over every part in the assembly, and
+      // neither reads at the size the board is while you are dragging it.
+      const draft = outlineQuality() === 'draft'
       const state = store.getState()
       const doc = {
         keys: state.keys,
@@ -451,8 +457,8 @@ export function Preview3D() {
         // edges (the 45° bevel chamfer, top/bottom rims, cutout corners)
         // stay creased. Lofted parts crease per band as they are built, so
         // they arrive already normalled.
-        const geo = preCreased ? raw : toCreasedNormals(raw, Math.PI / 6)
-        if (!preCreased) raw.dispose()
+        const geo = preCreased || draft ? raw : toCreasedNormals(raw, Math.PI / 6)
+        if (!preCreased && geo !== raw) raw.dispose()
         slabGeos.push(geo)
         const mesh = new THREE.Mesh(geo, material)
         mesh.rotation.x = -Math.PI / 2
@@ -492,7 +498,10 @@ export function Preview3D() {
         breaks: number[],
         bevel = 0,
       ) => {
-        const b = clampBevel(bevel, thickness)
+        // Chamfers come off entirely while a drag is in flight: they add a
+        // loft level and a ring offset per part for detail that is invisible
+        // at the resolution `draft` is already drawing at.
+        const b = draft ? 0 : clampBevel(bevel, thickness)
         const levels = taperedLevels(y, thickness, insetAt, breaks, b)
         for (const poly of mp) {
           const rings = poly.map((ring) => ringToVec(ring as [number, number][]))
@@ -515,7 +524,7 @@ export function Preview3D() {
         shadows: boolean,
         bevel = 0,
       ) => {
-        const b = Math.max(0, Math.min(bevel, thickness / 2 - 0.05))
+        const b = draft ? 0 : Math.max(0, Math.min(bevel, thickness / 2 - 0.05))
         shapesFromPolygons(mp).forEach((shape, i) => {
           const extruded = new THREE.ExtrudeGeometry(shape, {
             depth: thickness - 2 * b,
@@ -960,6 +969,7 @@ export function Preview3D() {
     let rebuildTimer: ReturnType<typeof setTimeout> | undefined
     let rebuildLastRun = 0
     const scheduleRebuild = () => {
+      noteEdit()
       const wait = Math.max(0, 150 - (performance.now() - rebuildLastRun))
       clearTimeout(rebuildTimer)
       rebuildTimer = setTimeout(() => {
@@ -967,6 +977,8 @@ export function Preview3D() {
         rebuild()
       }, wait)
     }
+    // Once editing stops, replace whatever was built at draft resolution.
+    const unsubscribeSettle = onSettled(rebuild)
 
     let last = store.getState()
     const unsubscribe = store.subscribe((state) => {
@@ -1015,6 +1027,7 @@ export function Preview3D() {
       cancelAnimationFrame(frame)
       clearTimeout(rebuildTimer)
       unsubscribe()
+      unsubscribeSettle()
       unsubscribeView()
       observer.disconnect()
       controls.dispose()

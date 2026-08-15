@@ -10,8 +10,34 @@ import {
   type XForm,
 } from './keys'
 import { groupMap } from './store'
+import { clipper2Requested, offsetMulti } from './offsetClipper2'
 
 export type { MultiPolygon, Polygon, Ring }
+
+// ---- Offset backend -------------------------------------------------------
+
+/** Which implementation `dilate`/`erode` use. `legacy` is the union-of-strips
+ * approximation below; `clipper2` hands the same job to Clipper2's native
+ * offsetter. Both are kept so the swap can be A/B'd on the bench and the
+ * fidelity script — see `src/model/offsetClipper2.ts`. */
+export type OffsetBackend = 'legacy' | 'clipper2'
+
+let offsetBackendMode: OffsetBackend = clipper2Requested() ? 'clipper2' : 'legacy'
+
+export function offsetBackend(): OffsetBackend {
+  return offsetBackendMode
+}
+
+export function setOffsetBackend(next: OffsetBackend): void {
+  if (next === offsetBackendMode) return
+  offsetBackendMode = next
+  // Every memo below holds geometry built by one backend, and unlike a
+  // quality flip this can change hole topology, so they are dropped outright.
+  plateCache = null
+  solidsCache = null
+  shellCache = null
+  screwCache = null
+}
 
 /** Plate switch cutout size per switch type, mm. */
 const CUTOUT: Record<Key['type'], number> = {
@@ -84,16 +110,99 @@ function robustClip(
  * edges. */
 const MIN_FEATURE = 3
 
-/** Disc approximation for Minkowski offsetting. Resolution scales with the
- * radius (~0.7 mm chords), with a floor of 18 segments (20° per facet) so
- * even tiny-radius arcs stay under the 3D preview's 30° normal-crease
- * threshold and shade smoothly. */
+// ---- Resolution -----------------------------------------------------------
+
+/** How finely offset arcs are sampled. Every millimetre of generated boundary
+ * is a vertex the clipper has to sweep, and its cost climbs faster than
+ * linearly, so resolution is the main lever on how long a rebuild takes.
+ * `draft` is for outlines being regenerated continuously under a drag; the
+ * result is the same shape with visibly coarser fillets. */
+export type OutlineQuality = 'fine' | 'draft'
+
+interface QualitySpec {
+  /** Largest allowed sagitta when sampling an arc, mm. */
+  sagitta: number
+  /** Hard cap on the angle a single arc segment may span, radians. `fine`
+   * keeps facets under the 3D preview's 30° normal-crease threshold so
+   * fillets shade as curves rather than flats. */
+  maxStep: number
+  /** Vertex-dropping tolerance applied between morphological stages, mm. */
+  simplifyEps: number
+}
+
+const QUALITY: Record<OutlineQuality, QualitySpec> = {
+  fine: { sagitta: 0.02, maxStep: Math.PI / 9, simplifyEps: 0.02 },
+  draft: { sagitta: 0.25, maxStep: Math.PI / 4, simplifyEps: 0.1 },
+}
+
+let quality: OutlineQuality = 'fine'
+
+export function outlineQuality(): OutlineQuality {
+  return quality
+}
+
+/** Switching quality invalidates every memo below, since they all cache
+ * geometry built at one resolution. Callers should therefore flip this once
+ * per gesture, not per edit. */
+export function setOutlineQuality(next: OutlineQuality): void {
+  quality = next
+}
+
+/** Angular step for sampling an arc of radius `r`, from the sagitta budget. */
+function arcStep(r: number): number {
+  const q = QUALITY[quality]
+  if (r <= 1e-9) return q.maxStep
+  const cos = 1 - Math.min(q.sagitta, r) / r
+  return Math.min(q.maxStep, 2 * Math.acos(Math.max(-1, Math.min(1, cos))))
+}
+
+/** Full disc, for the degenerate case where a vertex has no usable incoming
+ * edge to measure a turn against. */
 function discPoly(cx: number, cy: number, r: number): Polygon {
-  const segments = Math.min(36, Math.max(18, Math.ceil((2 * Math.PI * r) / 0.7)))
+  const segments = Math.max(6, Math.ceil((2 * Math.PI) / arcStep(r)))
   const ring: Ring = []
   for (let i = 0; i < segments; i++) {
     const a = (i / segments) * 2 * Math.PI
     ring.push([snap(cx + r * Math.cos(a)), snap(cy + r * Math.sin(a))])
+  }
+  ring.push(ring[0])
+  return [ring]
+}
+
+/** Only the part of the offset disc that the edge strips actually leave
+ * uncovered at a turn: the pie slice between the two edges' normals. A full
+ * disc at every corner is what the clipper used to spend most of its time on
+ * — all but the slice is buried inside the strips, and on an outline that has
+ * already been through one offsetting pass there is a corner every fraction
+ * of a millimetre.
+ *
+ * `MARGIN` swings both straight sides a little past the strips they meet, and
+ * the apex is pulled back off the polygon's own vertex, so boundaries cross
+ * transversally rather than touching — coincident geometry being exactly what
+ * makes this clipper's sweep line fall over, and the reason the straightforward
+ * version reached for whole discs to begin with. */
+function arcWedge(
+  vx: number,
+  vy: number,
+  r: number,
+  aStart: number,
+  sweep: number,
+): Polygon {
+  const MARGIN = 0.06
+  const APEX_PULL = 0.05
+  const mid = aStart + sweep / 2
+  const half = Math.abs(sweep) / 2 + MARGIN
+  const a0 = mid - half
+  const steps = Math.max(1, Math.ceil((2 * half) / arcStep(r)))
+  // The apex lands inside the material when dilating and outside it when
+  // eroding — either way in ground the operation already covers, so pulling
+  // it back off the boundary cannot change the result.
+  const ring: Ring = [
+    [snap(vx - Math.cos(mid) * APEX_PULL), snap(vy - Math.sin(mid) * APEX_PULL)],
+  ]
+  for (let i = 0; i <= steps; i++) {
+    const a = a0 + ((2 * half) * i) / steps
+    ring.push([snap(vx + r * Math.cos(a)), snap(vy + r * Math.sin(a))])
   }
   ring.push(ring[0])
   return [ring]
@@ -118,11 +227,13 @@ function offsetBand(mp: MultiPolygon, r: number, side: 'out' | 'in'): Polygon[] 
       for (let i = 0; i < n; i++) {
         const [x1, y1] = ring[i]
         const [x2, y2] = ring[i + 1]
-        const len = Math.hypot(x2 - x1, y2 - y1)
+        const ex = x2 - x1
+        const ey = y2 - y1
+        const len = Math.hypot(ex, ey)
         if (len < 1e-9) continue
         // Right normal = away from the material.
-        const nx = (y2 - y1) / len
-        const ny = -(x2 - x1) / len
+        const nx = ey / len
+        const ny = -ex / len
         parts.push([
           [
             [snap(x1 + nx * lo), snap(y1 + ny * lo)],
@@ -134,16 +245,45 @@ function offsetBand(mp: MultiPolygon, r: number, side: 'out' | 'in'): Polygon[] 
         ])
         // Left turns open a wedge on the right (outward) side and vice versa.
         const p0 = ring[(i + n - 1) % n]
-        const l0 = Math.hypot(x1 - p0[0], y1 - p0[1])
-        const cross = (x1 - p0[0]) * (y2 - y1) - (y1 - p0[1]) * (x2 - x1)
+        const px = x1 - p0[0]
+        const py = y1 - p0[1]
+        const l0 = Math.hypot(px, py)
+        const cross = px * ey - py * ex
         const sinT = l0 < 1e-9 ? 1 : cross / (l0 * len)
-        if ((side === 'out' ? sinT : -sinT) > 0.017) {
+        if ((side === 'out' ? sinT : -sinT) <= 0.017) continue
+        if (l0 < 1e-9) {
+          // No incoming edge to measure the turn against; fall back to the
+          // whole disc, which covers the wedge whatever direction it opens in.
           parts.push(discPoly(x1, y1, r))
+          continue
         }
+        // Signed turn from the incoming edge to this one. Dilating leaves the
+        // gap between the two outward normals; eroding leaves it between the
+        // two inward ones, swept the other way.
+        const turn = Math.atan2(cross, px * ex + py * ey)
+        parts.push(
+          side === 'out'
+            ? arcWedge(x1, y1, r, Math.atan2(-px, py), turn)
+            : arcWedge(x1, y1, r, Math.atan2(ny, nx) + Math.PI, -turn),
+        )
       }
     }
   }
   return parts
+}
+
+/** Exact Minkowski offset via Clipper2, wrapped in the same debris drop and
+ * inter-stage simplification the legacy path applies.
+ *
+ * The simplification is not optional. A round join emits arc points at every
+ * convex turn, and after one offset every vertex of a fillet *is* a convex
+ * turn, so a second offset re-tessellates each of them and the count roughly
+ * doubles per stage. Dropping the points that sit within `simplifyEps` of
+ * their neighbours' chord keeps a four-stage pipeline flat instead of
+ * exponential. */
+function offsetC2(mp: MultiPolygon, delta: number): MultiPolygon {
+  const q = QUALITY[quality]
+  return simplify(dropDebris(offsetMulti(mp, delta, q.sagitta, q.maxStep), 2), q.simplifyEps)
 }
 
 /** Approximate Minkowski dilation by a disc of radius r. Micro-holes are
@@ -151,9 +291,13 @@ function offsetBand(mp: MultiPolygon, r: number, side: 'out' | 'in'): Polygon[] 
  * a disc-sized hole under a following erosion. */
 function dilate(mp: MultiPolygon, r: number): MultiPolygon {
   if (mp.length === 0 || r <= 0) return mp
-  return dropDebris(
-    robustClip((s) => polygonClipping.union(s), [...mp, ...offsetBand(mp, r, 'out')]),
-    2,
+  if (offsetBackendMode === 'clipper2') return offsetC2(mp, r)
+  return simplify(
+    dropDebris(
+      robustClip((s) => polygonClipping.union(s), [...mp, ...offsetBand(mp, r, 'out')]),
+      2,
+    ),
+    QUALITY[quality].simplifyEps,
   )
 }
 
@@ -162,10 +306,19 @@ function dilate(mp: MultiPolygon, r: number): MultiPolygon {
  * strip's inner edge), so dilate-then-erode round-trips cleanly. */
 export function erode(mp: MultiPolygon, r: number): MultiPolygon {
   if (mp.length === 0 || r <= 0) return mp
+  if (offsetBackendMode === 'clipper2') return offsetC2(mp, -r)
+  // The band is deliberately *not* simplified: its inner edge reconstructs
+  // the eroded contour exactly, and nudging those vertices would leave the
+  // difference with boundaries that nearly — but no longer exactly — coincide
+  // with the subject's. That is the slowest and most fragile case there is for
+  // the sweep line, and it costs more than the vertices saved.
   const band = robustClip((s) => polygonClipping.union(s), offsetBand(mp, r, 'in'))
-  return dropDebris(
-    robustClip((s, c) => polygonClipping.difference(s, c!), mp, band),
-    2,
+  return simplify(
+    dropDebris(
+      robustClip((s, c) => polygonClipping.difference(s, c!), mp, band),
+      2,
+    ),
+    QUALITY[quality].simplifyEps,
   )
 }
 
@@ -217,7 +370,17 @@ function hasNarrowGap(poly: Polygon, width: number): boolean {
 /** Drop vertices that deviate less than `eps` from the line through their
  * neighbours. Closing leaves micro-edges at corners (disc sampling and
  * quantization artifacts) which would otherwise clamp the corner fillets to
- * nothing. */
+ * nothing.
+ *
+ * Each vertex is measured against its immediate neighbours, and no two
+ * adjacent vertices are dropped in the same pass, so one pass can never move
+ * the boundary by more than `eps`. Measuring against the last *kept* vertex
+ * instead lets a run of gentle vertices collapse onto one far-away anchor:
+ * a long shallow curve reads as within tolerance of the growing chord the
+ * whole way along and the pass shortcuts across it. That is a difference of
+ * hundreds of square millimetres on a real board, and because the walk starts
+ * at whichever vertex the clipper happened to emit first, it hit one half of
+ * a mirrored board and not the other. */
 function simplifyRing(ring: Ring, eps: number): Ring {
   let pts = [...ring]
   if (
@@ -230,11 +393,13 @@ function simplifyRing(ring: Ring, eps: number): Ring {
   let changed = true
   while (changed && pts.length > 3) {
     changed = false
-    const kept: Ring = []
-    for (let i = 0; i < pts.length; i++) {
-      const a = kept.length > 0 ? kept[kept.length - 1] : pts[pts.length - 1]
+    const n = pts.length
+    const drop = new Set<number>()
+    for (let i = 0; i < n; i++) {
+      if (drop.has((i - 1 + n) % n)) continue
+      const a = pts[(i - 1 + n) % n]
       const b = pts[i]
-      const c = pts[(i + 1) % pts.length]
+      const c = pts[(i + 1) % n]
       const ux = c[0] - a[0]
       const uy = c[1] - a[1]
       const len = Math.hypot(ux, uy)
@@ -242,13 +407,12 @@ function simplifyRing(ring: Ring, eps: number): Ring {
         len < 1e-9
           ? Math.hypot(b[0] - a[0], b[1] - a[1])
           : Math.abs((b[0] - a[0]) * uy - (b[1] - a[1]) * ux) / len
-      if (dist < eps) {
-        changed = true
-        continue
-      }
-      kept.push(b)
+      if (dist < eps) drop.add(i)
     }
-    pts = kept
+    if (drop.size === 0) break
+    if (pts.length - drop.size < 3) break
+    changed = true
+    pts = pts.filter((_, i) => !drop.has(i))
   }
   if (pts.length < 3) return ring
   pts.push(pts[0])
@@ -704,7 +868,13 @@ function bezelSolids(doc: Doc): BezelSolids[] {
 /** One case piece of the hollow top shell plus the bottom tray, as
  * extrudable outlines. The plate and foam are sized to the cavity, so
  * nothing interpenetrates: `hull` ⊃ `interior` (wall width in) ⊃ `inner`
- * (ridge width further in). */
+ * (ridge width further in).
+ *
+ * Every member below `hull` is a getter that offsets on first read and then
+ * memoizes. The 2D editor draws the case as a single contour and so touches
+ * only `hull` and `rim`; computing the cavity, the drop-in fit contour and
+ * the tray ridge eagerly meant it paid for the whole 3D part stack on every
+ * edit without ever drawing it. */
 export interface CaseShell {
   /** Outer footprint with interior islands/holes discarded. */
   hull: MultiPolygon
@@ -762,31 +932,61 @@ export function caseShells(doc: Doc): CaseShell[] {
       return mp
     }
   }
+  /** Run `compute` at most once, on first read. */
+  const once = <T,>(compute: () => T): (() => T) => {
+    let done = false
+    let value: T
+    return () => {
+      if (!done) {
+        value = compute()
+        done = true
+      }
+      return value
+    }
+  }
   const result: CaseShell[] = solids.map((s) => {
     const hull: MultiPolygon = s.outer.map((poly) => [poly[0]])
-    let interior: MultiPolygon = []
-    try {
-      interior = simplify(erode(hull, wallW), 0.05)
-    } catch (error) {
-      console.warn('keebforge: case interior generation failed', error)
-    }
-    const fit = round(interior)
-    let inner = fit
-    if (ridgeW > 0 && fit.length > 0) {
+    const interior = once(() => {
       try {
-        inner = round(simplify(erode(fit, ridgeW), 0.05))
+        return simplify(erode(hull, wallW), 0.05)
+      } catch (error) {
+        console.warn('keebforge: case interior generation failed', error)
+        return [] as MultiPolygon
+      }
+    })
+    const fit = once(() => round(interior()))
+    const inner = once(() => {
+      if (ridgeW <= 0 || fit().length === 0) return fit()
+      try {
+        return round(simplify(erode(fit(), ridgeW), 0.05))
       } catch (error) {
         console.warn('keebforge: tray ridge generation failed', error)
+        return fit()
       }
-    }
+    })
+    const wall = once(() => diff(hull, interior()))
+    const rim = once(() => diff(hull, s.opening))
+    const ridge = once(() => (inner() === fit() ? [] : diff(fit(), inner())))
     return {
       hull,
-      interior,
-      fit,
-      inner,
-      wall: diff(hull, interior),
-      rim: diff(hull, s.opening),
-      ridge: inner === fit ? [] : diff(fit, inner),
+      get interior() {
+        return interior()
+      },
+      get fit() {
+        return fit()
+      },
+      get inner() {
+        return inner()
+      },
+      get wall() {
+        return wall()
+      },
+      get rim() {
+        return rim()
+      },
+      get ridge() {
+        return ridge()
+      },
     }
   })
   shellCache = { solids, ridgeW, result }
@@ -958,11 +1158,90 @@ export const SCREW = {
  * exactly the radius it opens by — head flush with the underside. */
 export const CSK_DEPTH = SCREW.cskR - SCREW.lidHoleR
 
+
+/** Perimeter of a ring, corrected for the length tessellation loses.
+ *
+ * A chord under-measures the arc it stands in for, and by more at `draft`
+ * than at `fine` — 413.53 mm against 411.53 mm on the same outline, half a
+ * percent. Screw count is `round(perimeter / spacing)`, and half a percent is
+ * plenty to walk that across a rounding boundary: `default(r6)` lands on
+ * 7.519 at fine and 7.482 at draft, so a screw appears and disappears as you
+ * drag.
+ *
+ * The correction is exact for a circular arc. A chord spanning turn θ of a
+ * circle of radius r measures 2r·sin(θ/2) where the arc is rθ, so scaling by
+ * (θ/2)/sin(θ/2) recovers the arc — with no reference to how many chords the
+ * tessellator chose to spend on it, which is the whole point.
+ *
+ * Turns past roughly twice the tessellator's own step are real corners, not
+ * arc samples, and are left alone: stretching the edges either side of a
+ * square corner by 11% would not be a rounding error, it would be wrong. */
+/** Vertex-dropping tolerance for the length the screw count is measured
+ * against. Deliberately coarser than `draft`'s own sagitta, so a ring
+ * sampled at either quality reduces to nearly the same polyline before it
+ * is measured — the arc correction below can only recover what a chord
+ * stands in for, and it cannot see that `simplify` dropped different
+ * vertices at the two resolutions. */
+const COUNT_EPS = 0.4
+
+/** The length the screw count is derived from: reduced to a canonical
+ * resolution first, then corrected for arc-vs-chord. Both steps exist to
+ * stop `round(length / spacing)` from landing on different sides of a
+ * boundary at `fine` and at `draft`. */
+function canonicalPerimeter(pts: [number, number][]): number {
+  const closed = [...pts, pts[0]] as Ring
+  const reduced = simplifyRing(closed, COUNT_EPS)
+  return smoothPerimeter(reduced.slice(0, -1) as [number, number][])
+}
+
+function smoothPerimeter(pts: [number, number][]): number {
+  const n = pts.length
+  const cap = Math.min(Math.PI / 3, 2 * QUALITY[quality].maxStep)
+  const turns: number[] = []
+  for (let i = 0; i < n; i++) {
+    const [px, py] = pts[(i + n - 1) % n]
+    const [x, y] = pts[i]
+    const [qx, qy] = pts[(i + 1) % n]
+    const ax = x - px
+    const ay = y - py
+    const bx = qx - x
+    const by = qy - y
+    if (ax * ax + ay * ay < 1e-18 || bx * bx + by * by < 1e-18) {
+      turns.push(0)
+      continue
+    }
+    const turn = Math.abs(Math.atan2(ax * by - ay * bx, ax * bx + ay * by))
+    turns.push(turn > cap ? 0 : turn)
+  }
+  let total = 0
+  for (let i = 0; i < n; i++) {
+    const j = (i + 1) % n
+    const len = Math.hypot(pts[j][0] - pts[i][0], pts[j][1] - pts[i][1])
+    // Each chord carries half the turn at either end of it.
+    const theta = (turns[i] + turns[j]) / 2
+    total += theta < 1e-6 ? len : (len * (theta / 2)) / Math.sin(theta / 2)
+  }
+  return total
+}
+
 /** Evenly spaced points along a ring's perimeter, `spacing` mm apart,
- * phase-anchored at the vertex farthest from the ring centroid (a corner,
- * so screws land in corners first and the layout is stable under edits).
- * Used for `tight` outlines, which have no canonical corners; `box` pieces
- * take their screws from the rectangle they were built from instead. */
+ * phase-anchored at the corner farthest from the ring's centroid, so screws
+ * land in corners first. Used for `tight` outlines, which have no canonical
+ * corners; `box` pieces take their screws from the rectangle they were built
+ * from instead.
+ *
+ * Both halves of that anchor have to be independent of how finely the ring
+ * happens to be tessellated, or the whole layout rotates when the outline is
+ * rebuilt at a different resolution — which it is, on every drag, since
+ * `draft` quality re-samples every arc:
+ *
+ * - the centroid is the *area* centroid, not the average of the vertices.
+ *   A vertex average follows the sample density, so adding points to a
+ *   fillet drags it toward that fillet — measured at 2.5 mm between `fine`
+ *   and `draft`, which was enough to flip which corner came out farthest and
+ *   move every screw on the board.
+ * - ties are broken by angle about the centroid rather than by vertex order,
+ *   so a near-tie resolves the same way whatever the sampling. */
 function sampleRing(ring: Ring, spacing: number): [number, number][] {
   let pts = ring as [number, number][]
   if (
@@ -983,11 +1262,29 @@ function sampleRing(ring: Ring, spacing: number): [number, number][] {
   const total = cum[n]
   // Too small a piece to be worth fastening (or to fit screws at all).
   if (total < 40) return []
+  // Area centroid. Degenerate rings (zero enclosed area) fall back to the
+  // vertex average, which is all there is to work with.
   let cx = 0
   let cy = 0
-  for (const [x, y] of pts) {
-    cx += x / n
-    cy += y / n
+  let a2 = 0
+  for (let i = 0; i < n; i++) {
+    const [x1, y1] = pts[i]
+    const [x2, y2] = pts[(i + 1) % n]
+    const cross = x1 * y2 - x2 * y1
+    a2 += cross
+    cx += (x1 + x2) * cross
+    cy += (y1 + y2) * cross
+  }
+  if (Math.abs(a2) > 1e-9) {
+    cx /= 3 * a2
+    cy /= 3 * a2
+  } else {
+    cx = 0
+    cy = 0
+    for (const [x, y] of pts) {
+      cx += x / n
+      cy += y / n
+    }
   }
   const at = (s: number): [number, number] => {
     const t = ((s % total) + total) % total
@@ -999,18 +1296,51 @@ function sampleRing(ring: Ring, spacing: number): [number, number][] {
     return [x1 + (x2 - x1) * f, y1 + (y2 - y1) * f]
   }
 
+  // Anchor where the ring crosses the vertical through its own centroid, at
+  // the topmost such crossing — the middle of the far edge. Interpolated
+  // along the crossing edge, so it is a point on the *shape* and no vertex
+  // has to exist there; re-tessellating cannot move it.
+  //
+  // Anchoring on a corner instead reads better in principle — screws land in
+  // corners first — but there is no way to pick one that survives a rebuild.
+  // On a symmetric board the two farthest corners are exactly tied (measured
+  // 134.470 against 134.399 mm on `example(tight)`, 0.05% apart), so whichever
+  // one wins is decided by sampling noise, and the whole ring rotates when it
+  // flips. The crossing has the opposite property: on a mirrored board it sits
+  // *on* the axis of symmetry, which is the one place a tie cannot form.
   let start = 0
-  let best = -1
+  let anchor = 0
+  let top = -Infinity
   for (let i = 0; i < n; i++) {
-    const d = (pts[i][0] - cx) ** 2 + (pts[i][1] - cy) ** 2
-    if (d > best) {
-      best = d
-      start = i
-    }
+    const [x1, y1] = pts[i]
+    const [x2, y2] = pts[(i + 1) % n]
+    if (x1 - cx > 0 === x2 - cx > 0) continue
+    const f = (cx - x1) / (x2 - x1)
+    const y = y1 + (y2 - y1) * f
+    if (y <= top) continue
+    top = y
+    start = i
+    anchor = cum[i] + f * (cum[i + 1] - cum[i])
   }
-  const count = Math.max(2, Math.round(total / spacing))
+  if (top === -Infinity) {
+    // No crossing: the ring does not span its own centroid's abscissa, which
+    // takes a degenerate outline. Any repeatable choice will do.
+    let best = -1
+    for (let i = 0; i < n; i++) {
+      const d = (pts[i][0] - cx) ** 2 + (pts[i][1] - cy) ** 2
+      if (d > best) {
+        best = d
+        start = i
+      }
+    }
+    anchor = cum[start]
+  }
+  // Positions are laid out along `total`, the ring as actually tessellated,
+  // since that is the parameterisation `at()` walks. Only the count comes
+  // off the corrected length, because only the count has a threshold in it.
+  const count = Math.max(2, Math.round(canonicalPerimeter(pts) / spacing))
   const out: [number, number][] = []
-  for (let k = 0; k < count; k++) out.push(at(cum[start] + (k * total) / count))
+  for (let k = 0; k < count; k++) out.push(at(anchor + (k * total) / count))
   return out
 }
 
@@ -1082,7 +1412,15 @@ export function maxScrewInset(bezelWidth: number): number {
  * two independently-phased halves. Keep the left half plus anything sitting
  * on the axis, then reflect it — the right half becomes an exact mirror. */
 function mirrorScrews(pts: [number, number][], axis: number): [number, number][] {
-  const onAxis = 0.05
+  // A sample this close to the axis is *the* centre screw, and becomes one
+  // hole sitting on it. The tolerance has to be a real distance rather than
+  // a numerical epsilon: at 0.05 mm, a sample landing 0.06 mm off the axis
+  // took the other branch and produced a pair of screws 0.12 mm apart —
+  // overlapping countersinks, and a layout that flipped between one hole and
+  // two on a re-tessellation that moved the sample by a tenth of a
+  // millimetre. Two countersinks that do not overlap are two screws; anything
+  // closer was always meant to be one.
+  const onAxis = SCREW.cskR
   const out: [number, number][] = []
   for (const [x, y] of pts) {
     if (Math.abs(x - axis) <= onAxis) out.push([axis, y])

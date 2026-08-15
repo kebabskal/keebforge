@@ -1,5 +1,6 @@
 import { useRef, useState, type ReactNode } from 'react'
 import { EditorCanvas } from './editor/EditorCanvas'
+import { fastEditing, setFastEditing } from './model/editQuality'
 import { Preview3D } from './preview/Preview3D'
 import { Inspector } from './ui/Inspector'
 import { useTheme } from './ui/theme'
@@ -65,6 +66,7 @@ export default function App() {
   }
   const theme = useTheme((s) => s.theme)
   const toggleTheme = useTheme((s) => s.toggle)
+  const [fast, setFast] = useState(fastEditing)
 
   return (
     <div className="app">
@@ -85,6 +87,20 @@ export default function App() {
           </button>
         </nav>
         <Toolbar />
+        <button
+          className={`theme-btn${fast ? ' active' : ''}`}
+          onClick={() => {
+            setFastEditing(!fast)
+            setFast(!fast)
+          }}
+          title={
+            fast
+              ? 'Performance mode on: coarser fillets and no chamfers while you drag, full quality once you stop'
+              : 'Performance mode off: always draw at full quality'
+          }
+        >
+          ⚡
+        </button>
         <button
           className="theme-btn"
           onClick={toggleTheme}
