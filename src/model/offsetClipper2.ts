@@ -1,5 +1,5 @@
-/** Experimental replacement for the hand-rolled Minkowski offset in
- * `outline.ts`, backed by Clipper2 compiled to WebAssembly.
+/** The offset backend: Clipper2 compiled to WebAssembly, replacing the
+ * hand-rolled Minkowski offset in `outline.ts`.
  *
  * The legacy path approximates dilate/erode by emitting an edge strip plus an
  * arc wedge per boundary vertex and unioning the lot through
@@ -16,8 +16,11 @@
  * 248.27, and the ring visibly jumps across the shape. The WASM build is the
  * real Clipper2 and returns 248.03 (the deficit is just chord sampling).
  *
- * Selected by `setOffsetBackend()` or the `KEEBFORGE_OFFSET` env var; see
- * `offsetBackend()` in outline.ts. */
+ * The legacy offsetter is still there behind `setOffsetBackend()`, the
+ * `KEEBFORGE_OFFSET=legacy` env var and `?offset=legacy`, both as an A/B for
+ * the bench and fidelity scripts and as the fallback if this module fails to
+ * load. It is roughly 10x slower and measurably rougher: mirror symmetry
+ * comes out 0.229 mm off axis against 0.035 mm here. */
 import type { MultiPolygon, Polygon, Ring } from 'polygon-clipping'
 
 /** Decimal places Clipper2 keeps when it scales millimetres onto its internal
@@ -47,21 +50,29 @@ export function clipper2Ready(): boolean {
   return mod !== null
 }
 
-/** True when this process or page asked for the clipper2 backend up front:
- * `KEEBFORGE_OFFSET=clipper2` for the bench and fidelity scripts, `?offset=
- * clipper2` on the dev server for a visual A/B. */
+/** Clipper2 is the offset backend unless something asks for the old one:
+ * `KEEBFORGE_OFFSET=legacy` for the bench and fidelity scripts, `?offset=
+ * legacy` on the dev server for a visual A/B. */
 export function clipper2Requested(): boolean {
   const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process
     ?.env?.KEEBFORGE_OFFSET
-  if (env) return env === 'clipper2'
+  if (env) return env !== 'legacy'
   const search = (globalThis as { location?: { search?: string } }).location?.search
-  return !!search && new URLSearchParams(search).get('offset') === 'clipper2'
+  return !search || new URLSearchParams(search).get('offset') !== 'legacy'
 }
 
 // Resolved before anything can call into the offsetter, so `offsetMulti` stays
-// synchronous and outline.ts needs no async plumbing. Costs nothing when the
-// backend was not asked for: the import is dynamic, so the WASM never loads.
-if (clipper2Requested()) await initClipper2()
+// synchronous and outline.ts needs no async plumbing. A failure here is not
+// fatal: `clipper2Ready()` stays false and outline.ts falls back to the legacy
+// offsetter, which is slower and rougher but does not need a WASM module to
+// have loaded.
+if (clipper2Requested()) {
+  try {
+    await initClipper2()
+  } catch (error) {
+    console.warn('keebforge: Clipper2 unavailable, falling back to the legacy offsetter', error)
+  }
+}
 
 /** Millimetre rings to a PathsD the offsetter can take. Built through
  * `assign` on a flat Float64Array rather than per-point `push_back`, so a

@@ -1,9 +1,13 @@
 import * as THREE from 'three'
-import type { Doc } from '../model/keys'
+import { MCU_THICKNESS, type Doc } from '../model/keys'
 import {
+  BRACKET,
   caseBottomOutline,
   caseDims,
   caseShells,
+  controllerBrackets,
+  controllerPortCuts,
+  controllerPortSpan,
   CSK_DEPTH,
   PLATE_THICKNESS,
   plateWithCutouts,
@@ -11,6 +15,7 @@ import {
   screwPositions,
   simplify,
   subtractDiscs,
+  subtractShapes,
   type MultiPolygon,
 } from '../model/outline'
 import {
@@ -93,14 +98,30 @@ export function topCaseSolids(doc: Doc): Solid[] {
       ),
     )
   }
+  // Same band split as the preview: the pilot holes and the connector
+  // opening both start at the tray floor and stop at their own heights, so
+  // the wall breaks at each in turn and every band carries the cuts that
+  // reach it. Getting this wrong here and not in the preview would print a
+  // case with no hole in it.
+  const portCuts = controllerPortCuts(doc)
+  const portH =
+    portCuts.length > 0
+      ? Math.min(dims.wallH, MCU_THICKNESS + doc.controller.portHeight)
+      : 0
+  const stops = [pilotH, portH, dims.wallH]
+    .filter((h) => h > 1e-6 && h <= dims.wallH)
+    .sort((a, b) => a - b)
+    .filter((h, i, all) => i === 0 || h - all[i - 1] > 1e-6)
   for (const shell of caseShells(doc)) {
-    if (screws.length > 0) {
-      tapered(subtractDiscs(shell.wall, screws, SCREW.pilotR), pilotH, dims.caseBottomY)
-      if (dims.wallH > pilotH) {
-        tapered(shell.wall, dims.wallH - pilotH, dims.caseBottomY + pilotH)
+    let from = 0
+    for (const to of stops) {
+      let band = shell.wall
+      if (screws.length > 0 && to <= pilotH + 1e-6) {
+        band = subtractDiscs(band, screws, SCREW.pilotR)
       }
-    } else {
-      tapered(shell.wall, dims.wallH, dims.caseBottomY)
+      if (portH > 0 && to <= portH + 1e-6) band = subtractShapes(band, portCuts)
+      tapered(band, to - from, dims.caseBottomY + from)
+      from = to
     }
     if (dims.rimH > 0) tapered(shell.rim, dims.rimH, 0, dims.bevel)
   }
@@ -136,7 +157,24 @@ export function bottomSolids(doc: Doc): Solid[] {
   } else {
     solids = extruded(outline, t, 0)
   }
-  solids.push(...extruded(caseShells(doc).flatMap((s) => s.ridge), dims.cavity, t))
+  // The ridge stands between the board and the wall, so the connector passes
+  // through it too — split at the opening's height like the wall is.
+  const ridge = caseShells(doc).flatMap((s) => s.ridge)
+  const ridgePort = Math.min(dims.cavity, controllerPortSpan(doc))
+  if (ridgePort > 0) {
+    solids.push(...extruded(subtractShapes(ridge, controllerPortCuts(doc)), ridgePort, t))
+    if (dims.cavity > ridgePort) {
+      solids.push(...extruded(ridge, dims.cavity - ridgePort, t + ridgePort))
+    }
+  } else {
+    solids.push(...extruded(ridge, dims.cavity, t))
+  }
+  // Corner brackets stand on the tray floor, which is the lid's top face.
+  // The board itself is a part you buy, not one you print, so only the
+  // brackets go in the export.
+  solids.push(
+    ...extruded(controllerBrackets(doc), MCU_THICKNESS + BRACKET.rise, t),
+  )
   return solids
 }
 

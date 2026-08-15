@@ -11,14 +11,20 @@ import {
   DEFAULT_TENT,
   isKeyMirrored,
   keyWorldXF,
+  MCU_THICKNESS,
   mirrorXF,
   type XForm,
 } from '../model/keys'
 import { noteEdit, onSettled } from '../model/editQuality'
 import {
+  BRACKET,
   caseBottomOutline,
   caseDims,
   caseShells,
+  controllerBoards,
+  controllerBrackets,
+  controllerPortCuts,
+  controllerPortSpan,
   CSK_DEPTH,
   foamWithCutouts,
   outlineQuality,
@@ -29,6 +35,7 @@ import {
   SCREW,
   screwPositions,
   subtractDiscs,
+  subtractShapes,
   type MultiPolygon,
 } from '../model/outline'
 import { groupMap, useDocStore } from '../model/store'
@@ -365,6 +372,7 @@ export function Preview3D() {
         bezel: state.bezel,
         bottom: state.bottom,
         mounting: state.mounting,
+        controller: state.controller,
         tilt: state.tilt,
         materials: state.materials,
       }
@@ -507,9 +515,15 @@ export function Preview3D() {
           const rings = poly.map((ring) => ringToVec(ring as [number, number][]))
           if (rings[0].length < 3) continue
           placePart(
-            // Coarser staircase steps than the export: half the clipping
-            // work on every rebuild, invisible at preview scale.
-            taperedSolid(rings, levels, b, Math.PI / 6, 2), poly[0] as [number, number][],
+            // The taper is a staircase, and how fine it is costs one erosion
+            // per step. At stepScale 2 a 7 mm draft came out as seven 1 mm
+            // ledges — plainly visible, not the "invisible at preview scale"
+            // it was meant to be. That coarseness was paying for an offsetter
+            // that took 232 ms to walk 28 steps; Clipper2 does it in 13, so
+            // the preview can afford to be smoother than the export at rest
+            // and only coarsens while a drag is in flight.
+            taperedSolid(rings, levels, b, Math.PI / 6, draft ? 2 : 0.5),
+            poly[0] as [number, number][],
             part, y, material, shadows, true,
           )
         }
@@ -587,23 +601,36 @@ export function Preview3D() {
           // so the wall still reads solid from inside the case. Splitting the
           // band at that depth is how an extruded outline gets a blind hole.
           const pilotH = Math.min(SCREW.bite, wallH)
+          // The connector opening runs from the tray floor up past the
+          // board's connector, rather than starting at the board's top face.
+          // A slot open at the bottom needs nothing bridged over it, and the
+          // lid closes the underside off anyway.
+          const portCuts = controllerPortCuts(doc)
+          const portH =
+            portCuts.length > 0
+              ? Math.min(wallH, MCU_THICKNESS + doc.controller.portHeight)
+              : 0
+          // Both cuts start at the floor, so the wall splits at whichever of
+          // their tops comes first: each band carries the cuts that reach it.
+          const stops = [pilotH, portH, wallH]
+            .filter((h) => h > 1e-6 && h <= wallH)
+            .sort((a, b) => a - b)
+            .filter((h, i, all) => i === 0 || h - all[i - 1] > 1e-6)
           for (const shell of caseShells(doc)) {
             trackFront(shell.hull)
-            if (screws.length > 0) {
-              const drilled = subtractDiscs(shell.wall, screws, SCREW.pilotR)
-              const splitY = caseBottomY + pilotH
-              addTaperedSlab(
-                drilled, 'case', pilotH, caseBottomY, materials.bezel, true, insetAt, breaks,
-              )
-              if (wallH > pilotH) {
-                addTaperedSlab(
-                  shell.wall, 'case', wallH - pilotH, splitY, materials.bezel, true, insetAt, breaks,
-                )
+            let from = 0
+            for (const to of stops) {
+              let band = shell.wall
+              if (screws.length > 0 && to <= pilotH + 1e-6) {
+                band = subtractDiscs(band, screws, SCREW.pilotR)
               }
-            } else {
+              if (portH > 0 && to <= portH + 1e-6) {
+                band = subtractShapes(band, portCuts)
+              }
               addTaperedSlab(
-                shell.wall, 'case', wallH, caseBottomY, materials.bezel, true, insetAt, breaks,
+                band, 'case', to - from, caseBottomY + from, materials.bezel, true, insetAt, breaks,
               )
+              from = to
             }
             if (rimH > 0) {
               addTaperedSlab(
@@ -721,9 +748,38 @@ export function Preview3D() {
           // Tray ridge: an inset rim rising from the lid to the plate's
           // underside — the bottom becomes a tray whose lip supports the
           // plate from below, sandwiching it against the top case's rim.
+          // Corner brackets for a controller module, and the board they hold.
+          // Both stand on the tray floor, so they belong to the bottom and
+          // lift away with it in the exploded view.
+          const bracketMp = controllerBrackets(doc)
+          if (bracketMp.length > 0) {
+            addSlab(
+              bracketMp, 'bottom', MCU_THICKNESS + BRACKET.rise, caseBottomY,
+              materials.bezel, false,
+            )
+            addSlab(
+              controllerBoards(doc), 'bottom', MCU_THICKNESS, caseBottomY, materials.pcb, false,
+            )
+          }
           const ridgeMp = caseShells(doc).flatMap((s) => s.ridge)
           if (ridgeMp.length > 0) {
-            addSlab(ridgeMp, 'bottom', cavity, caseBottomY, materials.bezel, false)
+            // The ridge stands between the board and the wall, so the
+            // connector passes through it too — same band split as the wall.
+            const ridgePort = Math.min(cavity, controllerPortSpan(doc))
+            if (ridgePort > 0) {
+              addSlab(
+                subtractShapes(ridgeMp, controllerPortCuts(doc)), 'bottom', ridgePort,
+                caseBottomY, materials.bezel, false,
+              )
+              if (cavity > ridgePort) {
+                addSlab(
+                  ridgeMp, 'bottom', cavity - ridgePort, caseBottomY + ridgePort,
+                  materials.bezel, false,
+                )
+              }
+            } else {
+              addSlab(ridgeMp, 'bottom', cavity, caseBottomY, materials.bezel, false)
+            }
           }
           if (doc.bottom.mode === 'tight') {
             addSlab(bottomMp, 'bottom', bottomThickness, restY, materials.bezel, true)
@@ -990,6 +1046,7 @@ export function Preview3D() {
         state.bezel !== last.bezel ||
         state.bottom !== last.bottom ||
         state.mounting !== last.mounting ||
+        state.controller !== last.controller ||
         state.tilt !== last.tilt ||
         state.materials !== last.materials
       ) {

@@ -16,15 +16,26 @@ import {
 import { noteEdit, onSettled } from '../model/editQuality'
 import {
   bezelShape,
+  controllerBoards,
+  controllerBrackets,
+  controllerHit,
+  controllerOverlaps,
+  controllerPortCuts,
+  anchorOnWall,
+  controllerReach,
+  innerWallSegments,
   outlineQuality,
   plateOutline,
   SCREW,
   screwPositions,
   type MultiPolygon,
+  type WallSegment,
 } from '../model/outline'
 import {
   coalesceUndo,
   groupMap,
+  CONTROLLER_ID,
+  docOf,
   memberKeyIds,
   topGroupOf,
   useDocStore,
@@ -32,6 +43,15 @@ import {
   type TransformPatches,
 } from '../model/store'
 import { useTheme } from '../ui/theme'
+
+/** Snap radii for dragging the controller, in screen pixels — the same way
+ * the magnetic alignment guides are measured. In millimetres they were
+ * inescapable: 12 mm reaches a wall from almost anywhere inside a compact
+ * case, so the board was grabbed constantly and could not be placed by hand.
+ * Measured on screen, zooming in gives finer control, which is what you would
+ * reach for anyway. Alt suppresses both. */
+const WALL_SNAP_PX = 14
+const CENTER_SNAP_PX = 12
 
 const PALETTES = {
   dark: {
@@ -250,6 +270,7 @@ export function EditorCanvas() {
         gapSize: 3,
       }),
       bezelLine: new THREE.LineBasicMaterial({ color: COLORS.bezel }),
+      mcuClash: new THREE.LineBasicMaterial({ color: COLORS.snapGuide }),
       screwLine: new THREE.LineBasicMaterial({ color: COLORS.screw }),
       snapGuide: new THREE.LineBasicMaterial({ color: COLORS.snapGuide }),
       ghostCap: new THREE.MeshBasicMaterial({
@@ -416,6 +437,11 @@ export function EditorCanvas() {
     // geometry-relevant slices of the store change — sync() also fires for
     // selection changes, which don't affect either.
     let bezelLines: THREE.LineLoop[] = []
+    // The controller's own lines, kept apart from the rest so selecting it can
+    // recolour them without going near the outline rebuild — that is throttled
+    // and expensive, and selection changes are neither.
+    let mcuLines: THREE.LineLoop[] = []
+    let mcuClashed = false
     // Screw markers share one unit-circle geometry, scaled per ring.
     const screwCircleGeo = new THREE.BufferGeometry().setFromPoints(
       Array.from({ length: 32 }, (_, i) => {
@@ -427,7 +453,7 @@ export function EditorCanvas() {
     let bezelDeps: Partial<
       Pick<
         ReturnType<typeof store.getState>,
-        'keys' | 'groups' | 'mirror' | 'plate' | 'bezel' | 'bottom' | 'mounting'
+        'keys' | 'groups' | 'mirror' | 'plate' | 'bezel' | 'bottom' | 'mounting' | 'controller'
       >
     > = {}
     // Outlines built at draft resolution have to be rebuilt when editing
@@ -443,7 +469,8 @@ export function EditorCanvas() {
         state.plate === bezelDeps.plate &&
         state.bezel === bezelDeps.bezel &&
         state.bottom === bezelDeps.bottom &&
-        state.mounting === bezelDeps.mounting
+        state.mounting === bezelDeps.mounting &&
+        state.controller === bezelDeps.controller
       )
         return
       bezelQuality = outlineQuality()
@@ -455,12 +482,14 @@ export function EditorCanvas() {
         bezel: state.bezel,
         bottom: state.bottom,
         mounting: state.mounting,
+        controller: state.controller,
       }
       for (const line of bezelLines) {
         scene.remove(line)
         line.geometry.dispose()
       }
       bezelLines = []
+      mcuLines = []
       for (const line of screwLines) scene.remove(line)
       screwLines = []
       dims.style.display = 'none'
@@ -473,6 +502,7 @@ export function EditorCanvas() {
           bezel: state.bezel,
           bottom: state.bottom,
           mounting: state.mounting,
+          controller: state.controller,
           tilt: state.tilt,
           materials: state.materials,
         }
@@ -498,6 +528,35 @@ export function EditorCanvas() {
               line.scale.set(r, r, 1)
               scene.add(line)
               screwLines.push(line)
+            }
+          }
+        }
+
+        // Controller: the board, the brackets holding it and the opening its
+        // connector needs. The opening is drawn as the cut's own rectangle,
+        // which runs out past the wall, so it is obvious at a glance whether
+        // the board is close enough to the wall for it to break through.
+        if (state.controller.enabled) {
+          // Red when it runs into a switch body or the tray ridge: both sit
+          // in the cavity with it and neither is visible from above. Selection
+          // colour otherwise, so it reads as a handle you can act on.
+          mcuClashed = controllerOverlaps(doc)
+          for (const mp of [
+            controllerBoards(doc),
+            controllerBrackets(doc),
+            controllerPortCuts(doc),
+          ]) {
+            for (const poly of mp) {
+              for (const ring of poly) {
+                const geo = new THREE.BufferGeometry().setFromPoints(
+                  ring.map(([x, y]) => new THREE.Vector3(x, y, 0)),
+                )
+                const line = new THREE.LineLoop(geo, materials.bezelLine)
+                line.position.z = -0.42
+                scene.add(line)
+                bezelLines.push(line)
+                mcuLines.push(line)
+              }
             }
           }
         }
@@ -1283,6 +1342,15 @@ export function EditorCanvas() {
         }
       }
 
+      if (mcuLines.length > 0) {
+        const mat = mcuClashed
+          ? materials.mcuClash
+          : state.selection.has(CONTROLLER_ID)
+            ? materials.outline
+            : materials.bezelLine
+        for (const line of mcuLines) line.material = mat
+      }
+
       for (const key of state.keys) {
         const world = keyWorldXF(key, groups)
         const selected = state.selection.has(key.id)
@@ -1370,6 +1438,16 @@ export function EditorCanvas() {
       | { kind: 'idle' }
       | { kind: 'pan'; lastX: number; lastY: number }
       | ({ kind: 'drag' } & DragUnit)
+      | {
+          kind: 'mcu'
+          start: { x: number; y: number }
+          orig: { x: number; y: number }
+          walls: WallSegment[]
+          reach: number
+          half: number
+          centerX: number | null
+          gestureKey: string
+        }
       | { kind: 'band'; startX: number; startY: number; shift: boolean }
     let mode: Mode = { kind: 'idle' }
     let spaceHeld = false
@@ -1391,7 +1469,13 @@ export function EditorCanvas() {
 
     const setCursor = () => {
       canvas.style.cursor =
-        mode.kind === 'pan' ? 'grabbing' : spaceHeld ? 'grab' : 'default'
+        mode.kind === 'pan'
+          ? 'grabbing'
+          : mode.kind === 'mcu'
+            ? 'move'
+            : spaceHeld
+              ? 'grab'
+              : 'default'
     }
 
     /** Build drag units from the current selection: fully-selected top-level
@@ -1457,6 +1541,45 @@ export function EditorCanvas() {
       }
       if (e.button !== 0) return
       const pt = toMM(e.clientX, e.clientY)
+      // The controller wins the pick, ahead of the keys. It has to: it is
+      // enabled somewhere near the middle of the board and the first thing
+      // you do is drag it out to a wall, so if the keys it lands on top of
+      // took the click instead there would be no way to grab it at all.
+      // Keys underneath stay reachable by moving it off them, which is what
+      // you were going to do anyway.
+      if (controllerHit(store.getState().controller, pt.x, pt.y)) {
+        // Selected the way a key is, so the keyboard rotate and nudge apply
+        // to it and the inspector can show what is in hand. Ctrl-A takes it
+        // alongside the keys, so the commands that act on a selection handle
+        // it mixed in rather than assuming it stands alone.
+        store.getState().setSelection([CONTROLLER_ID])
+        const st = store.getState()
+        const c = st.controller
+        // Walls are pulled out once, here, off a snapshot with the controller
+        // turned off: the case grows around the module, so snapping against
+        // the live outline would chase a wall that moves as the board
+        // approaches it. Doing it per move also cost two full case rebuilds
+        // each time, the snapshot and the live document evicting each other
+        // from a one-entry cache.
+        const snapDoc = { ...docOf(st), controller: { ...c, enabled: false } }
+        mode = {
+          kind: 'mcu',
+          start: { x: pt.x, y: pt.y },
+          orig: { x: c.x, y: c.y },
+          walls: innerWallSegments(snapDoc),
+          reach: controllerReach(snapDoc),
+          half: c.length / 2,
+          // The line the board can be centred on. A mirrored board is built
+          // around its axis, so that is its centre; without mirroring there
+          // is no symmetry to centre on and the snap is simply off.
+          centerX: st.mirror.enabled ? st.mirror.axis : null,
+          // Unique per gesture, like the column gizmos: a fixed key would
+          // merge every drag the board ever sees into one undo entry.
+          gestureKey: `mcu${++gestureSeq}`,
+        }
+        setCursor()
+        return
+      }
       const hit = pickKey(pt.x, pt.y)
       if (!hit) {
         const rect = canvas.getBoundingClientRect()
@@ -1537,6 +1660,56 @@ export function EditorCanvas() {
         mode.lastX = e.clientX
         mode.lastY = e.clientY
         applyCamera()
+      } else if (mode.kind === 'mcu') {
+        const { start, orig, walls, reach, half, centerX, gestureKey } = mode
+        const pt = toMM(e.clientX, e.clientY)
+        let dx = pt.x - start.x
+        let dy = pt.y - start.y
+        // Shift constrains to the dominant axis, as it does for a key drag.
+        if (e.shiftKey) {
+          if (Math.abs(dx) >= Math.abs(dy)) dy = 0
+          else dx = 0
+        }
+        let x = snap(orig.x + dx)
+        let y = snap(orig.y + dy)
+        let r = store.getState().controller.r
+        // Pull the board flat against a wall once its port end is close to
+        // one, turning it to face out through it. Getting the connector
+        // through a wall is the entire job; alt drops out of the snap.
+        if (!e.altKey) {
+          const wallSnap = WALL_SNAP_PX / view.zoom
+          const centerSnap = CENTER_SNAP_PX / view.zoom
+          const rad = (r * Math.PI) / 180
+          // The connector end is what has to meet a wall.
+          const portX = x - Math.sin(rad) * half
+          const portY = y + Math.cos(rad) * half
+          const anchor = anchorOnWall(walls, portX, portY, reach)
+          const onWall = anchor !== null && anchor.distance < wallSnap
+          if (onWall && anchor) {
+            x = anchor.x
+            y = anchor.y
+            r = Math.round(anchor.r * 10) / 10
+          }
+          // Centre snap: ask where the wall would put the board if its
+          // connector end sat on the centre line, and take that placement.
+          // Re-anchoring rather than sliding along the wall already found is
+          // what makes this work on a curved case — the contour is
+          // tessellated into segments a fraction of a millimetre long, and a
+          // slide confined to one of them can never reach the centre.
+          if (centerX !== null && Math.abs(centerX - x) < centerSnap) {
+            const centred = anchorOnWall(walls, centerX, portY, reach)
+            if (centred && centred.distance < wallSnap) {
+              x = centred.x
+              y = centred.y
+              r = Math.round(centred.r * 10) / 10
+            } else if (!onWall) {
+              // Nothing to sit flush against; just centre it.
+              x = centerX
+            }
+          }
+        }
+        // One undo entry for the whole gesture, the way a key drag gets one.
+        coalesceUndo(gestureKey, () => store.getState().setController({ x, y, r }))
       } else if (mode.kind === 'drag') {
         const pt = toMM(e.clientX, e.clientY)
         let dx = pt.x - mode.start.x

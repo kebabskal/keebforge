@@ -4,6 +4,7 @@
 import {
   DEFAULT_BEZEL,
   DEFAULT_BOTTOM,
+  DEFAULT_CONTROLLER,
   DEFAULT_MATERIALS,
   DEFAULT_MOUNTING,
   DEFAULT_PLATE,
@@ -27,6 +28,7 @@ export function fromExample(over: Partial<Doc> = {}): Doc {
     bezel: { ...DEFAULT_BEZEL, ...parsed.bezel },
     bottom: { ...DEFAULT_BOTTOM, ...parsed.bottom },
     mounting: { ...DEFAULT_MOUNTING, ...parsed.mounting },
+    controller: { ...DEFAULT_CONTROLLER, ...parsed.controller },
     tilt: parsed.tilt ?? DEFAULT_TILT,
     materials: structuredClone(DEFAULT_MATERIALS),
     ...over,

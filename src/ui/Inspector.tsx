@@ -1,17 +1,28 @@
+import { useDeferredValue, useMemo } from 'react'
 import {
+  DEFAULT_BEZEL,
+  DEFAULT_BOTTOM,
+  DEFAULT_CONTROLLER,
+  DEFAULT_MOUNTING,
+  DEFAULT_PLATE,
   DEFAULT_TENT,
+  DEFAULT_TILT,
   isKeyMirrored,
   keyWorldXF,
   MATERIAL_PRESETS,
+  MCU_PRESETS,
   SWITCH_CLEARANCE,
+  USB_OPENING,
   type Group,
   type GroupLayout,
   type Key,
   type KeyType,
 } from '../model/keys'
-import { alignmentItems, coalesceUndo, groupMap, useDocStore } from '../model/store'
+import { alignmentItems, coalesceUndo, docOf, groupMap, useDocStore } from '../model/store'
 import {
   bezelShape,
+  controllerOverlaps,
+  controllerPortReaches,
   FOAM_CLEARANCE,
   foamWithCutouts,
   maxScrewInset,
@@ -78,6 +89,7 @@ function GroupPanel({ group }: { group: Group }) {
             max={180}
             step={1}
             unit="°"
+            reset={0}
             onCommit={(r) => updateGroup(group.id, { r })}
           />
         </div>
@@ -117,6 +129,7 @@ function GroupPanel({ group }: { group: Group }) {
                   max={20}
                   step={0.5}
                   unit="mm"
+                  reset={0}
                   onCommit={(gap) => updateGroupLayout(group.id, { ...layout, gap })}
                 />
                 <SliderField
@@ -126,6 +139,7 @@ function GroupPanel({ group }: { group: Group }) {
                   max={45}
                   step={1}
                   unit="°/key"
+                  reset={0}
                   onCommit={(curve) => updateGroupLayout(group.id, { ...layout, curve })}
                 />
               </>
@@ -230,6 +244,8 @@ function DocumentPanel() {
   const setBottom = useDocStore((s) => s.setBottom)
   const mounting = useDocStore((s) => s.mounting)
   const setMounting = useDocStore((s) => s.setMounting)
+  const controller = useDocStore((s) => s.controller)
+  const setController = useDocStore((s) => s.setController)
   const tilt = useDocStore((s) => s.tilt)
   const setTilt = useDocStore((s) => s.setTilt)
   const materials = useDocStore((s) => s.materials)
@@ -242,14 +258,30 @@ function DocumentPanel() {
       ? s.keys.filter((k) => isKeyMirrored(k, groupMap(s.groups))).length
       : 0,
   )
+  // Both checks need the case outline, and a zustand selector runs on every
+  // store update — which during a drag is every pointer move, synchronously.
+  // Keyed on a deferred copy of the controller instead, so a drag is not
+  // paying for a case rebuild per frame to keep a warning current.
+  const deferredController = useDeferredValue(controller)
+  const bezelEnabled = bezel.enabled
+  const { portReaches, overlaps } = useMemo(() => {
+    if (!deferredController.enabled) return { portReaches: true, overlaps: false }
+    // The rest of the document is read live; only the controller is taken
+    // from the deferred copy, so what is measured is what the deps say.
+    const doc = { ...docOf(useDocStore.getState()), controller: deferredController }
+    return {
+      portReaches: bezelEnabled ? controllerPortReaches(doc) : true,
+      overlaps: controllerOverlaps(doc),
+    }
+  }, [deferredController, bezelEnabled])
   const neededClearance = useDocStore((s) =>
     s.keys.reduce((m, k) => Math.max(m, SWITCH_CLEARANCE[k.type]), 0),
   )
 
   const exportDXF = (part: 'plate' | 'foam', filename: string) => {
-    const { keys, groups, mirror, plate, bezel, bottom, mounting, tilt, materials } =
+    const { keys, groups, mirror, plate, bezel, bottom, mounting, controller, tilt, materials } =
       useDocStore.getState()
-    const doc = { keys, groups, mirror, plate, bezel, bottom, mounting, tilt, materials }
+    const doc = { keys, groups, mirror, plate, bezel, bottom, mounting, controller, tilt, materials }
     const shapes = part === 'plate' ? plateWithCutouts(doc) : foamWithCutouts(doc)
     downloadText(filename, toDXF(shapes))
   }
@@ -318,6 +350,7 @@ function DocumentPanel() {
                 max={60}
                 step={1}
                 unit="°"
+                reset={DEFAULT_TENT}
                 onCommit={(tent) => setMirror({ tent })}
               />
               <SliderField
@@ -327,6 +360,7 @@ function DocumentPanel() {
                 max={45}
                 step={1}
                 unit="°"
+                reset={0}
                 onCommit={(rotation) => setMirror({ rotation })}
               />
             </>
@@ -338,6 +372,7 @@ function DocumentPanel() {
             max={25}
             step={0.5}
             unit="°"
+            reset={DEFAULT_TILT}
             onCommit={setTilt}
           />
         </div>
@@ -356,6 +391,7 @@ function DocumentPanel() {
             max={12}
             step={0.5}
             unit="mm"
+            reset={DEFAULT_PLATE.padding}
             onCommit={(padding) => setPlate({ padding })}
           />
         </div>
@@ -388,6 +424,7 @@ function DocumentPanel() {
           </label>
           <SliderField
             label="Width"
+            reset={DEFAULT_BEZEL.width}
             value={bezel.width}
             min={0}
             max={20}
@@ -402,6 +439,7 @@ function DocumentPanel() {
             max={5}
             step={0.25}
             unit="mm"
+            reset={DEFAULT_BEZEL.outset}
             onCommit={(outset) => setBezel({ outset })}
           />
           <SliderField
@@ -411,6 +449,7 @@ function DocumentPanel() {
             max={15}
             step={0.5}
             unit="mm"
+            reset={DEFAULT_BEZEL.height}
             onCommit={(height) => setBezel({ height })}
           />
           <SliderField
@@ -420,6 +459,7 @@ function DocumentPanel() {
             max={15}
             step={0.5}
             unit="mm"
+            reset={DEFAULT_BEZEL.radiusOuter}
             onCommit={(radiusOuter) => setBezel({ radiusOuter })}
           />
           <SliderField
@@ -429,6 +469,7 @@ function DocumentPanel() {
             max={10}
             step={0.5}
             unit="mm"
+            reset={DEFAULT_BEZEL.radiusInner}
             onCommit={(radiusInner) => setBezel({ radiusInner })}
           />
           <SliderField
@@ -438,6 +479,7 @@ function DocumentPanel() {
             max={5}
             step={0.25}
             unit="mm"
+            reset={DEFAULT_BEZEL.bevel}
             onCommit={(bevel) => setBezel({ bevel })}
           />
           <SliderField
@@ -447,6 +489,7 @@ function DocumentPanel() {
             max={6}
             step={0.1}
             unit="mm"
+            reset={DEFAULT_BEZEL.draft}
             onCommit={(draft) => setBezel({ draft })}
           />
           <SliderField
@@ -456,6 +499,7 @@ function DocumentPanel() {
             max={20}
             step={0.5}
             unit="mm"
+            reset={DEFAULT_BEZEL.draftStart}
             onCommit={(draftStart) => setBezel({ draftStart })}
           />
           <SliderField
@@ -465,6 +509,7 @@ function DocumentPanel() {
             max={40}
             step={1}
             unit="mm"
+            reset={DEFAULT_BEZEL.marginTop}
             onCommit={(v) => setBezel({ marginTop: v })}
           />
           <SliderField
@@ -474,6 +519,7 @@ function DocumentPanel() {
             max={40}
             step={1}
             unit="mm"
+            reset={DEFAULT_BEZEL.marginBottom}
             onCommit={(v) => setBezel({ marginBottom: v })}
           />
           {mirror.enabled ? (
@@ -484,6 +530,7 @@ function DocumentPanel() {
               max={40}
               step={1}
               unit="mm"
+              reset={DEFAULT_BEZEL.marginLeft}
               onCommit={(v) => setBezel({ marginLeft: v, marginRight: v })}
             />
           ) : (
@@ -495,6 +542,7 @@ function DocumentPanel() {
                 max={40}
                 step={1}
                 unit="mm"
+                reset={DEFAULT_BEZEL.marginLeft}
                 onCommit={(v) => setBezel({ marginLeft: v })}
               />
               <SliderField
@@ -504,6 +552,7 @@ function DocumentPanel() {
                 max={40}
                 step={1}
                 unit="mm"
+                reset={DEFAULT_BEZEL.marginRight}
                 onCommit={(v) => setBezel({ marginRight: v })}
               />
             </>
@@ -548,6 +597,7 @@ function DocumentPanel() {
             max={10}
             step={0.5}
             unit="mm"
+            reset={DEFAULT_BOTTOM.thickness}
             onCommit={(thickness) => setBottom({ thickness })}
           />
           <SliderField
@@ -557,6 +607,7 @@ function DocumentPanel() {
             max={10}
             step={0.5}
             unit="mm"
+            reset={DEFAULT_BOTTOM.inset}
             onCommit={(inset) => setBottom({ inset })}
           />
           <SliderField
@@ -566,6 +617,7 @@ function DocumentPanel() {
             max={15}
             step={0.5}
             unit="mm"
+            reset={neededClearance}
             onCommit={(clearance) => setBottom({ clearance })}
           />
           <SliderField
@@ -575,6 +627,7 @@ function DocumentPanel() {
             max={6}
             step={0.5}
             unit="mm"
+            reset={DEFAULT_BOTTOM.ridge}
             onCommit={(ridge) => setBottom({ ridge })}
           />
         </div>
@@ -613,6 +666,7 @@ function DocumentPanel() {
             max={100}
             step={5}
             unit="mm"
+            reset={DEFAULT_MOUNTING.spacing}
             onCommit={(spacing) => setMounting({ spacing })}
           />
         </div>
@@ -637,6 +691,165 @@ function DocumentPanel() {
           M2 self-tapping screws go up through the bottom lid into pilot holes
           in the bezel wall, spaced evenly along the wall. Spacing sets the
           target distance between screws.
+        </p>
+      </Section>
+      <Section id="doc-controller" title="Controller" defaultOpen={false}>
+        <div className="field-grid">
+          <label className="field field-check">
+            <span>Enabled</span>
+            <input
+              type="checkbox"
+              checked={controller.enabled}
+              onChange={(e) => setController({ enabled: e.target.checked })}
+            />
+          </label>
+          <label className="field">
+            <span>Mode</span>
+            <select
+              value={controller.mode}
+              onChange={(e) => setController({ mode: e.target.value as 'mcu' | 'pcb' })}
+            >
+              <option value="mcu">MCU module</option>
+              <option value="pcb">On the PCB</option>
+            </select>
+          </label>
+          {controller.mode === 'mcu' && (
+            <label className="field">
+              <span>Board</span>
+              <select
+                value={controller.preset}
+                onChange={(e) => {
+                  const preset = MCU_PRESETS.find((p) => p.id === e.target.value)
+                  setController(
+                    preset
+                      ? {
+                          preset: preset.id,
+                          length: preset.length,
+                          width: preset.width,
+                          portWidth: USB_OPENING[preset.usb].width,
+                          portHeight: USB_OPENING[preset.usb].height,
+                        }
+                      : { preset: 'custom' },
+                  )
+                }}
+              >
+                {MCU_PRESETS.map((preset) => (
+                  <option key={preset.id} value={preset.id}>
+                    {preset.name} ({preset.length} × {preset.width})
+                  </option>
+                ))}
+                <option value="custom">Custom</option>
+              </select>
+            </label>
+          )}
+          {controller.mode === 'mcu' && controller.preset === 'custom' && (
+            <>
+              <SliderField
+                label="Length"
+                value={controller.length}
+                min={10}
+                max={80}
+                step={0.1}
+                unit="mm"
+                reset={DEFAULT_CONTROLLER.length}
+                onCommit={(length) => setController({ length })}
+              />
+              <SliderField
+                label="Width"
+                reset={DEFAULT_CONTROLLER.width}
+                value={controller.width}
+                min={8}
+                max={40}
+                step={0.1}
+                unit="mm"
+                onCommit={(width) => setController({ width })}
+              />
+            </>
+          )}
+          {controller.mode === 'mcu' && (
+            <>
+              <NumberField
+                label="X (mm)"
+                value={controller.x}
+                step={1}
+                onCommit={(x) => setController({ x })}
+              />
+              <NumberField
+                label="Y (mm)"
+                value={controller.y}
+                step={1}
+                onCommit={(y) => setController({ y })}
+              />
+              <SliderField
+                label="Rotation"
+                reset={DEFAULT_CONTROLLER.r}
+                value={controller.r}
+                min={-180}
+                max={180}
+                step={5}
+                unit="°"
+                onCommit={(r) => setController({ r })}
+              />
+              <SliderField
+                label="Fit"
+                value={controller.fit}
+                min={0}
+                max={1}
+                step={0.05}
+                unit="mm"
+                reset={DEFAULT_CONTROLLER.fit}
+                onCommit={(fit) => setController({ fit })}
+              />
+            </>
+          )}
+          <SliderField
+            label="Port width"
+            value={controller.portWidth}
+            min={4}
+            max={20}
+            step={0.1}
+            unit="mm"
+            reset={DEFAULT_CONTROLLER.portWidth}
+            onCommit={(portWidth) => setController({ portWidth })}
+          />
+          <SliderField
+            label="Port height"
+            value={controller.portHeight}
+            min={2}
+            max={12}
+            step={0.1}
+            unit="mm"
+            reset={DEFAULT_CONTROLLER.portHeight}
+            onCommit={(portHeight) => setController({ portHeight })}
+          />
+        </div>
+        {controller.enabled && !bezel.enabled && (
+          <p className="hint hint-warn">
+            The opening is cut through the case wall, so it needs a bezel to
+            cut through — enable one to see it.
+          </p>
+        )}
+        {controller.enabled && overlaps && (
+          <p className="hint hint-warn">
+            The module runs into something sharing the cavity with it — a
+            switch body hanging below the plate, or the tray ridge around the
+            lid's edge. Drag it clear, or make room with a wider bezel margin.
+          </p>
+        )}
+        {controller.enabled && bezel.enabled && !portReaches && (
+          <p className="hint hint-warn">
+            The connector opening does not break through: the board's port end
+            has to sit inside the case with a wall in front of it. Move it
+            along X and Y until it meets one, or turn it with Rotation — at 0°
+            the connector points at the top of the board.
+          </p>
+        )}
+        <p className="hint">
+          {controller.mode === 'mcu'
+            ? 'A controller module held by four corner brackets rising off the tray floor, with its connector opening cut through the case wall. Drag it in the 2D view to place it — where it sits relative to the wall is the whole point, so put the port end against one. Rotation 0 points the connector at the top of the board. Fit is the slack between the board and its brackets — printed brackets come out a little fat, and a board that has to be forced in cannot come out again.'
+            : 'The controller sits on a full-size PCB under the plate, so only the connector opening is cut. Position it along the wall with X and Y.'}{' '}
+          On a split board each half gets its own controller; a mirrored
+          unibody keeps one.
         </p>
       </Section>
       <Section id="doc-materials" title="Materials" defaultOpen={false}>
@@ -863,6 +1076,7 @@ export function Inspector() {
             max={180}
             step={1}
             unit="°"
+            reset={0}
             onCommit={(r) => updateSelected({ r })}
           />
           <label className="field">

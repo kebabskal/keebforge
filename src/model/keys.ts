@@ -153,9 +153,13 @@ export interface BottomSettings {
   ridge: number
 }
 
-/** Clearance needed below the plate's underside per switch type, mm:
- * below-plate body (MX 5.0 / Choc 2.2 from the plate top) plus a 1.6 mm PCB
- * and hotswap socket (or the same room for handwired pins and wires). */
+/** How far a switch body hangs below the plate's top face, mm. Anything
+ * sharing the cavity has to pass under this or run into it. */
+export const SWITCH_LOWER: Record<KeyType, number> = { mx: 5.0, choc: 2.2 }
+
+/** Clearance needed below the plate's underside per switch type, mm: the
+ * below-plate body plus a 1.6 mm PCB and hotswap socket (or the same room
+ * for handwired pins and wires). */
 export const SWITCH_CLEARANCE: Record<KeyType, number> = { mx: 7, choc: 4.5 }
 
 export const DEFAULT_BOTTOM: BottomSettings = {
@@ -166,6 +170,90 @@ export const DEFAULT_BOTTOM: BottomSettings = {
   clearance: SWITCH_CLEARANCE.mx,
   ridge: 2.5,
 }
+
+// ---- Controller -----------------------------------------------------------
+
+/** A controller board that can sit in the case. `length` runs from the
+ * connector end inwards, `width` across it, both in mm — the board outline,
+ * not the pin pitch.
+ *
+ * Dimensions are the published ones where a board has them. Every
+ * Pro Micro-shaped board is 1.3 x 0.7 in, which is where 33.0 x 17.8 comes
+ * from; the odd-shaped boards are measured individually and differ by a
+ * millimetre or two, which is enough to matter inside a bracket. */
+export interface McuPreset {
+  id: string
+  name: string
+  length: number
+  width: number
+  usb: 'c' | 'micro'
+}
+
+export const MCU_PRESETS: McuPreset[] = [
+  { id: 'promicro', name: 'Pro Micro', length: 33, width: 17.8, usb: 'micro' },
+  { id: 'elitec', name: 'Elite-C', length: 33, width: 17.8, usb: 'c' },
+  { id: 'nicenano', name: 'nice!nano v2', length: 33, width: 17.8, usb: 'c' },
+  { id: 'kb2040', name: 'Adafruit KB2040', length: 33, width: 17.8, usb: 'c' },
+  { id: 'liatris', name: 'splitkb Liatris', length: 33, width: 17.8, usb: 'c' },
+  { id: 'promicrorp', name: 'SparkFun Pro Micro RP2040', length: 33, width: 17.8, usb: 'c' },
+  { id: 'rp2040zero', name: 'RP2040-Zero', length: 23.5, width: 18, usb: 'c' },
+  { id: 'tiny2040', name: 'Tiny 2040', length: 22.9, width: 18.2, usb: 'c' },
+  { id: 'qtpy', name: 'Adafruit QT Py RP2040', length: 21.8, width: 17.8, usb: 'c' },
+  { id: 'xiao', name: 'Seeed XIAO RP2040', length: 21, width: 17.5, usb: 'c' },
+  { id: 'pico', name: 'Raspberry Pi Pico', length: 51.3, width: 21, usb: 'micro' },
+  { id: 'stampy', name: 'Stampy', length: 57.3, width: 21.5, usb: 'c' },
+]
+
+/** Connector openings, mm. A USB-C receptacle is 8.94 x 3.16 and micro-USB
+ * 7.5 x 2.6; these add enough clearance that a cable's overmold clears the
+ * case face too, which is what actually decides the hole. */
+export const USB_OPENING: Record<McuPreset['usb'], { width: number; height: number }> = {
+  c: { width: 10.5, height: 4.5 },
+  micro: { width: 9.5, height: 4 },
+}
+
+export interface ControllerSettings {
+  enabled: boolean
+  /** `mcu` is a discrete module held in the case by corner brackets; `pcb`
+   * puts the controller on a full-size PCB under the plate, where the port is
+   * already part of the PCB and only the opening has to be cut. */
+  mode: 'mcu' | 'pcb'
+  /** Id from `MCU_PRESETS`, or `custom` to drive length/width by hand. */
+  preset: string
+  length: number
+  width: number
+  /** Board center in world mm. At r = 0 the connector end faces +y, so the
+   * board points at the top wall. */
+  x: number
+  y: number
+  r: number
+  /** Connector opening in the case face. */
+  portWidth: number
+  portHeight: number
+  /** Slack between the board's edge and the brackets holding it, per side.
+   * Printed brackets come out a little fat, and a board that has to be
+   * forced in is one that cannot come out again. */
+  fit: number
+}
+
+export const DEFAULT_CONTROLLER: ControllerSettings = {
+  enabled: false,
+  mode: 'mcu',
+  preset: 'promicro',
+  length: 33,
+  width: 17.8,
+  x: 0,
+  y: 0,
+  r: 0,
+  portWidth: USB_OPENING.micro.width,
+  portHeight: USB_OPENING.micro.height,
+  fit: 0.3,
+}
+
+/** Board thickness, mm. Every board in the list is on 1.6 mm FR-4; the
+ * components underneath are what actually set the standoff height, and that
+ * is the bracket's business rather than the board's. */
+export const MCU_THICKNESS = 1.6
 
 /** Case mounting: M2 self-tapping screws up through the bottom lid, biting
  * into pilot holes in the bezel wall. Screw positions are generated evenly
@@ -280,6 +368,7 @@ export interface Doc {
   bezel: BezelSettings
   bottom: BottomSettings
   mounting: MountingSettings
+  controller: ControllerSettings
   tilt: number
   materials: BoardMaterials
 }
@@ -674,6 +763,7 @@ export function defaultDoc(): Doc {
     bezel: { ...DEFAULT_BEZEL },
     bottom: { ...DEFAULT_BOTTOM },
     mounting: { ...DEFAULT_MOUNTING },
+    controller: { ...DEFAULT_CONTROLLER },
     tilt: DEFAULT_TILT,
     materials: structuredClone(DEFAULT_MATERIALS),
   }

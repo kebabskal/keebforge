@@ -26,9 +26,11 @@ import {
   type KeyType,
   type MirrorSettings,
   type MountingSettings,
+  type ControllerSettings,
   type PlateSettings,
   DEFAULT_BEZEL,
   DEFAULT_BOTTOM,
+  DEFAULT_CONTROLLER,
   DEFAULT_MATERIALS,
   DEFAULT_MOUNTING,
   DEFAULT_PLATE,
@@ -108,6 +110,7 @@ export interface DocState extends Doc {
   setBezel: (patch: Partial<BezelSettings>) => void
   setBottom: (patch: Partial<BottomSettings>) => void
   setMounting: (patch: Partial<MountingSettings>) => void
+  setController: (patch: Partial<ControllerSettings>) => void
   setTilt: (deg: number) => void
   setMaterial: (slot: MaterialSlot, patch: Partial<BoardMaterial>) => void
   /** Replace all materials at once (color presets). */
@@ -179,6 +182,13 @@ export function wholeSelectedGroup(state: {
   if (members.length !== state.selection.size) return null
   return members.every((id) => state.selection.has(id)) ? top : null
 }
+
+/** Stands in for the controller in `selection`, which otherwise holds key
+ * ids. Prefixed so it cannot collide with a generated id. Clicking the module
+ * selects it alone, but select-all takes it alongside the keys, so anything
+ * acting on a selection has to cope with it mixed in — and `commit` has to
+ * spare it from the prune that drops ids of keys an edit deleted. */
+export const CONTROLLER_ID = '__controller'
 
 export type AlignMode = 'left' | 'hcenter' | 'right' | 'top' | 'vcenter' | 'bottom'
 
@@ -354,6 +364,20 @@ export function normalizeBottom(raw: unknown): BottomSettings {
   return { ...DEFAULT_BOTTOM, ...(raw as Partial<BottomSettings>) }
 }
 
+/** Fill in defaults for docs saved before the controller existed. A doc that
+ * predates it has no board, so it comes back disabled rather than sprouting a
+ * Pro Micro in the middle of the board. */
+export function normalizeController(raw: unknown): ControllerSettings {
+  if (
+    !raw ||
+    typeof raw !== 'object' ||
+    typeof (raw as ControllerSettings).length !== 'number'
+  ) {
+    return { ...DEFAULT_CONTROLLER }
+  }
+  return { ...DEFAULT_CONTROLLER, ...(raw as Partial<ControllerSettings>) }
+}
+
 /** Fill in defaults; docs saved before surface finishes carried a `colors`
  * map of plain hex strings, which migrate onto the default finishes. */
 export function normalizeMaterials(raw: unknown, legacyColors?: unknown): BoardMaterials {
@@ -394,6 +418,7 @@ function loadSaved(): Doc | null {
       bezel: normalizeBezel(parsed.bezel),
       bottom: normalizeBottom(parsed.bottom),
       mounting: normalizeMounting(parsed.mounting),
+      controller: normalizeController(parsed.controller),
       tilt: typeof parsed.tilt === 'number' ? parsed.tilt : DEFAULT_TILT,
       materials: normalizeMaterials(parsed.materials, parsed.colors),
     }
@@ -422,7 +447,7 @@ export function coalesceUndo<T>(key: string, fn: () => T): T {
   }
 }
 
-const docOf = (s: Doc): Doc => ({
+export const docOf = (s: Doc): Doc => ({
   keys: s.keys,
   groups: s.groups,
   mirror: s.mirror,
@@ -430,6 +455,7 @@ const docOf = (s: Doc): Doc => ({
   bezel: s.bezel,
   bottom: s.bottom,
   mounting: s.mounting,
+  controller: s.controller,
   tilt: s.tilt,
   materials: s.materials,
 })
@@ -463,11 +489,16 @@ export const useDocStore = create<DocState>((set, get) => {
       bezel: patch.bezel ?? state.bezel,
       bottom: patch.bottom ?? state.bottom,
       mounting: patch.mounting ?? state.mounting,
+      controller: patch.controller ?? state.controller,
       tilt: patch.tilt ?? state.tilt,
       materials: patch.materials ?? state.materials,
       past: pushPast ? [...state.past.slice(-MAX_HISTORY + 1), prev] : state.past,
       future: [],
-      selection: new Set([...state.selection].filter((id) => alive.has(id))),
+      // The controller is not a key, so it has to survive the prune that
+      // drops ids of keys an edit deleted.
+      selection: new Set(
+        [...state.selection].filter((id) => alive.has(id) || id === CONTROLLER_ID),
+      ),
     })
   }
 
@@ -533,7 +564,13 @@ export const useDocStore = create<DocState>((set, get) => {
       set({ selection })
     },
     clearSelection: () => set({ selection: new Set() }),
-    selectAll: () => set({ selection: new Set(get().keys.map((k) => k.id)) }),
+    selectAll: () => {
+      const state = get()
+      const ids = state.keys.map((k) => k.id)
+      // The controller is part of the board, so select-all takes it too.
+      if (state.controller?.enabled) ids.push(CONTROLLER_ID)
+      set({ selection: new Set(ids) })
+    },
 
     addKey: (type) => {
       const { keys, selection } = get()
@@ -710,15 +747,29 @@ export const useDocStore = create<DocState>((set, get) => {
     rotateSelected: (deg) => {
       const state = get()
       if (state.selection.size === 0) return
+      // The controller can be selected alongside keys (Ctrl-A takes both), so
+      // it rides along in whichever commit runs rather than short-circuiting
+      // one of them.
+      const spun =
+        state.selection.has(CONTROLLER_ID) && state.controller.enabled
+          ? {
+              controller: {
+                ...state.controller,
+                r: Math.round((state.controller.r + deg) * 100) / 100,
+              },
+            }
+          : {}
       const whole = wholeSelectedGroup(state)
       if (whole) {
         commit({
+          ...spun,
           groups: state.groups.map((g) =>
             g.id === whole.id ? { ...g, r: Math.round((g.r + deg) * 100) / 100 } : g,
           ),
         })
       } else {
         commit({
+          ...spun,
           keys: state.keys.map((k) =>
             state.selection.has(k.id)
               ? { ...k, r: Math.round((k.r + deg) * 100) / 100 }
@@ -731,6 +782,13 @@ export const useDocStore = create<DocState>((set, get) => {
     nudgeSelected: (dx, dy) => {
       const state = get()
       if (state.selection.size === 0) return
+      if (state.selection.has(CONTROLLER_ID) && state.controller.enabled) {
+        commit({
+          controller: { ...state.controller, x: state.controller.x + dx, y: state.controller.y + dy },
+        })
+        // Keys move too when both are in hand.
+        if (state.selection.size === 1) return
+      }
       // Move in alignment units: a fully-selected group shifts its origin, so
       // stack-layout members aren't re-packed back to where they started.
       applyItemMoves(alignmentItems(state).map((item) => ({ item, dx, dy })))
@@ -1014,6 +1072,10 @@ export const useDocStore = create<DocState>((set, get) => {
       commit({ mounting: { ...get().mounting, ...patch } })
     },
 
+    setController: (patch) => {
+      commit({ controller: { ...get().controller, ...patch } })
+    },
+
     setTilt: (deg) => {
       commit({ tilt: deg })
     },
@@ -1086,7 +1148,11 @@ export const useDocStore = create<DocState>((set, get) => {
         ...prev,
         past: state.past.slice(0, -1),
         future: [docOf(state), ...state.future],
-        selection: new Set([...state.selection].filter((id) => alive.has(id))),
+        // The controller is not a key, so it has to survive the prune that
+      // drops ids of keys an edit deleted.
+      selection: new Set(
+        [...state.selection].filter((id) => alive.has(id) || id === CONTROLLER_ID),
+      ),
       })
     },
     redo: () => {
@@ -1099,7 +1165,11 @@ export const useDocStore = create<DocState>((set, get) => {
         ...next,
         past: [...state.past, docOf(state)],
         future: state.future.slice(1),
-        selection: new Set([...state.selection].filter((id) => alive.has(id))),
+        // The controller is not a key, so it has to survive the prune that
+      // drops ids of keys an edit deleted.
+      selection: new Set(
+        [...state.selection].filter((id) => alive.has(id) || id === CONTROLLER_ID),
+      ),
       })
     },
 
@@ -1112,6 +1182,7 @@ export const useDocStore = create<DocState>((set, get) => {
         bezel: normalizeBezel(doc.bezel),
         bottom: normalizeBottom(doc.bottom),
         mounting: normalizeMounting(doc.mounting),
+        controller: normalizeController(doc.controller),
         tilt: doc.tilt ?? DEFAULT_TILT,
         materials: normalizeMaterials(doc.materials),
       })
@@ -1151,6 +1222,7 @@ useDocStore.subscribe((state, prev) => {
           bezel: state.bezel,
           bottom: state.bottom,
           mounting: state.mounting,
+          controller: state.controller,
           tilt: state.tilt,
           materials: state.materials,
         }),

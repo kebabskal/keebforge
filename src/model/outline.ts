@@ -5,12 +5,15 @@ import {
   isKeyMirrored,
   keySize,
   keyWorldXF,
+  MCU_THICKNESS,
+  SWITCH_LOWER,
+  type ControllerSettings,
   type Doc,
   type Key,
   type XForm,
 } from './keys'
 import { groupMap } from './store'
-import { clipper2Requested, offsetMulti } from './offsetClipper2'
+import { clipper2Ready, clipper2Requested, offsetMulti } from './offsetClipper2'
 
 export type { MultiPolygon, Polygon, Ring }
 
@@ -22,7 +25,10 @@ export type { MultiPolygon, Polygon, Ring }
  * fidelity script — see `src/model/offsetClipper2.ts`. */
 export type OffsetBackend = 'legacy' | 'clipper2'
 
-let offsetBackendMode: OffsetBackend = clipper2Requested() ? 'clipper2' : 'legacy'
+// Clipper2 by default, and legacy whenever it is not there — either because
+// it was asked for, or because the WASM module failed to load.
+let offsetBackendMode: OffsetBackend =
+  clipper2Requested() && clipper2Ready() ? 'clipper2' : 'legacy'
 
 export function offsetBackend(): OffsetBackend {
   return offsetBackendMode
@@ -975,6 +981,7 @@ let solidsCache: {
   groups: Doc['groups']
   mirror: Doc['mirror']
   bezel: Doc['bezel']
+  controller: Doc['controller']
   result: BezelSolids[]
 } | null = null
 
@@ -987,7 +994,8 @@ function bezelSolids(doc: Doc): BezelSolids[] {
     solidsCache.keys === doc.keys &&
     solidsCache.groups === doc.groups &&
     solidsCache.mirror === doc.mirror &&
-    solidsCache.bezel === doc.bezel
+    solidsCache.bezel === doc.bezel &&
+    solidsCache.controller === doc.controller
   ) {
     return solidsCache.result
   }
@@ -997,6 +1005,7 @@ function bezelSolids(doc: Doc): BezelSolids[] {
     groups: doc.groups,
     mirror: doc.mirror,
     bezel: doc.bezel,
+    controller: doc.controller,
     result,
   }
   return result
@@ -1201,6 +1210,43 @@ export function bezelBoxes(doc: Doc): BoxRect[] {
   })
 }
 
+/** What the case has to grow around to contain a controller module: the
+ * board plus its brackets, pushed out by the wall width so the wall closes
+ * around them rather than cutting through.
+ *
+ * Without this a board placed past the edge of the key field simply has no
+ * case over it — the outline is built from the keys, and a controller is not
+ * a key. Only the outer solid gets it; putting it in the keycap opening
+ * would punch a hole in the bezel instead of bulging it.
+ *
+ * A PCB-mounted controller needs none of this: it is already under the plate,
+ * inside a cavity the keys defined. */
+function controllerHullPad(
+  doc: Doc,
+  half: 'both' | 'left' | 'right',
+  wall: number,
+): Polygon[] {
+  const c = doc.controller
+  if (!c?.enabled || c.mode !== 'mcu') return []
+  const frames = controllerFrames(doc)
+  // Sides come back in the same order controllerFrames does: the board you
+  // placed, then its mirror.
+  const picked =
+    half === 'both' ? frames : half === 'left' ? frames.slice(0, 1) : frames.slice(1)
+  if (picked.length === 0) return []
+  const pad = c.fit + BRACKET.wall
+  const solid = robustClip((s) => polygonClipping.union(s), [
+    ...picked.map((f) => rectPoly(f.xf, c.width + 2 * pad, c.length + 2 * pad)),
+  ])
+  // Past the wall *and* the tray ridge. Clearing only the wall grows the case
+  // so that the ridge — which sits inboard of it — lands right back on top of
+  // the board, and the collision check then flags a ridge that exists only
+  // because the module is there. Measured at 103 mm² of self-inflicted
+  // overlap on a default board.
+  const ridge = doc.bottom.enabled ? Math.max(0, doc.bottom.ridge ?? 0) : 0
+  return dilate(solid, wall + ridge + 0.5)
+}
+
 function bezelSolidsUncached(doc: Doc): BezelSolids[] {
   const bezel = doc.bezel
   if (!bezel.enabled || bezel.width <= 0) return []
@@ -1244,7 +1290,13 @@ function bezelSolidsUncached(doc: Doc): BezelSolids[] {
     let outer: MultiPolygon
     if (bezel.mode === 'tight') {
       outer = prep(
-        expandMargins(capUnion(bezel.outset + bezel.width, NUB_HEIGHT), margins),
+        expandMargins(
+          withArcBands(
+            capUnion(bezel.outset + bezel.width, NUB_HEIGHT),
+            controllerHullPad(doc, side.half, bezel.width),
+          ),
+          margins,
+        ),
         bezel.radiusOuter ?? 0,
       )
     } else {
@@ -1708,6 +1760,20 @@ export function subtractDiscs(
   }
 }
 
+/** Subtract arbitrary shapes rather than discs — the connector opening is a
+ * rectangle, and like the screw holes it only applies to the height band it
+ * actually passes through. Failure keeps the solid outline, on the grounds
+ * that a case with no hole beats no case at all. */
+export function subtractShapes(mp: MultiPolygon, cuts: MultiPolygon): MultiPolygon {
+  if (mp.length === 0 || cuts.length === 0) return mp
+  try {
+    return robustClip((s, c) => polygonClipping.difference(s, c!), mp, cuts)
+  } catch (error) {
+    console.warn('keebforge: opening cut failed, keeping solid outline', error)
+    return mp
+  }
+}
+
 /** Plate shape: the case cavity's contour (so the plate drops into the
  * shell without clipping), or the padded key outline when there is no case,
  * minus switch cutouts. Holes appear as extra rings within each polygon. */
@@ -1735,4 +1801,350 @@ export function foamWithCutouts(doc: Doc): MultiPolygon {
   if (outline.length === 0) return []
   const cutouts = switchCutouts(doc, FOAM_CLEARANCE)
   return robustClip((s, c) => polygonClipping.difference(s, c!), outline, cutouts)
+}
+
+// ---- Controller -----------------------------------------------------------
+
+/** Corner brackets that hold a controller module down: four L-shaped walls
+ * rising off the tray floor, each hugging one corner of the board from
+ * outside. Dimensions in mm. */
+export const BRACKET = {
+  /** Wall thickness of a bracket leg. */
+  wall: 1.6,
+  /** How far a bracket runs along the board's long edge. */
+  legLong: 7,
+  /** How far it runs along the short edge. */
+  legShort: 5,
+  /** How far the brackets stand above the board's top face. Enough to stop
+   * the board lifting, not so much that it cannot be pressed in past them. */
+  rise: 1.2,
+}
+
+/** How far the connector cut reaches out past the board's port end. It only
+ * ever gets subtracted from the wall ring, so overshooting the outside costs
+ * nothing — but a board parked well away from the wall will cut the nearest
+ * wall it does reach, which is why this is bounded rather than infinite. */
+const PORT_REACH = 25
+
+/** Where a controller board sits, in world space. `out` points from the
+ * board's center towards its connector end and `side` across it, so board
+ * coordinates are (u along out, v along side). */
+export interface ControllerFrame {
+  xf: XForm
+  out: Vec
+  side: Vec
+  /** Board center to connector end, and to a long edge. */
+  halfLength: number
+  halfWidth: number
+  /** Local (u, v) to world. */
+  at: (u: number, v: number) => XForm
+}
+
+function frameFor(doc: Doc, xf: XForm): ControllerFrame {
+  const rad = (xf.r * Math.PI) / 180
+  // r = 0 points the connector end at +y, so `out` is the frame's local +y
+  // and `side` its local +x — the same convention rectPoly uses, which lets
+  // every piece below be an axis-aligned rectangle in board space.
+  const out: Vec = { x: -Math.sin(rad), y: Math.cos(rad) }
+  const side: Vec = { x: Math.cos(rad), y: Math.sin(rad) }
+  return {
+    xf,
+    out,
+    side,
+    halfLength: doc.controller.length / 2,
+    halfWidth: doc.controller.width / 2,
+    at: (u, v) => ({
+      x: xf.x + out.x * u + side.x * v,
+      y: xf.y + out.y * u + side.y * v,
+      r: xf.r,
+    }),
+  }
+}
+
+/** Every controller on the board: one, or one per half on a split.
+ *
+ * A mirrored unibody has a single controller — mirroring it would put two
+ * boards in one case — but a split is two separate cases, and each needs its
+ * own. So the controller follows `split` rather than `enabled`. */
+export function controllerFrames(doc: Doc): ControllerFrame[] {
+  const c = doc.controller
+  if (!c?.enabled) return []
+  const own = frameFor(doc, { x: c.x, y: c.y, r: c.r })
+  if (!doc.mirror.enabled || !doc.mirror.split) return [own]
+  return [own, frameFor(doc, { x: 2 * doc.mirror.axis - c.x, y: c.y, r: -c.r })]
+}
+
+/** The board's own footprint — drawn in the editor, and the proxy the 3D
+ * preview stands in the case. */
+export function controllerBoards(doc: Doc): MultiPolygon {
+  return controllerFrames(doc).map((f) =>
+    rectPoly(f.xf, doc.controller.width, doc.controller.length),
+  )
+}
+
+/** Plan-view cut for the connector opening, to be subtracted from the wall
+ * ring over the opening's height band. Reaches from just inside the board's
+ * port end out through the wall. */
+export function controllerPortCuts(doc: Doc): MultiPolygon {
+  const c = doc.controller
+  const inset = 3
+  const depth = inset + PORT_REACH
+  return controllerFrames(doc).map((f) =>
+    rectPoly(f.at(f.halfLength - inset + depth / 2, 0), c.portWidth, depth),
+  )
+}
+
+/** Plan-view footprint of the corner brackets.
+ *
+ * Each corner gets two rectangles that the union merges into an L: one along
+ * the board's long edge and one across its short edge. At the connector end
+ * the short-edge leg is cut back so it cannot grow across the port — a
+ * bracket that reaches into the opening is a bracket you discover after
+ * printing. */
+export function controllerBrackets(doc: Doc): MultiPolygon {
+  const c = doc.controller
+  if (c.mode !== 'mcu') return []
+  const t = BRACKET.wall
+  const parts: Polygon[] = []
+  for (const f of controllerFrames(doc)) {
+    const a = f.halfLength + c.fit
+    const b = f.halfWidth + c.fit
+    for (const su of [1, -1] as const) {
+      for (const sv of [1, -1] as const) {
+        // Along the long edge, sitting just outside it. The long edges run
+        // along `out`, which is the frame's local y, so the leg's length is
+        // the rectangle's height and its wall thickness the width.
+        parts.push(
+          rectPoly(f.at(su * (a - BRACKET.legLong / 2), sv * (b + t / 2)), t, BRACKET.legLong),
+        )
+        // Across the short edge. At the connector end it has to stop clear of
+        // the opening, and if that leaves nothing worth printing it is
+        // dropped — the case wall is right there to stop the board anyway.
+        const legShort =
+          su > 0
+            ? Math.min(BRACKET.legShort, b - c.portWidth / 2 - 0.5)
+            : BRACKET.legShort
+        if (legShort <= 0.5) continue
+        parts.push(
+          rectPoly(
+            f.at(su * (a + t / 2), sv * (b + (t - legShort) / 2)),
+            legShort + t,
+            t,
+          ),
+        )
+      }
+    }
+  }
+  if (parts.length === 0) return []
+  return robustClip((s) => polygonClipping.union(s), parts)
+}
+
+/** Does the connector opening actually break through the case wall?
+ *
+ * Placing the board is fiddly — a millimetre too far out and the cut only
+ * nicks the wall's corner, a few too far in and it stops short of the outer
+ * face — and neither reads as wrong until the part is printed. Answered with
+ * two point-in-polygon tests rather than by clipping, since the inspector
+ * asks on every render: the port end has to sit inside the case, and the far
+ * end of its reach outside it. */
+export function controllerPortReaches(doc: Doc): boolean {
+  const frames = controllerFrames(doc)
+  if (frames.length === 0) return false
+  const shells = caseShells(doc)
+  if (shells.length === 0) return false
+  const inside = (mp: MultiPolygon, p: XForm) =>
+    mp.some((poly) =>
+      poly.every((ring, i) => {
+        let hit = false
+        for (let a = 0, b = ring.length - 2; a < ring.length - 1; b = a++) {
+          const [xi, yi] = ring[a]
+          const [xj, yj] = ring[b]
+          if (yi > p.y !== yj > p.y && p.x < ((xj - xi) * (p.y - yi)) / (yj - yi) + xi) {
+            hit = !hit
+          }
+        }
+        // Outer ring has to contain the point, holes have to not.
+        return i === 0 ? hit : !hit
+      }),
+    )
+  return frames.every((f) => {
+    const port = f.at(f.halfLength - 0.5, 0)
+    const beyond = f.at(f.halfLength + PORT_REACH, 0)
+    return shells.some(
+      (s) => inside(s.hull, port) && !inside(s.hull, beyond),
+    )
+  })
+}
+
+/** Is (x, y) on the controller board? Only the board you placed — on a split
+ * the mirrored copy follows it, so dragging that one would fight itself. */
+export function controllerHit(c: ControllerSettings, x: number, y: number): boolean {
+  if (!c.enabled) return false
+  const rad = (c.r * Math.PI) / 180
+  const dx = x - c.x
+  const dy = y - c.y
+  // Into board space: u along the connector axis, v across it.
+  const u = -Math.sin(rad) * dx + Math.cos(rad) * dy
+  const v = Math.cos(rad) * dx + Math.sin(rad) * dy
+  return Math.abs(u) <= c.length / 2 && Math.abs(v) <= c.width / 2
+}
+
+/** Where a controller would sit if it were pushed flat against a wall:
+ * centered on the wall face, connector end touching it, turned to face out
+ * through it. `distance` is how far the board's port end is from that face
+ * now, so a caller can decide whether the snap is close enough to want. */
+export interface WallAnchor {
+  x: number
+  y: number
+  r: number
+  distance: number
+}
+
+/** Nearest inside wall face to the board's port end.
+ *
+ * The whole job of placing a controller is getting its connector through a
+ * wall, and eyeballing that to within a millimetre is exactly the kind of
+ * thing a drag should do for you. Searched against the case interior, which
+ * is the face the board actually sits behind. */
+/** One straight run of the floor's boundary. */
+export interface WallSegment {
+  ax: number
+  ay: number
+  bx: number
+  by: number
+}
+
+/** How far the outermost part of the board stands from its center: the
+ * bracket on its end, not the board's own edge, plus a fifth of a millimetre
+ * so a snapped board is not exactly tangent to everything around it. */
+export function controllerReach(doc: Doc): number {
+  const c = doc.controller
+  if (!c) return 0
+  return c.length / 2 + (c.mode === 'mcu' ? c.fit + BRACKET.wall : 0) + 0.2
+}
+
+/** The floor's boundary as plain segments.
+ *
+ * `inner`, not `interior`: the tray ridge stands on the floor between the
+ * two, so a board pushed flat against the cavity wall would be sitting on top
+ * of it. `inner` is the floor the board can actually reach, and the two are
+ * the same contour when there is no ridge.
+ *
+ * Handed out as raw segments because the caller is a drag loop. Asking for
+ * the case on every pointer move costs two full rebuilds — the snapshot being
+ * snapped against and the live document being redrawn evict each other from a
+ * cache that holds one entry — which measured 240 ms a move on the legacy
+ * offset backend and simply froze the drag. Pulled out once, the search that
+ * follows is arithmetic. */
+export function innerWallSegments(doc: Doc): WallSegment[] {
+  const out: WallSegment[] = []
+  for (const shell of caseShells(doc)) {
+    for (const poly of shell.inner) {
+      // Outer ring only: a hole's faces look into the material, not out of it.
+      const ring = poly[0]
+      for (let i = 0; i < ring.length - 1; i++) {
+        out.push({ ax: ring[i][0], ay: ring[i][1], bx: ring[i + 1][0], by: ring[i + 1][1] })
+      }
+    }
+  }
+  return out
+}
+
+/** Nearest wall face to a point, as the placement that puts a controller's
+ * connector end flat against it, facing out. `distance` is how far the point
+ * is from that face now, so a caller can decide whether to take the snap. */
+export function anchorOnWall(
+  segments: WallSegment[],
+  x: number,
+  y: number,
+  reach: number,
+): WallAnchor | null {
+  let best: WallAnchor | null = null
+  for (const { ax, ay, bx, by } of segments) {
+    const ex = bx - ax
+    const ey = by - ay
+    const len2 = ex * ex + ey * ey
+    if (len2 < 1e-12) continue
+    const t = Math.max(0, Math.min(1, ((x - ax) * ex + (y - ay) * ey) / len2))
+    const px = ax + ex * t
+    const py = ay + ey * t
+    const distance = Math.hypot(x - px, y - py)
+    if (best && distance >= best.distance) continue
+    // Inner outer rings run counter-clockwise with the cavity on the left, so
+    // the wall faces right of travel.
+    const len = Math.sqrt(len2)
+    const nx = ey / len
+    const ny = -ex / len
+    best = {
+      x: px - nx * reach,
+      y: py - ny * reach,
+      // `out` is the frame's local +y, so its heading is atan2(-x, y).
+      r: (Math.atan2(-nx, ny) * 180) / Math.PI,
+      distance,
+    }
+  }
+  return best
+}
+
+/** Does the module run into anything it shares the cavity with?
+ *
+ * The test has to know about height, not just plan position. The board lies
+ * on the tray floor and the brackets stand 2.8 mm off it, while a switch body
+ * hangs down only as far as its own depth below the plate — on a default MX
+ * board those miss each other by nearly 2 mm, and calling that a collision
+ * would flag every placement on the board. So switches count as obstacles
+ * only when they actually reach down past the brackets.
+ *
+ * The tray ridge always counts: it runs from the lid right up to the plate's
+ * underside, so it blocks the full height of the cavity. */
+export function controllerOverlaps(doc: Doc): boolean {
+  const c = doc.controller
+  if (!c?.enabled || c.mode !== 'mcu') return false
+  const footprint = robustClip((s) => polygonClipping.union(s), [
+    ...controllerBoards(doc),
+    ...controllerBrackets(doc),
+  ])
+  if (footprint.length === 0) return false
+  const bracketTop = caseDims(doc).caseBottomY + MCU_THICKNESS + BRACKET.rise
+  // Switch bodies hang below y = 0, the plate's top face.
+  const deepest = doc.keys.reduce((m, k) => Math.max(m, SWITCH_LOWER[k.type]), 0)
+  const obstacles: MultiPolygon = [
+    ...(-deepest < bracketTop ? switchCutouts(doc) : []),
+    ...caseShells(doc).flatMap((s) => s.ridge),
+  ]
+  if (obstacles.length === 0) return false
+  try {
+    const hit = robustClip(
+      (s, cl) => polygonClipping.intersection(s, cl!),
+      footprint,
+      obstacles,
+    )
+    // By area, not by emptiness. Snapping puts the brackets flat against the
+    // wall, and the clipper answers an exactly-tangent pair with a zero-area
+    // sliver rather than nothing at all — which would report every snapped
+    // placement as a collision.
+    let overlap = 0
+    for (const poly of hit) {
+      for (const [i, ring] of poly.entries()) {
+        let s = 0
+        for (let k = 0; k < ring.length - 1; k++) {
+          s += ring[k][0] * ring[k + 1][1] - ring[k + 1][0] * ring[k][1]
+        }
+        overlap += (i === 0 ? 1 : -1) * Math.abs(s / 2)
+      }
+    }
+    return overlap > 0.5
+  } catch {
+    return false
+  }
+}
+
+/** How far up the connector opening reaches from the tray floor: the board's
+ * own thickness plus the opening itself. Both the case wall and the tray
+ * ridge have to be split at this height, since the connector passes through
+ * each of them on its way out. */
+export function controllerPortSpan(doc: Doc): number {
+  return doc.controller && controllerPortCuts(doc).length > 0
+    ? MCU_THICKNESS + doc.controller.portHeight
+    : 0
 }

@@ -64,11 +64,15 @@ export function SliderField(props: {
   step: number
   /** Unit suffix for the readout, e.g. "mm" or "°". */
   unit?: string
+  /** Value shift-clicking snaps back to. Omitted where a field has no
+   * meaningful default, in which case shift-click drags as usual. */
+  reset?: number
   onCommit: (value: number) => void
 }) {
   const session = useRef('')
+  const resettable = props.reset !== undefined
   return (
-    <label className="field field-slider">
+    <label className={`field field-slider${resettable ? ' field-resettable' : ''}`}>
       <span>
         {props.label}
         <em>
@@ -82,7 +86,19 @@ export function SliderField(props: {
         max={props.max}
         step={props.step}
         value={props.value}
-        onPointerDown={() => {
+        title={resettable ? `Shift-click to reset to ${fmt(props.reset!)}${props.unit ?? ''}` : undefined}
+        onPointerDown={(e) => {
+          // Shift-click puts the value back to its default. Handled on
+          // pointerdown and stopped there, because letting the range input
+          // see the click would first jerk the value to wherever on the
+          // track the pointer landed.
+          if (resettable && e.shiftKey) {
+            e.preventDefault()
+            e.stopPropagation()
+            session.current = newSession()
+            coalesceUndo(session.current, () => props.onCommit(props.reset!))
+            return
+          }
           session.current = newSession()
         }}
         onFocus={() => {
