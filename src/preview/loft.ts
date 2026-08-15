@@ -1,5 +1,6 @@
 import * as THREE from 'three'
 import { toCreasedNormals } from 'three/addons/utils/BufferGeometryUtils.js'
+import { erode, outlineDifference, simplify, type MultiPolygon, type Ring } from '../model/outline'
 
 /** Rings come from polygon-clipping with a duplicated closing point, and
  * exactly-tangent placements can leave coincident neighbours. Both produce
@@ -37,7 +38,13 @@ export interface LoftLevel {
  * along its corner bisector. Vertex count is preserved, so rings at adjacent
  * levels correspond one-to-one and can be lofted together. Relies on
  * polygon-clipping's canonical winding, which keeps material to the left of
- * the traversal for outer rings and holes alike. */
+ * the traversal for outer rings and holes alike.
+ *
+ * Only sound while `d` stays under the local feature size — a corner arc
+ * tighter than the offset folds the ring over itself. taperedSolid validates
+ * each offset and falls back to a morphological staircase when that happens;
+ * the countersink loft uses this unguarded, its rings being circles
+ * comfortably wider than their offsets. */
 export function offsetRingInward(ring: THREE.Vector2[], d: number): THREE.Vector2[] {
   const n = ring.length
   if (Math.abs(d) < 1e-9 || n < 3) return ring
@@ -64,18 +71,27 @@ export function offsetRingInward(ring: THREE.Vector2[], d: number): THREE.Vector
     bisector.normalize()
     // Travelling along the bisector overshoots the face offset by
     // 1/cos(half angle). Capped so a near-cusp corner can't shoot off.
-    const miter = Math.min(1 / Math.max(bisector.dot(n1), 1e-3), 4)
+    const miter = Math.min(1 / Math.max(bisector.dot(n1), 1e-3), 2)
     out.push(new THREE.Vector2(cur.x + bisector.x * d * miter, cur.y + bisector.y * d * miter))
   }
   return out
+}
+
+/** Clamp a top-edge chamfer so it cannot consume the part. Callers pass the
+ * same clamped value to taperedLevels and taperedSolid so the last band
+ * level and the chamfer meet at the same height. */
+export function clampBevel(bevel: number, thickness: number): number {
+  return Math.max(0, Math.min(bevel, thickness / 2 - 0.05))
 }
 
 /** Loft levels for a part whose outer face tapers with height. `insetAt`
  * gives the outer pull-in at any world height, so parts stacked along the
  * case continue one unbroken profile. `breaks` are world heights where that
  * profile changes slope — a level is planted at each one falling inside this
- * band, so the break lands exactly where asked even mid-part. `bevel`
- * chamfers the top edge, opening included. */
+ * band, so the break lands exactly where asked even mid-part. A top chamfer
+ * (`bevel`, pre-clamped via clampBevel) only shortens the band here — the
+ * chamfer surface itself is built by taperedSolid, which takes the same
+ * value. */
 export function taperedLevels(
   base: number,
   thickness: number,
@@ -83,8 +99,7 @@ export function taperedLevels(
   breaks: number[],
   bevel = 0,
 ): LoftLevel[] {
-  const b = Math.max(0, Math.min(bevel, thickness / 2 - 0.05))
-  const top = base + thickness - b
+  const top = base + thickness - bevel
   const levels: LoftLevel[] = [{ z: 0, outer: insetAt(base), hole: 0 }]
   for (const at of breaks) {
     if (at > base + 1e-6 && at < top - 1e-6) {
@@ -92,32 +107,17 @@ export function taperedLevels(
     }
   }
   levels.push({ z: top - base, outer: insetAt(top), hole: 0 })
-  // The chamfer pulls both boundaries in on top of whatever draft has
-  // already accumulated.
-  if (b > 0) levels.push({ z: thickness, outer: insetAt(top) + b, hole: b })
   return levels
 }
 
-/** A prism whose cross-section shifts with height, built in the XY plane and
- * rising along +Z the way an extrusion does. Draft taper, the break where the
- * taper starts, and the top chamfer are all just levels. ExtrudeGeometry
- * cannot express any of them: its bevel is symmetric across both caps, so it
- * can only pinch a part equally at each end. */
-export function loftRings(
-  rings: THREE.Vector2[][],
-  levels: LoftLevel[],
-  creaseAngle = Math.PI / 6,
-): THREE.BufferGeometry {
-  const slices = levels.map((level) =>
-    rings.map((ring, r) => offsetRingInward(ring, r === 0 ? level.outer : level.hole)),
-  )
-
-  // Each band and each cap is normalled on its own, then concatenated. Every
-  // boundary between them is a real edge — the break where the draft starts,
-  // the chamfer, the cap rims — and smoothing has to stop there. Creasing the
-  // whole part in one pass instead lets a vertex average its wall face with
-  // the cap face sitting on it, which tips the top and bottom rows of every
-  // band ~45° off and reads as banding down the side of the case.
+/** Collects normalled sub-meshes and concatenates them into one geometry.
+ * Each band and each cap is normalled on its own — every boundary between
+ * them is a real edge (draft break, chamfer, cap rims) and smoothing has to
+ * stop there. Creasing the whole part in one pass instead lets a vertex
+ * average its wall face with the cap face sitting on it, which tips the top
+ * and bottom rows of every band ~45° off and reads as banding down the side
+ * of the case. */
+function pieceCollector(creaseAngle: number) {
   const pieces: THREE.BufferGeometry[] = []
   const finish = (position: number[], crease: boolean) => {
     if (position.length === 0) return
@@ -134,36 +134,47 @@ export function loftRings(
     g.dispose()
     pieces.push(creased)
   }
+  const concat = (): THREE.BufferGeometry => {
+    const position: number[] = []
+    const normal: number[] = []
+    for (const piece of pieces) {
+      const p = piece.getAttribute('position')
+      const n = piece.getAttribute('normal')
+      for (let i = 0; i < p.count; i++) {
+        position.push(p.getX(i), p.getY(i), p.getZ(i))
+        normal.push(n.getX(i), n.getY(i), n.getZ(i))
+      }
+      piece.dispose()
+    }
+    const geo = new THREE.BufferGeometry()
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(position, 3))
+    geo.setAttribute('normal', new THREE.Float32BufferAttribute(normal, 3))
+    return geo
+  }
+  return { finish, concat }
+}
+
+/** A prism whose cross-section shifts with height, built in the XY plane and
+ * rising along +Z the way an extrusion does. Rings at every level come from
+ * offsetRingInward, so its feature-size caveat applies. */
+export function loftRings(
+  rings: THREE.Vector2[][],
+  levels: LoftLevel[],
+  creaseAngle = Math.PI / 6,
+): THREE.BufferGeometry {
+  const slices = levels.map((level) =>
+    rings.map((ring, r) => offsetRingInward(ring, r === 0 ? level.outer : level.hole)),
+  )
+  const { finish, concat } = pieceCollector(creaseAngle)
 
   for (let k = 0; k + 1 < slices.length; k++) {
-    const z0 = levels[k].z
-    const z1 = levels[k + 1].z
-    const band: number[] = []
-    const push = (p: THREE.Vector2, z: number) => band.push(p.x, p.y, z)
-    for (let r = 0; r < rings.length; r++) {
-      const lo = slices[k][r]
-      const hi = slices[k + 1][r]
-      for (let i = 0; i < lo.length; i++) {
-        const j = (i + 1) % lo.length
-        // Wound so the face normal points out of the material: for a ring
-        // traversed with material on its left, that is to the right.
-        push(lo[i], z0)
-        push(lo[j], z0)
-        push(hi[j], z1)
-        push(lo[i], z0)
-        push(hi[j], z1)
-        push(hi[i], z1)
-      }
-    }
-    finish(band, true)
+    loftBand(finish, slices[k], levels[k].z, slices[k + 1], levels[k + 1].z)
   }
 
   // Caps come from the same offset rings, so they meet the walls exactly.
   // They are triangulated on the un-offset rings and only then mapped to
-  // their offset positions: a large offset can fold a ring over itself
-  // locally, and ear-cutting the folded polygon directly produces stray
-  // faces whose edges match no wall — index-mapped triangulation keeps the
-  // cap topologically consistent with the bands whatever the offsets do.
+  // their offset positions, which keeps every cap edge matched to a wall
+  // edge whatever the offsets do.
   const faces = THREE.ShapeUtils.triangulateShape(rings[0], rings.slice(1))
   for (const index of [0, slices.length - 1]) {
     const pts = slices[index].flat()
@@ -181,19 +192,282 @@ export function loftRings(
     finish(capPos, false)
   }
 
-  const position: number[] = []
-  const normal: number[] = []
-  for (const piece of pieces) {
-    const p = piece.getAttribute('position')
-    const n = piece.getAttribute('normal')
-    for (let i = 0; i < p.count; i++) {
-      position.push(p.getX(i), p.getY(i), p.getZ(i))
-      normal.push(n.getX(i), n.getY(i), n.getZ(i))
+  return concat()
+}
+
+type Finish = (position: number[], crease: boolean) => void
+
+/** Wall band between two slices with identical ring topology. Wound so the
+ * face normal points out of the material: for a ring traversed with material
+ * on its left, that is to the right — outer rings and holes alike. Vertical
+ * walls are the lo === hi case. */
+function loftBand(
+  finish: Finish,
+  lo: THREE.Vector2[][],
+  z0: number,
+  hi: THREE.Vector2[][],
+  z1: number,
+) {
+  const band: number[] = []
+  for (let r = 0; r < lo.length; r++) {
+    const a = lo[r]
+    const b = hi[r]
+    for (let i = 0; i < a.length; i++) {
+      const j = (i + 1) % a.length
+      band.push(a[i].x, a[i].y, z0, a[j].x, a[j].y, z0, b[j].x, b[j].y, z1)
+      band.push(a[i].x, a[i].y, z0, b[j].x, b[j].y, z1, b[i].x, b[i].y, z1)
     }
-    piece.dispose()
   }
-  const geo = new THREE.BufferGeometry()
-  geo.setAttribute('position', new THREE.Float32BufferAttribute(position, 3))
-  geo.setAttribute('normal', new THREE.Float32BufferAttribute(normal, 3))
-  return geo
+  finish(band, true)
+}
+
+/** Flat region triangulated at height z. Faces up unless `down`. */
+function flatRegion(finish: Finish, region: MultiPolygon, z: number, down = false) {
+  const pos: number[] = []
+  for (const poly of region) {
+    const contour = ringToVec(poly[0] as [number, number][])
+    if (contour.length < 3) continue
+    const holes = poly.slice(1).map((ring) => ringToVec(ring as [number, number][]))
+    const faces = THREE.ShapeUtils.triangulateShape(contour, holes)
+    const pts = [contour, ...holes].flat()
+    for (const face of faces) {
+      for (const o of down ? [2, 1, 0] : [0, 1, 2]) {
+        const p = pts[face[o]]
+        pos.push(p.x, p.y, z)
+      }
+    }
+  }
+  finish(pos, false)
+}
+
+/** True if any two non-adjacent edges of the ring set cross or overlap — the
+ * signature of an offset that folded. Also rejects rings whose orientation
+ * flipped outright (an offset past the ring's own size). Sweep over edges
+ * sorted by min-x keeps the pair test near-linear on real outlines. */
+function ringsFold(offset: THREE.Vector2[][], original: THREE.Vector2[][]): boolean {
+  for (let r = 0; r < offset.length; r++) {
+    const area = (ring: THREE.Vector2[]) => {
+      let a = 0
+      for (let i = 0; i < ring.length; i++) {
+        const j = (i + 1) % ring.length
+        a += ring[i].x * ring[j].y - ring[j].x * ring[i].y
+      }
+      return a / 2
+    }
+    const a0 = area(original[r])
+    const a1 = area(offset[r])
+    if (Math.abs(a0) > 1e-9 && a1 * a0 <= 0) return true
+  }
+  interface Edge {
+    ax: number
+    ay: number
+    bx: number
+    by: number
+    ring: number
+    idx: number
+    n: number
+    minX: number
+    maxX: number
+    minY: number
+    maxY: number
+  }
+  const edges: Edge[] = []
+  offset.forEach((ring, r) => {
+    for (let i = 0; i < ring.length; i++) {
+      const a = ring[i]
+      const b = ring[(i + 1) % ring.length]
+      edges.push({
+        ax: a.x, ay: a.y, bx: b.x, by: b.y,
+        ring: r, idx: i, n: ring.length,
+        minX: Math.min(a.x, b.x), maxX: Math.max(a.x, b.x),
+        minY: Math.min(a.y, b.y), maxY: Math.max(a.y, b.y),
+      })
+    }
+  })
+  edges.sort((p, q) => p.minX - q.minX)
+  const EPS = 1e-9
+  const cross = (ox: number, oy: number, px: number, py: number, qx: number, qy: number) =>
+    (px - ox) * (qy - oy) - (py - oy) * (qx - ox)
+  for (let i = 0; i < edges.length; i++) {
+    const e = edges[i]
+    for (let k = i + 1; k < edges.length; k++) {
+      const f = edges[k]
+      if (f.minX > e.maxX) break
+      if (f.minY > e.maxY || f.maxY < e.minY) continue
+      if (e.ring === f.ring) {
+        const d = Math.abs(e.idx - f.idx)
+        if (d <= 1 || d === e.n - 1) continue
+      }
+      const d1 = cross(e.ax, e.ay, e.bx, e.by, f.ax, f.ay)
+      const d2 = cross(e.ax, e.ay, e.bx, e.by, f.bx, f.by)
+      const d3 = cross(f.ax, f.ay, f.bx, f.by, e.ax, e.ay)
+      const d4 = cross(f.ax, f.ay, f.bx, f.by, e.bx, e.by)
+      if (
+        ((d1 > EPS && d2 < -EPS) || (d1 < -EPS && d2 > EPS)) &&
+        ((d3 > EPS && d4 < -EPS) || (d3 < -EPS && d4 > EPS))
+      ) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+const closeRing = (ring: THREE.Vector2[]): Ring => {
+  const r: Ring = ring.map((v) => [v.x, v.y] as Ring[number])
+  r.push(r[0])
+  return r
+}
+
+/** How fine the staircase fallback steps: treads and rises both stay near a
+ * typical print layer, so the stepped face is invisible in the print. The
+ * preview passes stepScale 2 for half the clipping work per rebuild. */
+const STEP_RISE = 0.5
+const STEP_TREAD = 0.3
+
+/** A drafted prism, built exactly where possible and robustly everywhere.
+ *
+ * Each tapered segment first tries the smooth loft: bisector-offset rings
+ * bridged by ruled walls. That is the exact surface, but it folds over
+ * itself wherever the inset exceeds a local feature — a corner arc tighter
+ * than the offset, two scallop lobes closer than twice the draft — and the
+ * fold is a self-intersection slicers reject. So every offset is validated
+ * (ringsFold), and a folding segment falls back to a morphological
+ * staircase: thin vertical extrusions of contours successively *eroded*
+ * with polygon clipping — the same machinery the outlines are generated
+ * with, where lobes merge instead of crossing — with flat treads between
+ * steps. Holes rise vertically; the top chamfer offsets holes too, so the
+ * opening chamfers with the rim. */
+export function taperedSolid(
+  rings: THREE.Vector2[][],
+  levels: LoftLevel[],
+  bevel = 0,
+  creaseAngle = Math.PI / 6,
+  stepScale = 1,
+): THREE.BufferGeometry {
+  const { finish, concat } = pieceCollector(creaseAngle)
+  const holes = rings.slice(1)
+  const holesMp: MultiPolygon = holes.map((r) => [closeRing(r)])
+
+  // Erosion sprinkles disc-sampled vertices along every concave stretch;
+  // simplifying the result keeps repeated offsets from compounding them.
+  const safeErode = (mp: MultiPolygon, r: number): MultiPolygon | null => {
+    try {
+      const out = simplify(erode(mp, r), 0.02)
+      return out.length > 0 ? out : null
+    } catch (error) {
+      console.warn('keebforge: taper erosion failed, keeping straight face', error)
+      return null
+    }
+  }
+  const safeDiff = (a: MultiPolygon, b: MultiPolygon): MultiPolygon => {
+    try {
+      return outlineDifference(a, b)
+    } catch (error) {
+      console.warn('keebforge: taper clipping failed, keeping unclipped face', error)
+      return a
+    }
+  }
+  const mpOf = (outers: THREE.Vector2[][]): MultiPolygon => outers.map((r) => [closeRing(r)])
+  const vecsOf = (mp: MultiPolygon): THREE.Vector2[][] =>
+    mp.flatMap((poly) => poly.map((ring) => ringToVec(ring as [number, number][])))
+
+  /** Staircase from `from` up to z1, eroding `total` in all: vertical wall
+   * up to each step boundary, then a smaller cross-section above it. Every
+   * step erodes from the base with a growing radius rather than chaining
+   * erosions — the result is the same (erosion composes) but vertex counts
+   * stay flat. Returns the top cross-section.
+   *
+   * Each erosion interface is emitted as a full up-facing cap of the section
+   * below plus a full down-facing cap of the section above. Where the two
+   * coincide the faces cancel; the exposed tread ring survives. Clipping the
+   * tread ring out directly would tie the mesh to another clipper run whose
+   * output vertices need not match the contours' — this way every face
+   * reuses the contour rings verbatim and the joints are exact by
+   * construction. The chamfer passes cross-sections with the holes folded in
+   * (`holed`), so erosion widens them and their walls ride along; segment
+   * drafts erode the outer contour alone, with hole walls emitted full-height
+   * by the caller — the caps' hole edges pair with each other. */
+  const staircase = (
+    from: MultiPolygon,
+    z0: number,
+    z1: number,
+    total: number,
+    holed: boolean,
+  ): MultiPolygon => {
+    const steps = Math.max(
+      1,
+      Math.ceil((z1 - z0) / (STEP_RISE * stepScale)),
+      Math.ceil(total / (STEP_TREAD * stepScale)),
+    )
+    const capRegion = (mp: MultiPolygon) => (holed ? mp : safeDiff(mp, holesMp))
+    let cur = from
+    for (let s = 0; s < steps; s++) {
+      const zA = z0 + ((z1 - z0) * s) / steps
+      const zB = z0 + ((z1 - z0) * (s + 1)) / steps
+      const walls = vecsOf(cur)
+      loftBand(finish, walls, zA, walls, zB)
+      const next = safeErode(from, (total * (s + 1)) / steps)
+      if (!next) {
+        // No material left (or clipping failed): wall up the rest and stop.
+        if (s + 1 < steps) loftBand(finish, walls, zB, walls, z1)
+        return cur
+      }
+      flatRegion(finish, capRegion(cur), zB)
+      flatRegion(finish, capRegion(next), zB, true)
+      cur = next
+    }
+    return cur
+  }
+
+  // The outer contour walks up the levels. Its own base inset may start
+  // above zero when the part continues a draft begun by the part below it;
+  // erosion (not a bisector offset) keeps that base identical to the top of
+  // the part underneath, which used erosion for the same stretch.
+  let outers: THREE.Vector2[][] = [rings[0]]
+  if (levels[0].outer > 1e-6) {
+    const eroded = safeErode(mpOf(outers), levels[0].outer)
+    if (eroded) outers = vecsOf(eroded)
+  }
+
+  flatRegion(finish, safeDiff(mpOf(outers), holesMp), levels[0].z, true)
+
+  for (let k = 0; k + 1 < levels.length; k++) {
+    const z0 = levels[k].z
+    const z1 = levels[k + 1].z
+    const delta = levels[k + 1].outer - levels[k].outer
+    if (delta > 1e-6) {
+      const cand = outers.map((r) => offsetRingInward(r, delta))
+      if (!ringsFold([...cand, ...holes], [...outers, ...holes])) {
+        loftBand(finish, outers, z0, cand, z1)
+        outers = cand
+      } else {
+        outers = vecsOf(staircase(mpOf(outers), z0, z1, delta, false))
+      }
+    } else {
+      loftBand(finish, outers, z0, outers, z1)
+    }
+    loftBand(finish, holes, z0, holes, z1)
+  }
+
+  // Top: chamfered (outer pulled in, holes widened), or a flat cap when
+  // there is no bevel or no room for one.
+  const zTop = levels[levels.length - 1].z
+  if (bevel > 1e-6) {
+    // Positive offsets move every ring into the material: the outer edge
+    // pulls in and the openings widen, which is what a chamfer does to both.
+    const all = [...outers, ...holes]
+    const cand = all.map((r) => offsetRingInward(r, bevel))
+    if (outers.length === 1 && !ringsFold(cand, all)) {
+      loftBand(finish, all, zTop, cand, zTop + bevel)
+      flatRegion(finish, [cand.map(closeRing)], zTop + bevel)
+      return concat()
+    }
+    const part = safeDiff(mpOf(outers), holesMp)
+    const top = staircase(part, zTop, zTop + bevel, bevel, true)
+    flatRegion(finish, top, zTop + bevel)
+    return concat()
+  }
+  flatRegion(finish, safeDiff(mpOf(outers), holesMp), zTop)
+  return concat()
 }

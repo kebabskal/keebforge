@@ -14,10 +14,12 @@ import {
   type MultiPolygon,
 } from '../model/outline'
 import {
+  clampBevel,
   loftRings,
   ringToVec,
   shapeFromRings,
   taperedLevels,
+  taperedSolid,
   type LoftLevel,
 } from '../preview/loft'
 
@@ -60,6 +62,16 @@ function lofted(mp: MultiPolygon, levels: LoftLevel[], z: number): Solid[] {
   return out
 }
 
+function taperedLofted(mp: MultiPolygon, levels: LoftLevel[], z: number, bevel: number): Solid[] {
+  const out: Solid[] = []
+  for (const poly of clean(mp)) {
+    const rings = poly.map((ring) => ringToVec(ring as [number, number][]))
+    if (rings[0].length < 3) continue
+    out.push({ geo: taperedSolid(rings, levels, bevel), z })
+  }
+  return out
+}
+
 /** Top case shell, matching the 3D preview: wall band with blind screw
  * pilots, rim band above, one continuous draft profile across both. The lid
  * plane sits at z = 0, so the part rests upright on the bed opening-up. A
@@ -70,14 +82,17 @@ export function topCaseSolids(doc: Doc): Solid[] {
   const screws = screwPositions(doc)
   const pilotH = Math.min(SCREW.bite, dims.wallH)
   const solids: Solid[] = []
-  const tapered = (mp: MultiPolygon, thickness: number, y: number, bevel = 0) =>
+  const tapered = (mp: MultiPolygon, thickness: number, y: number, bevel = 0) => {
+    const b = clampBevel(bevel, thickness)
     solids.push(
-      ...lofted(
+      ...taperedLofted(
         mp,
-        taperedLevels(y, thickness, dims.insetAt, dims.breaks, bevel),
+        taperedLevels(y, thickness, dims.insetAt, dims.breaks, b),
         y - dims.caseBottomY,
+        b,
       ),
     )
+  }
   for (const shell of caseShells(doc)) {
     if (screws.length > 0) {
       tapered(subtractDiscs(shell.wall, screws, SCREW.pilotR), pilotH, dims.caseBottomY)

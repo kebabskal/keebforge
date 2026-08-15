@@ -160,7 +160,7 @@ function dilate(mp: MultiPolygon, r: number): MultiPolygon {
 /** Approximate Minkowski erosion by a disc of radius r: subtract the band
  * within r of the boundary. Straight edges are reconstructed exactly (the
  * strip's inner edge), so dilate-then-erode round-trips cleanly. */
-function erode(mp: MultiPolygon, r: number): MultiPolygon {
+export function erode(mp: MultiPolygon, r: number): MultiPolygon {
   if (mp.length === 0 || r <= 0) return mp
   const band = robustClip((s) => polygonClipping.union(s), offsetBand(mp, r, 'in'))
   return dropDebris(
@@ -1152,6 +1152,14 @@ export function screwPositions(doc: Doc): [number, number][] {
     result,
   }
   return result
+}
+
+/** Robust polygon difference for downstream geometry (chamfer bands). May
+ * throw on degenerate input like the clipper it wraps — callers degrade. */
+export function outlineDifference(a: MultiPolygon, b: MultiPolygon): MultiPolygon {
+  if (a.length === 0) return []
+  if (b.length === 0) return a
+  return robustClip((s, c) => polygonClipping.difference(s, c!), a, b)
 }
 
 /** Vertical dimensions of the case stack and the outer face's draft profile,

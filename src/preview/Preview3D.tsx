@@ -32,7 +32,7 @@ import {
 import { groupMap, useDocStore } from '../model/store'
 import { useTheme } from '../ui/theme'
 import { capGeo, CAP_PROFILE, frustumGeo } from './capGeometry'
-import { loftRings, ringToVec, shapeFromRings, taperedLevels } from './loft'
+import { clampBevel, ringToVec, shapeFromRings, taperedLevels, taperedSolid } from './loft'
 import { ViewBar } from './ViewBar'
 import { useViewSettings } from './viewSettings'
 
@@ -492,12 +492,15 @@ export function Preview3D() {
         breaks: number[],
         bevel = 0,
       ) => {
-        const levels = taperedLevels(y, thickness, insetAt, breaks, bevel)
+        const b = clampBevel(bevel, thickness)
+        const levels = taperedLevels(y, thickness, insetAt, breaks, b)
         for (const poly of mp) {
           const rings = poly.map((ring) => ringToVec(ring as [number, number][]))
           if (rings[0].length < 3) continue
           placePart(
-            loftRings(rings, levels), poly[0] as [number, number][],
+            // Coarser staircase steps than the export: half the clipping
+            // work on every rebuild, invisible at preview scale.
+            taperedSolid(rings, levels, b, Math.PI / 6, 2), poly[0] as [number, number][],
             part, y, material, shadows, true,
           )
         }
