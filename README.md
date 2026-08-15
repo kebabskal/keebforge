@@ -12,7 +12,7 @@ Visual designer for ergonomic keyboard layouts, in the browser.
 - Live mirroring for split layouts
 - Key labels
 - Realistic 3D preview (PCB, switches, keycaps)
-- Export: DXF/STEP for Fusion 360, KiCad PCB → gerbers for JLCPCB
+- Export: DXF/STEP for Fusion 360, STL for 3D printing, KiCad PCB → gerbers for JLCPCB
 
 ## Development
 

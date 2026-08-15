@@ -70,6 +70,34 @@ export function offsetRingInward(ring: THREE.Vector2[], d: number): THREE.Vector
   return out
 }
 
+/** Loft levels for a part whose outer face tapers with height. `insetAt`
+ * gives the outer pull-in at any world height, so parts stacked along the
+ * case continue one unbroken profile. `breaks` are world heights where that
+ * profile changes slope — a level is planted at each one falling inside this
+ * band, so the break lands exactly where asked even mid-part. `bevel`
+ * chamfers the top edge, opening included. */
+export function taperedLevels(
+  base: number,
+  thickness: number,
+  insetAt: (worldY: number) => number,
+  breaks: number[],
+  bevel = 0,
+): LoftLevel[] {
+  const b = Math.max(0, Math.min(bevel, thickness / 2 - 0.05))
+  const top = base + thickness - b
+  const levels: LoftLevel[] = [{ z: 0, outer: insetAt(base), hole: 0 }]
+  for (const at of breaks) {
+    if (at > base + 1e-6 && at < top - 1e-6) {
+      levels.push({ z: at - base, outer: insetAt(at), hole: 0 })
+    }
+  }
+  levels.push({ z: top - base, outer: insetAt(top), hole: 0 })
+  // The chamfer pulls both boundaries in on top of whatever draft has
+  // already accumulated.
+  if (b > 0) levels.push({ z: thickness, outer: insetAt(top) + b, hole: b })
+  return levels
+}
+
 /** A prism whose cross-section shifts with height, built in the XY plane and
  * rising along +Z the way an extrusion does. Draft taper, the break where the
  * taper starts, and the top chamfer are all just levels. ExtrudeGeometry
@@ -131,19 +159,24 @@ export function loftRings(
   }
 
   // Caps come from the same offset rings, so they meet the walls exactly.
+  // They are triangulated on the un-offset rings and only then mapped to
+  // their offset positions: a large offset can fold a ring over itself
+  // locally, and ear-cutting the folded polygon directly produces stray
+  // faces whose edges match no wall — index-mapped triangulation keeps the
+  // cap topologically consistent with the bands whatever the offsets do.
+  const faces = THREE.ShapeUtils.triangulateShape(rings[0], rings.slice(1))
   for (const index of [0, slices.length - 1]) {
-    const cap = new THREE.ShapeGeometry(shapeFromRings(slices[index]))
-    const flat = cap.toNonIndexed()
-    cap.dispose()
-    const p = flat.getAttribute('position')
+    const pts = slices[index].flat()
     const z = levels[index].z
     const capPos: number[] = []
-    // ShapeGeometry faces +Z; the bottom cap has to look the other way.
+    // Triangulation faces +Z; the bottom cap has to look the other way.
     const order = index === 0 ? [2, 1, 0] : [0, 1, 2]
-    for (let i = 0; i + 2 < p.count; i += 3) {
-      for (const o of order) capPos.push(p.getX(i + o), p.getY(i + o), z)
+    for (const face of faces) {
+      for (const o of order) {
+        const p = pts[face[o]]
+        capPos.push(p.x, p.y, z)
+      }
     }
-    flat.dispose()
     // A cap is planar, so face normals are already the right answer.
     finish(capPos, false)
   }

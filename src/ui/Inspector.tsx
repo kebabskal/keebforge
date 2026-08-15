@@ -18,6 +18,7 @@ import {
   plateWithCutouts,
 } from '../model/outline'
 import { downloadText, toDXF } from '../export/dxf'
+import { bottomSolids, downloadSTL, plateSolids, topCaseSolids } from '../export/stl'
 import { NumberField, Section, SliderField, TextField } from './fields'
 
 function GroupPanel({ group }: { group: Group }) {
@@ -251,6 +252,18 @@ function DocumentPanel() {
     const doc = { keys, groups, mirror, plate, bezel, bottom, mounting, tilt, materials }
     const shapes = part === 'plate' ? plateWithCutouts(doc) : foamWithCutouts(doc)
     downloadText(filename, toDXF(shapes))
+  }
+
+  const exportSTL = (part: 'case' | 'bottom' | 'plate') => {
+    const doc = useDocStore.getState()
+    const solids =
+      part === 'case'
+        ? topCaseSolids(doc)
+        : part === 'bottom'
+          ? bottomSolids(doc)
+          : plateSolids(doc)
+    const name = { case: 'case-top', bottom: 'case-bottom', plate: 'plate' }[part]
+    if (solids.length > 0) downloadSTL(`keebforge-${name}.stl`, solids)
   }
 
   return (
@@ -739,6 +752,31 @@ function DocumentPanel() {
             Bezel DXF
           </button>
         </div>
+        <div className="button-row">
+          <button
+            disabled={!bezel.enabled || bezel.width <= 0}
+            title="Top case shell with screw pilots and draft, ready to print"
+            onClick={() => exportSTL('case')}
+          >
+            Case STL
+          </button>
+          <button
+            disabled={!bottom.enabled}
+            title="Bottom tray with countersunk screw seats"
+            onClick={() => exportSTL('bottom')}
+          >
+            Bottom STL
+          </button>
+          <button title="Switch plate as a printable solid" onClick={() => exportSTL('plate')}>
+            Plate STL
+          </button>
+        </div>
+        <p className="hint">
+          DXF is 2D outlines for CAD; STL is print-ready solids (mm, Z up,
+          resting on the bed) for a slicer. A split case exports both halves
+          side by side. Wedge bottoms export as their flat tray — tilt,
+          tenting and support posts are preview-only.
+        </p>
       </Section>
       <Section id="doc-shortcuts" title="Shortcuts" defaultOpen={false}>
         <ul className="hint">
