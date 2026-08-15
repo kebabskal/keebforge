@@ -16,10 +16,10 @@ import {
 } from '../model/keys'
 import {
   caseBottomOutline,
+  caseDims,
   caseShells,
   CSK_DEPTH,
   foamWithCutouts,
-  FOAM_THICKNESS,
   PCB_THICKNESS,
   pcbOutline,
   PLATE_THICKNESS,
@@ -32,7 +32,7 @@ import {
 import { groupMap, useDocStore } from '../model/store'
 import { useTheme } from '../ui/theme'
 import { capGeo, CAP_PROFILE, frustumGeo } from './capGeometry'
-import { loftRings, ringToVec, shapeFromRings, type LoftLevel } from './loft'
+import { loftRings, ringToVec, shapeFromRings, taperedLevels } from './loft'
 import { ViewBar } from './ViewBar'
 import { useViewSettings } from './viewSettings'
 
@@ -368,12 +368,8 @@ export function Preview3D() {
       // than the foam layer), leaving room for switch bodies and sockets.
       // The case rests on the underside of the bottom part (when present),
       // which is also the tilt/tent pivot plane and the desk height.
-      const cavity = doc.bottom.enabled
-        ? Math.max(FOAM_THICKNESS, doc.bottom.clearance ?? 0)
-        : FOAM_THICKNESS
-      const caseBottomY = -PLATE_THICKNESS - cavity
-      const bottomThickness = doc.bottom.enabled ? Math.max(0.5, doc.bottom.thickness) : 0
-      const restY = caseBottomY - bottomThickness
+      const dims = caseDims(doc)
+      const { cavity, caseBottomY, bottomThickness, restY } = dims
       restingY = restY
       groundClip.constant = 0.05 - restY
 
@@ -496,16 +492,7 @@ export function Preview3D() {
         breaks: number[],
         bevel = 0,
       ) => {
-        const b = Math.max(0, Math.min(bevel, thickness / 2 - 0.05))
-        const top = y + thickness - b
-        const levels: LoftLevel[] = [{ z: 0, outer: insetAt(y), hole: 0 }]
-        for (const at of breaks) {
-          if (at > y + 1e-6 && at < top - 1e-6) levels.push({ z: at - y, outer: insetAt(at), hole: 0 })
-        }
-        levels.push({ z: top - y, outer: insetAt(top), hole: 0 })
-        // The chamfer pulls both boundaries in on top of whatever draft has
-        // already accumulated.
-        if (b > 0) levels.push({ z: thickness, outer: insetAt(top) + b, hole: b })
+        const levels = taperedLevels(y, thickness, insetAt, breaks, bevel)
         for (const poly of mp) {
           const rings = poly.map((ring) => ringToVec(ring as [number, number][]))
           if (rings[0].length < 3) continue
@@ -579,26 +566,15 @@ export function Preview3D() {
         // the cavity, so nothing interpenetrates.
         const screws = screwPositions(doc)
         if (doc.bezel.enabled && doc.bezel.width > 0) {
-          const bevel = Math.min(doc.bezel.bevel ?? 0, doc.bezel.width / 2 - 0.05)
-          const wallH = PLATE_THICKNESS + cavity
-          // Self-tapping pilots are blind: only as deep as the screw bites,
-          // so the wall still reads solid from inside the case. Splitting the
-          // band at that depth is how an extruded outline gets a blind hole.
-          const pilotH = Math.min(SCREW.bite, wallH)
           // The wall and rim share the hull, so their outer faces form one
           // continuous surface from the lid plane to the top of the rim. The
           // draft is spread over that whole height and each band picks up the
           // slice it spans, so the slope never breaks at a seam.
-          const rimH = doc.bezel.height > 0 ? doc.bezel.height : 0
-          const outerH = wallH + rimH
-          const draft = Math.max(0, doc.bezel.draft ?? 0)
-          // The face stays vertical up to the break, then tapers the rest of
-          // the way to the top of the rim.
-          const breakY = caseBottomY + Math.max(0, Math.min(doc.bezel.draftStart ?? 0, outerH))
-          const taperH = caseBottomY + outerH - breakY
-          const insetAt = (y: number) =>
-            taperH > 1e-6 ? (draft * Math.max(0, y - breakY)) / taperH : 0
-          const breaks = [breakY]
+          const { wallH, rimH, bevel, insetAt, breaks } = dims
+          // Self-tapping pilots are blind: only as deep as the screw bites,
+          // so the wall still reads solid from inside the case. Splitting the
+          // band at that depth is how an extruded outline gets a blind hole.
+          const pilotH = Math.min(SCREW.bite, wallH)
           for (const shell of caseShells(doc)) {
             trackFront(shell.hull)
             if (screws.length > 0) {

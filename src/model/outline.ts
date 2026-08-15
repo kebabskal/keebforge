@@ -255,7 +255,7 @@ function simplifyRing(ring: Ring, eps: number): Ring {
   return pts
 }
 
-function simplify(mp: MultiPolygon, eps: number): MultiPolygon {
+export function simplify(mp: MultiPolygon, eps: number): MultiPolygon {
   return mp.map((poly) => poly.map((ring) => simplifyRing(ring, eps)))
 }
 
@@ -1152,6 +1152,57 @@ export function screwPositions(doc: Doc): [number, number][] {
     result,
   }
   return result
+}
+
+/** Vertical dimensions of the case stack and the outer face's draft profile,
+ * shared by the 3D preview and the print export so both build the same
+ * solids. Heights are world Y (0 = plate top); `insetAt` gives the outer
+ * face's pull-in at any world height, and `breaks` the heights where that
+ * profile changes slope. */
+export interface CaseDims {
+  /** Interior depth below the plate (switch bodies, board, sockets). */
+  cavity: number
+  /** World Y of the case interior's floor — the lid plane. */
+  caseBottomY: number
+  bottomThickness: number
+  /** World Y of the bottom lid's underside — the resting plane. */
+  restY: number
+  /** Wall band height: lid plane up to the plate top. */
+  wallH: number
+  /** Rim band height above the plate top. */
+  rimH: number
+  /** Top-edge chamfer, clamped so it cannot consume the bezel. */
+  bevel: number
+  insetAt: (worldY: number) => number
+  breaks: number[]
+}
+
+export function caseDims(doc: Doc): CaseDims {
+  const cavity = doc.bottom.enabled
+    ? Math.max(FOAM_THICKNESS, doc.bottom.clearance ?? 0)
+    : FOAM_THICKNESS
+  const caseBottomY = -PLATE_THICKNESS - cavity
+  const bottomThickness = doc.bottom.enabled ? Math.max(0.5, doc.bottom.thickness) : 0
+  const wallH = PLATE_THICKNESS + cavity
+  const rimH = doc.bezel.height > 0 ? doc.bezel.height : 0
+  const outerH = wallH + rimH
+  // The face stays vertical up to the break, then tapers the rest of the way
+  // to the top of the rim.
+  const draft = Math.max(0, doc.bezel.draft ?? 0)
+  const breakY = caseBottomY + Math.max(0, Math.min(doc.bezel.draftStart ?? 0, outerH))
+  const taperH = caseBottomY + outerH - breakY
+  return {
+    cavity,
+    caseBottomY,
+    bottomThickness,
+    restY: caseBottomY - bottomThickness,
+    wallH,
+    rimH,
+    bevel: Math.min(doc.bezel.bevel ?? 0, doc.bezel.width / 2 - 0.05),
+    insetAt: (y: number) =>
+      taperH > 1e-6 ? (draft * Math.max(0, y - breakY)) / taperH : 0,
+    breaks: [breakY],
+  }
 }
 
 /** Punch circular holes of radius r at the given centers. Failures degrade
