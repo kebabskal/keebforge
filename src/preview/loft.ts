@@ -1,6 +1,13 @@
 import * as THREE from 'three'
-import { toCreasedNormals } from 'three/addons/utils/BufferGeometryUtils.js'
-import { erode, outlineDifference, simplify, type MultiPolygon, type Ring } from '../model/outline'
+import {
+  erode,
+  outlineDifference,
+  qualityMaxStep,
+  simplify,
+  type MultiPolygon,
+  type Ring,
+} from '../model/outline'
+
 
 /** Rings come from polygon-clipping with a duplicated closing point, and
  * exactly-tangent placements can leave coincident neighbours. Both produce
@@ -110,42 +117,28 @@ export function taperedLevels(
   return levels
 }
 
-/** Collects normalled sub-meshes and concatenates them into one geometry.
- * Each band and each cap is normalled on its own — every boundary between
- * them is a real edge (draft break, chamfer, cap rims) and smoothing has to
- * stop there. Creasing the whole part in one pass instead lets a vertex
- * average its wall face with the cap face sitting on it, which tips the top
- * and bottom rows of every band ~45° off and reads as banding down the side
- * of the case. */
-function pieceCollector(creaseAngle: number) {
-  const pieces: THREE.BufferGeometry[] = []
-  const finish = (position: number[], crease: boolean) => {
-    if (position.length === 0) return
-    const g = new THREE.BufferGeometry()
-    g.setAttribute('position', new THREE.Float32BufferAttribute(position, 3))
-    g.computeVertexNormals()
-    if (!crease) {
-      pieces.push(g)
-      return
-    }
-    // Within a band, neighbouring facets still smooth, so outline arcs read
-    // as curves rather than facets.
-    const creased = toCreasedNormals(g, creaseAngle)
-    g.dispose()
-    pieces.push(creased)
+/** Collects triangles that already know their own normals.
+ *
+ * Nothing here infers shading from the mesh. Every surface a lofted part has
+ * is one we generated and therefore one whose curvature we know: a wall band
+ * is a ruled surface over a ring, a cap is a plane, and the seam between them
+ * is a real edge. Emitting the normal alongside the position says so directly.
+ *
+ * Inferring it instead — measure the angle between neighbouring facets, crease
+ * where it exceeds a threshold — cannot work here, because the angles do not
+ * separate. On a default board the draft break is 21°, and one arc facet at
+ * the coarsest detail level is up to 40° once simplification has thinned it:
+ * any threshold that keeps the fillet smooth erases the break line, and any
+ * threshold that keeps the break creases the fillet. It only appears to work
+ * at high detail, where fine sampling opens a window between the two. */
+function pieceCollector() {
+  const position: number[] = []
+  const normal: number[] = []
+  const finish = (pos: number[], nor: number[]) => {
+    for (const v of pos) position.push(v)
+    for (const v of nor) normal.push(v)
   }
   const concat = (): THREE.BufferGeometry => {
-    const position: number[] = []
-    const normal: number[] = []
-    for (const piece of pieces) {
-      const p = piece.getAttribute('position')
-      const n = piece.getAttribute('normal')
-      for (let i = 0; i < p.count; i++) {
-        position.push(p.getX(i), p.getY(i), p.getZ(i))
-        normal.push(n.getX(i), n.getY(i), n.getZ(i))
-      }
-      piece.dispose()
-    }
     const geo = new THREE.BufferGeometry()
     geo.setAttribute('position', new THREE.Float32BufferAttribute(position, 3))
     geo.setAttribute('normal', new THREE.Float32BufferAttribute(normal, 3))
@@ -154,18 +147,65 @@ function pieceCollector(creaseAngle: number) {
   return { finish, concat }
 }
 
+/** Outward face normals along a closed ring, and the blended normal at each
+ * vertex where the boundary is genuinely curving rather than turning a corner.
+ *
+ * A ring arrives as bare points: the arc the offsetter sampled and the corner
+ * the shape actually has look identical. What tells them apart is not the turn
+ * angle on its own but the turn angle *against how finely arcs are sampled at
+ * the current level* — an arc facet turns by about the level's step, a corner
+ * by tens of degrees more. So the threshold is derived from the step rather
+ * than fixed, and the same code keeps fillets smooth at every detail level.
+ *
+ * The allowance over the step is generous because simplification runs after
+ * sampling and thins arcs by up to half their points, doubling the turn at the
+ * ones that survive. Real corners in these outlines are 90° or sharper — the
+ * hull is rounded by construction — so a wide margin costs nothing. */
+function ringNormals(ring: THREE.Vector2[], smoothTurn: number) {
+  const n = ring.length
+  // Material lies to the left of the traversal, so the outward normal of an
+  // edge is to its right.
+  const edge: THREE.Vector2[] = []
+  for (let i = 0; i < n; i++) {
+    const a = ring[i]
+    const b = ring[(i + 1) % n]
+    const dx = b.x - a.x
+    const dy = b.y - a.y
+    const len = Math.hypot(dx, dy)
+    edge.push(len > 1e-9 ? new THREE.Vector2(dy / len, -dx / len) : new THREE.Vector2(0, 0))
+  }
+  // Two normals per vertex: the one the face arriving at it uses, and the one
+  // the face leaving it uses. Equal wherever the boundary is smooth.
+  const arriving: THREE.Vector2[] = []
+  const leaving: THREE.Vector2[] = []
+  for (let i = 0; i < n; i++) {
+    const before = edge[(i - 1 + n) % n]
+    const after = edge[i]
+    const turn = Math.acos(Math.max(-1, Math.min(1, before.dot(after))))
+    if (turn <= smoothTurn) {
+      const blend = before.clone().add(after)
+      const v = blend.lengthSq() > 1e-12 ? blend.normalize() : after.clone()
+      arriving.push(v)
+      leaving.push(v.clone())
+    } else {
+      arriving.push(before.clone())
+      leaving.push(after.clone())
+    }
+  }
+  return { arriving, leaving }
+}
+
 /** A prism whose cross-section shifts with height, built in the XY plane and
  * rising along +Z the way an extrusion does. Rings at every level come from
  * offsetRingInward, so its feature-size caveat applies. */
 export function loftRings(
   rings: THREE.Vector2[][],
   levels: LoftLevel[],
-  creaseAngle = Math.PI / 6,
 ): THREE.BufferGeometry {
   const slices = levels.map((level) =>
     rings.map((ring, r) => offsetRingInward(ring, r === 0 ? level.outer : level.hole)),
   )
-  const { finish, concat } = pieceCollector(creaseAngle)
+  const { finish, concat } = pieceCollector()
 
   for (let k = 0; k + 1 < slices.length; k++) {
     loftBand(finish, slices[k], levels[k].z, slices[k + 1], levels[k + 1].z)
@@ -180,27 +220,46 @@ export function loftRings(
     const pts = slices[index].flat()
     const z = levels[index].z
     const capPos: number[] = []
+    const capNor: number[] = []
     // Triangulation faces +Z; the bottom cap has to look the other way.
     const order = index === 0 ? [2, 1, 0] : [0, 1, 2]
+    const nz = index === 0 ? -1 : 1
     for (const face of faces) {
       for (const o of order) {
         const p = pts[face[o]]
         capPos.push(p.x, p.y, z)
+        capNor.push(0, 0, nz)
       }
     }
-    // A cap is planar, so face normals are already the right answer.
-    finish(capPos, false)
+    finish(capPos, capNor)
   }
 
   return concat()
 }
 
-type Finish = (position: number[], crease: boolean) => void
+type Finish = (position: number[], normal: number[]) => void
+
+/** How far the boundary may turn at a vertex and still count as curving
+ * rather than cornering, radians. Derived from the level's own arc step, with
+ * room for the thinning that simplification does afterwards. */
+function smoothTurn(): number {
+  return Math.min(Math.PI / 2.2, qualityMaxStep() * 2.6)
+}
 
 /** Wall band between two slices with identical ring topology. Wound so the
  * face normal points out of the material: for a ring traversed with material
  * on its left, that is to the right — outer rings and holes alike. Vertical
- * walls are the lo === hi case. */
+ * walls are the lo === hi case.
+ *
+ * The normal follows the surface rather than the triangles. Around the ring it
+ * blends across every vertex the boundary merely curves through, so an arc
+ * shades as an arc however coarsely it was sampled. Up the band it tilts by
+ * the slope the band actually has: a vertex that moves inward by `d` while
+ * rising `h` has its normal leaned back by exactly that ratio. Which is also
+ * what puts a crease on the draft break for free — the band below it is
+ * vertical and the band above it is not, so their normals differ at the seam
+ * they share, by the 21° the break really turns through, and no threshold had
+ * to be consulted to find that out. */
 function loftBand(
   finish: Finish,
   lo: THREE.Vector2[][],
@@ -208,22 +267,39 @@ function loftBand(
   hi: THREE.Vector2[][],
   z1: number,
 ) {
-  const band: number[] = []
+  const pos: number[] = []
+  const nor: number[] = []
+  const turn = smoothTurn()
+  const h = z1 - z0
   for (let r = 0; r < lo.length; r++) {
     const a = lo[r]
     const b = hi[r]
+    const { arriving, leaving } = ringNormals(a, turn)
+    // Lean per vertex, from how far this vertex actually moved inward.
+    const lean = (i: number, flat: THREE.Vector2): [number, number, number] => {
+      const d = (a[i].x - b[i].x) * flat.x + (a[i].y - b[i].y) * flat.y
+      const len = Math.hypot(h, d) || 1
+      return [(flat.x * h) / len, (flat.y * h) / len, d / len]
+    }
     for (let i = 0; i < a.length; i++) {
       const j = (i + 1) % a.length
-      band.push(a[i].x, a[i].y, z0, a[j].x, a[j].y, z0, b[j].x, b[j].y, z1)
-      band.push(a[i].x, a[i].y, z0, b[j].x, b[j].y, z1, b[i].x, b[i].y, z1)
+      // The quad's two corners take the normals of the edge they lie on.
+      const ni = lean(i, leaving[i])
+      const nj = lean(j, arriving[j])
+      pos.push(a[i].x, a[i].y, z0, a[j].x, a[j].y, z0, b[j].x, b[j].y, z1)
+      nor.push(...ni, ...nj, ...nj)
+      pos.push(a[i].x, a[i].y, z0, b[j].x, b[j].y, z1, b[i].x, b[i].y, z1)
+      nor.push(...ni, ...nj, ...ni)
     }
   }
-  finish(band, true)
+  finish(pos, nor)
 }
 
 /** Flat region triangulated at height z. Faces up unless `down`. */
 function flatRegion(finish: Finish, region: MultiPolygon, z: number, down = false) {
   const pos: number[] = []
+  const nor: number[] = []
+  const nz = down ? -1 : 1
   for (const poly of region) {
     const contour = ringToVec(poly[0] as [number, number][])
     if (contour.length < 3) continue
@@ -234,10 +310,11 @@ function flatRegion(finish: Finish, region: MultiPolygon, z: number, down = fals
       for (const o of down ? [2, 1, 0] : [0, 1, 2]) {
         const p = pts[face[o]]
         pos.push(p.x, p.y, z)
+        nor.push(0, 0, nz)
       }
     }
   }
-  finish(pos, false)
+  finish(pos, nor)
 }
 
 /** True if any two non-adjacent edges of the ring set cross or overlap — the
@@ -342,10 +419,9 @@ export function taperedSolid(
   rings: THREE.Vector2[][],
   levels: LoftLevel[],
   bevel = 0,
-  creaseAngle = Math.PI / 6,
   stepScale = 1,
 ): THREE.BufferGeometry {
-  const { finish, concat } = pieceCollector(creaseAngle)
+  const { finish, concat } = pieceCollector()
   const holes = rings.slice(1)
   const holesMp: MultiPolygon = holes.map((r) => [closeRing(r)])
 
@@ -470,52 +546,4 @@ export function taperedSolid(
   }
   flatRegion(finish, safeDiff(mpOf(outers), holesMp), zTop)
   return concat()
-}
-
-/** A prism whose far face is slanted rather than flat: the cross-section is
- * given in (u, v) and swept along +Z, but the sweep length varies with `v`.
- *
- * The connector opening's corner fill needs this. A drafted case pulls its
- * outer face inward as it rises, so fill swept a constant distance stands
- * proud of the taper — 0.74 mm at the top of the hole on a 2 mm draft. Asking
- * the caller for a depth per height lands the far face on the tapered surface
- * instead. */
-export function slantedPrism(
-  rings: [number, number][][],
-  depthAt: (v: number) => number,
-): THREE.BufferGeometry {
-  const position: number[] = []
-  const push = (p: [number, number], z: number) => position.push(p[0], p[1], z)
-  for (const raw of rings) {
-    // Rings arrive closed; the repeated point would make a zero-area facet.
-    const ring =
-      raw.length > 1 &&
-      raw[0][0] === raw[raw.length - 1][0] &&
-      raw[0][1] === raw[raw.length - 1][1]
-        ? raw.slice(0, -1)
-        : raw
-    if (ring.length < 3) continue
-    const pts = ring.map(([u, v]) => new THREE.Vector2(u, v))
-    const faces = THREE.ShapeUtils.triangulateShape(pts, [])
-    const ccw = THREE.ShapeUtils.isClockWise(pts) ? -1 : 1
-    for (const [a, b, c] of faces) {
-      // Near face looks back along the sweep, far face along it.
-      const near = ccw > 0 ? [c, b, a] : [a, b, c]
-      const far = ccw > 0 ? [a, b, c] : [c, b, a]
-      for (const i of near) push(ring[i], 0)
-      for (const i of far) push(ring[i], depthAt(ring[i][1]))
-    }
-    for (let i = 0; i < ring.length; i++) {
-      const j = (i + 1) % ring.length
-      const [a, b] = ccw > 0 ? [ring[i], ring[j]] : [ring[j], ring[i]]
-      const za = depthAt(a[1])
-      const zb = depthAt(b[1])
-      push(a, 0); push(b, 0); push(b, zb)
-      push(a, 0); push(b, zb); push(a, za)
-    }
-  }
-  const geo = new THREE.BufferGeometry()
-  geo.setAttribute('position', new THREE.Float32BufferAttribute(position, 3))
-  geo.computeVertexNormals()
-  return geo
 }

@@ -14,6 +14,12 @@ import { outlineQuality, setOutlineQuality } from './outline'
  * about the board, only how it is drawn mid-gesture. */
 
 const STORAGE_KEY = 'keebforge.fastedit'
+const DETAIL_KEY = 'keebforge.detail'
+
+/** Levels a rebuild can settle on, coarsest first. `draft` is not among them:
+ * it belongs to the gesture, not to the user's choice. */
+export const DETAIL_LEVELS = ['low', 'medium', 'high'] as const
+export type Detail = (typeof DETAIL_LEVELS)[number]
 
 /** How long edits have to stop for before the full-quality pass runs. Long
  * enough to sit out the gap between two drag frames or two arrow-key repeats,
@@ -28,9 +34,44 @@ function load(): boolean {
   }
 }
 
+function loadDetail(): Detail {
+  try {
+    const raw = localStorage.getItem(DETAIL_KEY)
+    if (DETAIL_LEVELS.includes(raw as Detail)) return raw as Detail
+  } catch {
+    // fall through to the default
+  }
+  return 'medium'
+}
+
 let enabled = load()
+let detail = loadDetail()
 let settleTimer: ReturnType<typeof setTimeout> | undefined
 const settlers = new Set<() => void>()
+
+setOutlineQuality(detail)
+
+/** How fine a settled rebuild is. */
+export function meshDetail(): Detail {
+  return detail
+}
+
+/** Pick a detail level and rebuild every view at it. Costs a full regeneration
+ * — every memo below caches geometry built at one resolution — so this is a
+ * deliberate setting rather than something to sweep through. */
+export function setMeshDetail(next: Detail): void {
+  if (next === detail) return
+  detail = next
+  try {
+    localStorage.setItem(DETAIL_KEY, next)
+  } catch {
+    // best-effort persistence
+  }
+  clearTimeout(settleTimer)
+  settleTimer = undefined
+  setOutlineQuality(next)
+  for (const rebuild of settlers) rebuild()
+}
 
 export function fastEditing(): boolean {
   return enabled
@@ -68,7 +109,7 @@ export function onSettled(rebuild: () => void): () => void {
 function settle(): void {
   clearTimeout(settleTimer)
   settleTimer = undefined
-  if (outlineQuality() === 'fine') return
-  setOutlineQuality('fine')
+  if (outlineQuality() === detail) return
+  setOutlineQuality(detail)
   for (const rebuild of settlers) rebuild()
 }

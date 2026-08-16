@@ -39,15 +39,21 @@ export function offsetBackend(): OffsetBackend {
   return offsetBackendMode
 }
 
-export function setOffsetBackend(next: OffsetBackend): void {
-  if (next === offsetBackendMode) return
-  offsetBackendMode = next
-  // Every memo below holds geometry built by one backend, and unlike a
-  // quality flip this can change hole topology, so they are dropped outright.
+/** Drop every memo below. They all hold geometry built at one resolution by
+ * one backend, and none of them keys on either — the keys are document
+ * identities — so anything that changes how geometry is generated has to say
+ * so here. */
+function dropMemos(): void {
   plateCache = null
   solidsCache = null
   shellCache = null
   screwCache = null
+}
+
+export function setOffsetBackend(next: OffsetBackend): void {
+  if (next === offsetBackendMode) return
+  offsetBackendMode = next
+  dropMemos()
 }
 
 /** Plate switch cutout size per switch type, mm. */
@@ -126,37 +132,86 @@ const MIN_FEATURE = 3
 /** How finely offset arcs are sampled. Every millimetre of generated boundary
  * is a vertex the clipper has to sweep, and its cost climbs faster than
  * linearly, so resolution is the main lever on how long a rebuild takes.
+ *
  * `draft` is for outlines being regenerated continuously under a drag; the
- * result is the same shape with visibly coarser fillets. */
-export type OutlineQuality = 'fine' | 'draft'
+ * result is the same shape with visibly coarser fillets. The other three are
+ * what a rebuild settles on, and are the user's to pick: `low` is what the
+ * app shipped with, fine enough to print and cheap enough to edit at, and the
+ * two above it buy smoother fillets with clipper time. */
+export type OutlineQuality = 'draft' | 'low' | 'medium' | 'high'
 
 interface QualitySpec {
   /** Largest allowed sagitta when sampling an arc, mm. */
   sagitta: number
-  /** Hard cap on the angle a single arc segment may span, radians. `fine`
-   * keeps facets under the 3D preview's 30° normal-crease threshold so
-   * fillets shade as curves rather than flats. */
+  /** Hard cap on the angle a single arc segment may span, radians. Every
+   * settled level keeps facets under the 3D preview's 30° normal-crease
+   * threshold so fillets shade as curves rather than flats. */
   maxStep: number
-  /** Vertex-dropping tolerance applied between morphological stages, mm. */
+  /** Vertex-dropping tolerance applied between morphological stages, mm.
+   *
+   * Has to stay at or below `sagitta`, or it undoes the sampling that just
+   * happened: a round join emits its arc to within the sagitta, and a
+   * simplifier allowed to move points further than that will take the arc
+   * straight back out again. Setting the two independently is how the first
+   * cut of these levels came out *coarser* the higher you went. */
   simplifyEps: number
+  /** Vertex-dropping tolerance for the shaping passes — the morphological
+   * open/close that rounds the outline and the erosions that derive the
+   * cavity from it. Looser than `simplifyEps`, since those run on contours
+   * that have already been through several offsets and accumulate debris, but
+   * it still has to scale with the level: left at a fixed value it becomes the
+   * ceiling on detail and no amount of finer sampling upstream survives it. */
+  cleanEps: number
+  /** Segments around a full circle for the solids the case is cut by — screw
+   * pilots and the like. Kept in step with the outline's own arcs so one
+   * setting means one level of roundness everywhere. */
+  segments: number
 }
 
 const QUALITY: Record<OutlineQuality, QualitySpec> = {
-  fine: { sagitta: 0.02, maxStep: Math.PI / 9, simplifyEps: 0.02 },
-  draft: { sagitta: 0.25, maxStep: Math.PI / 4, simplifyEps: 0.1 },
+  draft: { sagitta: 0.25, maxStep: Math.PI / 4, simplifyEps: 0.1, cleanEps: 0.1, segments: 12 },
+  low: { sagitta: 0.02, maxStep: Math.PI / 9, simplifyEps: 0.02, cleanEps: 0.05, segments: 16 },
+  medium: { sagitta: 0.008, maxStep: Math.PI / 15, simplifyEps: 0.005, cleanEps: 0.02, segments: 24 },
+  high: { sagitta: 0.003, maxStep: Math.PI / 24, simplifyEps: 0.0015, cleanEps: 0.008, segments: 40 },
 }
 
-let quality: OutlineQuality = 'fine'
+/** Vertex-dropping tolerance for the shaping passes at the current level. */
+function cleanEps(): number {
+  return QUALITY[quality].cleanEps
+}
+
+/** The largest angle one arc segment may span at the current level. Read by
+ * the mesh builders, which need to know how coarsely a curve was sampled
+ * before they can tell one of its facets from a corner of the shape. */
+export function qualityMaxStep(): number {
+  return QUALITY[quality].maxStep
+}
+
+let quality: OutlineQuality = 'medium'
+
+/** Segments around a circle at the current resolution. */
+export function qualitySegments(): number {
+  return QUALITY[quality].segments
+}
 
 export function outlineQuality(): OutlineQuality {
   return quality
 }
 
-/** Switching quality invalidates every memo below, since they all cache
- * geometry built at one resolution. Callers should therefore flip this once
- * per gesture, not per edit. */
+/** Switching quality drops every memo, since they all cache geometry built at
+ * one resolution and key only on document identity. Callers should therefore
+ * flip this once per gesture, not per edit — which is also why it returns
+ * early on a no-op, so the repeated `draft` flips a drag makes cost nothing.
+ *
+ * Not dropping them was a silent staleness rather than a crash, which is how
+ * it survived: a drag caches its outlines at draft resolution against the
+ * document it built them from, and the full-quality pass that runs when the
+ * drag stops asks for that same document — so it got the draft geometry
+ * handed straight back, and the board you stopped on was never rebuilt. */
 export function setOutlineQuality(next: OutlineQuality): void {
+  if (next === quality) return
   quality = next
+  dropMemos()
 }
 
 /** Angular step for sampling an arc of radius `r`, from the sagitta budget. */
@@ -807,7 +862,7 @@ function trimSpikeRing(ring: Ring, maxHeight: number): Ring {
 function smoothOutline(mp: MultiPolygon, r: number, sc: number): MultiPolygon {
   if (mp.length === 0) return mp
   try {
-    return simplify(erode(dilate(erode(mp, r), r + sc), sc), 0.05)
+    return simplify(erode(dilate(erode(mp, r), r + sc), sc), cleanEps())
   } catch (error) {
     console.warn('keebforge: outline smoothing failed, keeping raw outline', error)
     return mp
@@ -827,7 +882,7 @@ function closeGaps(mp: MultiPolygon, r: number): MultiPolygon {
     }
     try {
       const clean = simplify([poly], 0.02)
-      out.push(...dropDebris(simplify(erode(dilate(clean, r), r), 0.05), 1))
+      out.push(...dropDebris(simplify(erode(dilate(clean, r), r), cleanEps()), 1))
     } catch (error) {
       console.warn('keebforge: gap closing failed, keeping raw outline', error)
       out.push(poly)
@@ -1077,7 +1132,7 @@ export function caseShells(doc: Doc): CaseShell[] {
   const round = (mp: MultiPolygon): MultiPolygon => {
     if (mp.length === 0) return mp
     try {
-      return simplify(dilate(erode(mp, FIT_R), FIT_R), 0.05)
+      return simplify(dilate(erode(mp, FIT_R), FIT_R), cleanEps())
     } catch (error) {
       console.warn('keebforge: fit rounding failed', error)
       return mp
@@ -1099,7 +1154,7 @@ export function caseShells(doc: Doc): CaseShell[] {
     const hull: MultiPolygon = s.outer.map((poly) => [poly[0]])
     const interior = once(() => {
       try {
-        return simplify(erode(hull, wallW), 0.05)
+        return simplify(erode(hull, wallW), cleanEps())
       } catch (error) {
         console.warn('keebforge: case interior generation failed', error)
         return [] as MultiPolygon
@@ -1109,7 +1164,7 @@ export function caseShells(doc: Doc): CaseShell[] {
     const inner = once(() => {
       if (ridgeW <= 0 || fit().length === 0) return fit()
       try {
-        return round(simplify(erode(fit(), ridgeW), 0.05))
+        return round(simplify(erode(fit(), ridgeW), cleanEps()))
       } catch (error) {
         console.warn('keebforge: tray ridge generation failed', error)
         return fit()
@@ -1160,7 +1215,7 @@ export function caseBottomOutline(doc: Doc): MultiPolygon {
   const inset = doc.bottom.inset ?? 0
   if (inset <= 0) return outline
   try {
-    return simplify(erode(outline, inset), 0.05)
+    return simplify(erode(outline, inset), cleanEps())
   } catch (error) {
     console.warn('keebforge: bottom inset failed, keeping full outline', error)
     return outline
@@ -1681,7 +1736,7 @@ export function screwPositions(doc: Doc): [number, number][] {
       for (const box of boxes) result.push(...sampleBoxRect(box, e, doc.bezel, spacing))
     } else {
       for (const shell of caseShells(doc)) {
-        const spine = simplify(erode(shell.hull, e), 0.05)
+        const spine = simplify(erode(shell.hull, e), cleanEps())
         for (const poly of spine) result.push(...sampleRing(poly[0], spacing))
       }
     }
@@ -2232,141 +2287,90 @@ export function controllerConnectorHeight(doc: Doc): number {
 /** How far the opening's top corners are rounded, mm. */
 const PORT_ARCH = 1.5
 
-/** The corner pieces that turn the square opening into a rounded one.
+/** The connector opening, as a shape in its own vertical plane.
  *
- * The opening is a rectangle driven through the wall, so it cannot be rounded
- * by cutting differently — a cut is a plan-view shape and the roundness lives
- * in the *face* of the case, a vertical plane. It can be rounded by putting
- * material back: the difference between the rectangle and the rounded profile
- * is four corner slivers, and adding those leaves a rounded hole.
+ * Everything else the case is cut by is a plan-view shape driven straight
+ * through it, because an extruded outline can express nothing else. This one
+ * is not: the roundness lives in the *face* of the case, so the cut has to be
+ * a profile standing in a vertical plane and swept horizontally through the
+ * wall. That is a boolean, not an extrusion — see `csg.ts`.
  *
- * Cheap, because the slivers are tiny and there is no third dimension to
- * approximate: rings come back in the opening's own plane, `u` across it and
- * `v` up from the base of the cut, for the caller to extrude along the board's
- * axis and stand in place. */
-export function controllerPortFillets(doc: Doc): [number, number][][] {
-  const c = doc.controller
-  if (!c?.enabled) return []
-  const w = c.portWidth
-  const h = MCU_THICKNESS + c.portHeight
-  // An arch, not a pill. The top case prints the right way up, lid plane on
-  // the bed and opening upward, so the wall below the hole is laid down
-  // first and the hole's *upper* edge is the material that has to span the
-  // void. Arching it keeps every layer supported by the one under it. The
-  // lower edge needs nothing — the print simply stops there — so it stays
-  // square rather than giving away opening.
-  // Corner radius, not a half-round roof. A full arch spans the whole width
-  // and gives away a quarter of the opening's height to save a bridge the
-  // printer would have managed anyway: the flat left between these corners is
-  // a few millimetres, well inside what bridges cleanly. This just takes the
-  // sharp corners off the span.
-  const r = Math.max(0, Math.min(PORT_ARCH, w / 2, h / 2))
-  if (r <= 0.05) return []
-  const square: MultiPolygon = [[[
-    [-w / 2, 0], [w / 2, 0], [w / 2, h], [-w / 2, h], [-w / 2, 0],
-  ]]]
-  const seg = Math.max(3, Math.ceil(Math.PI / 2 / arcStep(r)))
-  // Up the right side, round the two top corners, back down the left.
-  const ring: Ring = [[snap(w / 2), snap(0)]]
-  const corner = (cx: number, from: number) => {
-    for (let i = 0; i <= seg; i++) {
-      const a = from + (i / seg) * (Math.PI / 2)
-      ring.push([snap(cx + r * Math.cos(a)), snap(h - r + r * Math.sin(a))])
-    }
-  }
-  corner(w / 2 - r, 0)
-  corner(-w / 2 + r, Math.PI / 2)
-  ring.push([snap(-w / 2), snap(0)])
-  ring.push(ring[0])
-  const rounded: MultiPolygon = [[ring]]
-  try {
-    return robustClip((s, cl) => polygonClipping.difference(s, cl!), square, rounded)
-      .flatMap((poly) => poly.map((r2) => r2.map(([x, y]) => [x, y] as [number, number])))
-  } catch {
-    return []
-  }
-}
-
-/** Where a set of fillets stands: the opening's own plane in world terms. */
-export interface PortFilletPlacement {
-  /** Rings in the opening's plane, `u` across and `v` up from `base`. */
-  rings: [number, number][][]
-  /** Centre of the opening's inner edge, world mm. */
+ * `profile` is the opening seen head-on, `u` across it and `v` up from the
+ * tray floor. Behind it the board itself has to be let through, which is a
+ * wider, taller, square hole with no reason to be rounded: `slot`. Both are
+ * swept along `out`, the profile from the board's leading edge outward and the
+ * slot from there back into the cavity. */
+export interface PortOpening {
+  /** Opening profile in (u, v), closed. */
+  profile: [number, number][]
+  /** Half-width and height of the board's own passage. */
+  slotHalf: number
+  slotHeight: number
+  /** How far each sweep runs. Overshooting the outside of the case costs
+   * nothing — a boolean only removes material that is there. */
+  reach: number
+  /** World position of the board's leading edge, on the tray floor. */
   x: number
   y: number
-  /** Unit vectors for `u` and for the direction the fill is extruded. */
+  z: number
+  /** Unit vectors: `u` runs along `side`, the sweep along `out`. */
   sideX: number
   sideY: number
   outX: number
   outY: number
-  /** World height of `v` = 0. */
-  base: number
-  /** How far the fill reaches at a given height above `base`. A drafted case
-   * pulls its outer face in as it rises, so this shortens with height rather
-   * than being one number. */
-  depthAt: (v: number) => number
 }
 
-/** How far forward the case actually extends past a point, along `out`.
- *
- * Measured rather than assumed. The nominal answer is the connector overhang
- * plus PORT_INSET, but the pad that grows the case around the module rounds
- * its front corner, so the real face can sit a little further out — 0.6 mm on
- * a measured board, which is exactly enough to leave a square lip standing in
- * front of a rounded opening. */
-function forwardToHull(doc: Doc, f: ControllerFrame, fromU: number): number {
-  const ox = f.out.x
-  const oy = f.out.y
-  const px = f.xf.x + ox * fromU
-  const py = f.xf.y + oy * fromU
-  let best = Infinity
-  for (const shell of caseShells(doc)) {
-    for (const poly of shell.hull) {
-      const ring = poly[0]
-      for (let i = 0; i < ring.length - 1; i++) {
-        const [ax, ay] = ring[i]
-        const [bx, by] = ring[i + 1]
-        const ex = bx - ax
-        const ey = by - ay
-        // Ray (p + t*out) against segment (a + s*e), 0 <= s <= 1, t > 0.
-        const denom = ox * ey - oy * ex
-        if (Math.abs(denom) < 1e-12) continue
-        const t = ((ax - px) * ey - (ay - py) * ex) / denom
-        const sPos = ((ax - px) * oy - (ay - py) * ox) / denom
-        if (t > 1e-6 && sPos >= 0 && sPos <= 1) best = Math.min(best, t)
+/** The opening at every controller: one, or one per half on a split. */
+export function controllerPortOpenings(doc: Doc): PortOpening[] {
+  const c = doc.controller
+  if (!c?.enabled) return []
+  const w = c.portWidth
+  const h = MCU_THICKNESS + c.portHeight
+  if (w <= 0 || h <= 0) return []
+  // An arch, not a pill. The top case prints the right way up, lid plane on
+  // the bed and opening upward, so the wall below the hole is laid down first
+  // and the hole's *upper* edge is the material that has to span the void.
+  // Rounding it keeps every layer supported by the one under it. The lower
+  // edge needs nothing — the print simply stops there — so it stays square
+  // rather than giving away opening.
+  //
+  // Corner radius, not a half-round roof: a full arch spans the whole width
+  // and gives away a quarter of the opening's height to save a bridge the
+  // printer would have managed anyway. The flat left between these corners is
+  // a few millimetres, well inside what bridges cleanly.
+  const r = Math.max(0, Math.min(PORT_ARCH, w / 2, h / 2))
+  const profile: [number, number][] = [[snap(-w / 2), 0], [snap(w / 2), 0]]
+  if (r > 0.05) {
+    const seg = Math.max(3, Math.ceil(Math.PI / 2 / arcStep(r)))
+    // Up the right side, round the two top corners, back down the left.
+    for (const [cx, from] of [
+      [w / 2 - r, 0],
+      [-w / 2 + r, Math.PI / 2],
+    ] as const) {
+      for (let i = 0; i <= seg; i++) {
+        const a = from + (i / seg) * (Math.PI / 2)
+        profile.push([snap(cx + r * Math.cos(a)), snap(h - r + r * Math.sin(a))])
       }
     }
+  } else {
+    profile.push([snap(w / 2), snap(h)])
   }
-  return Number.isFinite(best) ? best : 0
-}
-
-/** Fillets placed against every controller.
- *
- * The reach is exactly the port-sized part of the hole — from the board's
- * leading edge out to the case's outer face — so the fill can never stand
- * proud of the case. Behind that the opening is the wider slot the board
- * passes through, which wants no rounding. */
-export function controllerPortFilletPlacements(doc: Doc): PortFilletPlacement[] {
-  const rings = controllerPortFillets(doc)
-  if (rings.length === 0) return []
-  const dims = caseDims(doc)
-  const base = dims.caseBottomY
+  profile.push([snap(-w / 2), snap(h)])
+  const base = caseDims(doc).caseBottomY
   return controllerFrames(doc).map((f) => {
     const at = f.at(f.halfLength, 0)
-    // Out to the case's real face, then back off by however far the draft
-    // has pulled that face in at each height.
-    const flat = forwardToHull(doc, f, f.halfLength)
-    const depthAt = (v: number) => Math.max(0, flat - dims.insetAt(base + v))
     return {
-      rings,
+      profile,
+      slotHalf: c.width / 2 + PORT_SLOT_FIT,
+      slotHeight: h,
+      reach: PORT_REACH,
       x: at.x,
       y: at.y,
+      z: base,
       sideX: f.side.x,
       sideY: f.side.y,
       outX: f.out.x,
       outY: f.out.y,
-      base,
-      depthAt,
     }
   })
 }

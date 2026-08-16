@@ -33,6 +33,10 @@ export interface ViewSettings {
   showBottom: boolean
   /** Hiding the screws exposes the countersunk holes they sit in. */
   showScrews: boolean
+  /** Draw every triangle edge over the shaded surface. A diagnostic: banding,
+   * stray fill and failed booleans all look like shading until you can see
+   * the triangles they are made of. */
+  wireframe: boolean
 }
 
 export const DEFAULT_VIEW: ViewSettings = {
@@ -54,6 +58,7 @@ export const DEFAULT_VIEW: ViewSettings = {
   showFoam: true,
   showBottom: true,
   showScrews: true,
+  wireframe: false,
 }
 
 // v2: re-seed everyone once with the studio-look defaults.

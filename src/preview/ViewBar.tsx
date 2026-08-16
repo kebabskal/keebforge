@@ -127,6 +127,13 @@ export function ViewBar() {
         />
         <span className="viewbar-sep" />
         <button
+          className={view.wireframe ? 'active' : ''}
+          onClick={() => view.update({ wireframe: !view.wireframe })}
+          title={view.wireframe ? 'Hide wireframe' : 'Show wireframe over the surface'}
+        >
+          Wire
+        </button>
+        <button
           className={settingsOpen ? 'active' : ''}
           onClick={() => setSettingsOpen((v) => !v)}
           title="Camera & lighting settings"

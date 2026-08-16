@@ -1,7 +1,7 @@
 import { useRef, useState } from 'react'
 import { deleteFile, listFiles, loadFile, saveFile } from '../model/files'
 import { U, type Doc, type Key } from '../model/keys'
-import { normalizeMaterials, useDocStore } from '../model/store'
+import { docOf, normalizeMaterials, useDocStore } from '../model/store'
 
 const SNAP_OPTIONS = [
   { label: 'Snap: off', value: 0 },
@@ -14,11 +14,14 @@ const SNAP_OPTIONS = [
 
 const CURRENT_FILE_KEY = 'keebforge.file'
 
-/** Current document in the export/save JSON shape. */
+/** Current document in the export/save JSON shape.
+ *
+ * Everything the store treats as part of the document, and nothing else —
+ * `docOf` is the list, so a setting group added there cannot be forgotten
+ * here. Mounting and the controller were, and a board saved with a Pro Micro
+ * in it came back empty. */
 function serializeDoc() {
-  const { keys, groups, mirror, plate, bezel, bottom, tilt, materials } =
-    useDocStore.getState()
-  return { version: 5, keys, groups, mirror, plate, bezel, bottom, tilt, materials }
+  return { version: 6, ...docOf(useDocStore.getState()) }
 }
 
 /** Validate and load a parsed layout; throws on malformed input. */
@@ -50,6 +53,8 @@ function applyParsedDoc(parsed: any) {
         ? parsed.bezel
         : undefined,
     bottom: parsed.bottom,
+    mounting: parsed.mounting,
+    controller: parsed.controller,
     tilt: typeof parsed.tilt === 'number' ? parsed.tilt : undefined,
     materials: normalizeMaterials(parsed.materials, parsed.colors),
   } as Partial<Doc>)

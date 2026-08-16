@@ -117,7 +117,7 @@ if (cmd === 'capture') {
   // was sampled — `draft` is what every drag rebuilds at, so a layout that
   // depends on resolution is one that jumps around while you edit. Needs no
   // baseline: the two qualities are checked against each other.
-  const altQuality = process.argv.includes('--draft') ? 'fine' : 'draft'
+  const altQuality = process.argv.includes('--draft') ? 'low' : 'draft'
   setOutlineQuality(altQuality)
   const drift: string[] = []
   for (const [name, make] of DOCS) {
@@ -139,7 +139,7 @@ if (cmd === 'capture') {
     // somewhere else entirely, is what this is looking for.
     if (worst > 2) drift.push(`  ${name}: moved ${worst.toFixed(3)} mm at ${altQuality}`)
   }
-  setOutlineQuality(process.argv.includes('--draft') ? 'draft' : 'fine')
+  setOutlineQuality(process.argv.includes('--draft') ? 'draft' : 'low')
   console.log(
     drift.length
       ? `SCREW PHASE — ${drift.length} doc(s) depend on resolution:\n${drift.join('\n')}`

@@ -26,7 +26,6 @@ import {
   controllerConnectorHeight,
   controllerConnectors,
   controllerPortCuts,
-  controllerPortFilletPlacements,
   controllerPortSpan,
   CSK_DEPTH,
   foamWithCutouts,
@@ -44,7 +43,8 @@ import {
 import { groupMap, useDocStore } from '../model/store'
 import { useTheme } from '../ui/theme'
 import { capGeo, CAP_PROFILE, frustumGeo } from './capGeometry'
-import { clampBevel, ringToVec, shapeFromRings, slantedPrism, taperedLevels, taperedSolid } from './loft'
+import { portBandHeight, topCasePieces } from './caseSolid'
+import { clampBevel, ringToVec, shapeFromRings, taperedLevels, taperedSolid } from './loft'
 import { ViewBar } from './ViewBar'
 import { loadCamera, saveCamera, useViewSettings } from './viewSettings'
 
@@ -217,10 +217,47 @@ export function Preview3D() {
       THREE.Object3D[]
     > = { caps: [], switches: [], case: [], plate: [], pcb: [], foam: [], bottom: [], screws: [] }
 
+    // Wireframe overlay. Drawn as a child of each mesh so it inherits every
+    // transform the part already has — the tilt/tent frames, and the position
+    // writes the explode slider moves parts with. Depth-tested against the
+    // surface it sits on, so hidden edges stay hidden and the wires read as
+    // belonging to the face they are drawn over rather than to the whole
+    // model; three's default depthFunc passes at equal depth, which is exactly
+    // where a wire over its own triangle lands.
+    const wireMat = new THREE.MeshBasicMaterial({
+      color: 0x35e0ff,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.55,
+      depthWrite: false,
+    })
+    const syncWireframe = (on: boolean) => {
+      for (const root of [board, posts]) {
+        root.traverse((obj) => {
+          if (obj.userData.isWire) return
+          const mesh = obj as THREE.Mesh
+          if (!mesh.isMesh || !mesh.geometry) return
+          const wire = mesh.userData.wire as THREE.Mesh | undefined
+          if (on === !!wire) return
+          if (!on) {
+            mesh.remove(wire!)
+            mesh.userData.wire = undefined
+            return
+          }
+          const overlay = new THREE.Mesh(mesh.geometry, wireMat)
+          overlay.userData.isWire = true
+          overlay.renderOrder = 2
+          mesh.add(overlay)
+          mesh.userData.wire = overlay
+        })
+      }
+    }
+
     const applyViewSettings = () => {
       const v = useViewSettings.getState()
       camera.fov = v.fov
       camera.updateProjectionMatrix()
+      syncWireframe(v.wireframe)
       const shown = {
         caps: v.showCaps,
         switches: v.showSwitches,
@@ -532,7 +569,7 @@ export function Preview3D() {
             // that took 232 ms to walk 28 steps; Clipper2 does it in 13, so
             // the preview can afford to be smoother than the export at rest
             // and only coarsens while a drag is in flight.
-            taperedSolid(rings, levels, b, Math.PI / 6, draft ? 2 : 0.5),
+            taperedSolid(rings, levels, b, draft ? 2 : 0.5),
             poly[0] as [number, number][],
             part, y, material, shadows, true,
           )
@@ -607,45 +644,59 @@ export function Preview3D() {
           // draft is spread over that whole height and each band picks up the
           // slice it spans, so the slope never breaks at a seam.
           const { wallH, rimH, bevel, insetAt, breaks } = dims
-          // Self-tapping pilots are blind: only as deep as the screw bites,
-          // so the wall still reads solid from inside the case. Splitting the
-          // band at that depth is how an extruded outline gets a blind hole.
-          const pilotH = Math.min(SCREW.bite, wallH)
-          // The connector opening runs from the tray floor up past the
-          // board's connector, rather than starting at the board's top face.
-          // A slot open at the bottom needs nothing bridged over it, and the
-          // lid closes the underside off anyway.
-          const portCuts = controllerPortCuts(doc)
-          const portH =
-            portCuts.length > 0
-              ? Math.min(wallH, MCU_THICKNESS + doc.controller.portHeight)
-              : 0
-          // Both cuts start at the floor, so the wall splits at whichever of
-          // their tops comes first: each band carries the cuts that reach it.
-          const stops = [pilotH, portH, wallH]
-            .filter((h) => h > 1e-6 && h <= wallH)
-            .sort((a, b) => a - b)
-            .filter((h, i, all) => i === 0 || h - all[i - 1] > 1e-6)
-          for (const shell of caseShells(doc)) {
-            trackFront(shell.hull)
-            let from = 0
-            for (const to of stops) {
-              let band = shell.wall
-              if (screws.length > 0 && to <= pilotH + 1e-6) {
-                band = subtractDiscs(band, screws, SCREW.pilotR)
-              }
-              if (portH > 0 && to <= portH + 1e-6) {
-                band = subtractShapes(band, portCuts)
-              }
-              addTaperedSlab(
-                band, 'case', to - from, caseBottomY + from, materials.bezel, true, insetAt, breaks,
+          // One solid per shell, cut rather than banded: the whole outer face
+          // arrives as one surface, so the draft stops striping at the band
+          // seams, and the connector opening can be the shape it should be.
+          const pieces = topCasePieces(doc, draft ? 2 : 0.5)
+          for (const shell of caseShells(doc)) trackFront(shell.hull)
+          if (pieces) {
+            for (const piece of pieces) {
+              placePart(
+                piece.geo, piece.ring, 'case', piece.base, materials.bezel, true, true,
               )
-              from = to
             }
-            if (rimH > 0) {
-              addTaperedSlab(
-                shell.rim, 'case', rimH, 0, materials.bezel, true, insetAt, breaks, bevel,
-              )
+          } else {
+            // A shell whose taper folded: `taperedSolid` answers that with a
+            // morphological staircase, which is not a solid a boolean can
+            // take. Those cases keep the banded build — striped seams and a
+            // square opening, but a case.
+            //
+            // Self-tapping pilots are blind: only as deep as the screw bites,
+            // so the wall still reads solid from inside the case. Splitting
+            // the band at that depth is how an extruded outline gets a blind
+            // hole. The connector opening runs from the tray floor up past the
+            // board's connector; a slot open at the bottom needs nothing
+            // bridged over it, and the lid closes the underside off anyway.
+            const pilotH = Math.min(SCREW.bite, wallH)
+            const portCuts = controllerPortCuts(doc)
+            const portH = portCuts.length > 0 ? portBandHeight(doc) : 0
+            // Both cuts start at the floor, so the wall splits at whichever of
+            // their tops comes first: each band carries the cuts that reach it.
+            const stops = [pilotH, portH, wallH]
+              .filter((h) => h > 1e-6 && h <= wallH)
+              .sort((a, b) => a - b)
+              .filter((h, i, all) => i === 0 || h - all[i - 1] > 1e-6)
+            for (const shell of caseShells(doc)) {
+              let from = 0
+              for (const to of stops) {
+                let band = shell.wall
+                if (screws.length > 0 && to <= pilotH + 1e-6) {
+                  band = subtractDiscs(band, screws, SCREW.pilotR)
+                }
+                if (portH > 0 && to <= portH + 1e-6) {
+                  band = subtractShapes(band, portCuts)
+                }
+                addTaperedSlab(
+                  band, 'case', to - from, caseBottomY + from, materials.bezel, true,
+                  insetAt, breaks,
+                )
+                from = to
+              }
+              if (rimH > 0) {
+                addTaperedSlab(
+                  shell.rim, 'case', rimH, 0, materials.bezel, true, insetAt, breaks, bevel,
+                )
+              }
             }
           }
         }
@@ -770,40 +821,6 @@ export function Preview3D() {
             addSlab(
               controllerBoards(doc), 'bottom', MCU_THICKNESS, caseBottomY, materials.pcb, false,
             )
-            // Corner fill that rounds the square opening. The cut is a
-            // plan-view shape, so the roundness cannot come from cutting; it
-            // comes from putting these four slivers back into the corners.
-            // They stand in the opening's own plane, which is vertical, so
-            // they are built there and rotated into it.
-            for (const fill of controllerPortFilletPlacements(doc)) {
-              if (fill.rings.length === 0) continue
-              const geo = slantedPrism(fill.rings, fill.depthAt)
-              slabGeos.push(geo)
-              const mesh = new THREE.Mesh(geo, materials.bezel)
-              // Scene axes are x right, y up, z back-to-front, so a world
-              // (x, y) lands at (x, height, -y). Unlike every other part this
-              // one is built in a vertical plane, so its orientation comes
-              // from a basis rather than the usual lie-flat-and-tip-up
-              // rotation — but it goes in as a quaternion, not as a baked
-              // matrix. Freezing the matrix makes the mesh deaf to every
-              // later position write, and the explode view moves parts by
-              // exactly that, so the fill would sit still while the wall it
-              // rounds lifted away from it.
-              mesh.quaternion.setFromRotationMatrix(
-                new THREE.Matrix4().makeBasis(
-                  new THREE.Vector3(fill.sideX, 0, -fill.sideY),
-                  new THREE.Vector3(0, 1, 0),
-                  new THREE.Vector3(fill.outX, 0, -fill.outY),
-                ),
-              )
-              mesh.position.set(fill.x, fill.base, -fill.y)
-              mesh.userData.assembledY = fill.base
-              mesh.castShadow = true
-              mesh.receiveShadow = true
-              // Part of the case, so it hides and explodes with it.
-              targetFor(fill.x).add(mesh)
-              partMeshes.case.push(mesh)
-            }
             // The receptacle stands on the board's top face and pokes out
             // through the opening cut for it.
             addSlab(
@@ -1163,6 +1180,7 @@ export function Preview3D() {
       disposeBoard()
       for (const geo of geoCache.values()) geo.dispose()
       for (const m of Object.values(materials)) m.dispose()
+      wireMat.dispose()
       ground.geometry.dispose()
       ;(ground.material as THREE.Material).dispose()
       cyclo.geometry?.dispose()

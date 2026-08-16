@@ -7,7 +7,6 @@ import {
   caseShells,
   controllerBrackets,
   controllerPortCuts,
-  controllerPortFilletPlacements,
   controllerPortSpan,
   CSK_DEPTH,
   PLATE_THICKNESS,
@@ -19,12 +18,12 @@ import {
   subtractShapes,
   type MultiPolygon,
 } from '../model/outline'
+import { portBandHeight, topCasePieces } from '../preview/caseSolid'
 import {
   clampBevel,
   loftRings,
   ringToVec,
   shapeFromRings,
-  slantedPrism,
   taperedLevels,
   taperedSolid,
   type LoftLevel,
@@ -37,6 +36,10 @@ import {
 export interface Solid {
   geo: THREE.BufferGeometry
   z: number
+  /** Set when the geometry is known watertight — anything that came out of a
+   * boolean is, by construction. Skips the T-junction healing below, which
+   * exists for ear-cut caps and costs a pass over every vertex per edge. */
+  sound?: boolean
 }
 
 /** Collinear seam vertices (touching cutouts merged by the union) survive on
@@ -86,6 +89,16 @@ function taperedLofted(mp: MultiPolygon, levels: LoftLevel[], z: number, bevel: 
 export function topCaseSolids(doc: Doc): Solid[] {
   if (!doc.bezel.enabled || doc.bezel.width <= 0) return []
   const dims = caseDims(doc)
+  // One watertight solid per shell, cut rather than banded — the same
+  // assembly the preview shows, so what prints is what was on screen.
+  const pieces = topCasePieces(doc)
+  if (pieces) {
+    return pieces.map((piece) => ({
+      geo: piece.geo,
+      z: piece.base - dims.caseBottomY,
+      sound: true,
+    }))
+  }
   const screws = screwPositions(doc)
   const pilotH = Math.min(SCREW.bite, dims.wallH)
   const solids: Solid[] = []
@@ -106,10 +119,7 @@ export function topCaseSolids(doc: Doc): Solid[] {
   // reach it. Getting this wrong here and not in the preview would print a
   // case with no hole in it.
   const portCuts = controllerPortCuts(doc)
-  const portH =
-    portCuts.length > 0
-      ? Math.min(dims.wallH, MCU_THICKNESS + doc.controller.portHeight)
-      : 0
+  const portH = portCuts.length > 0 ? portBandHeight(doc) : 0
   const stops = [pilotH, portH, dims.wallH]
     .filter((h) => h > 1e-6 && h <= dims.wallH)
     .sort((a, b) => a - b)
@@ -126,25 +136,6 @@ export function topCaseSolids(doc: Doc): Solid[] {
       from = to
     }
     if (dims.rimH > 0) tapered(shell.rim, dims.rimH, 0, dims.bevel)
-  }
-  // Corner fill that rounds the connector opening. Built in the opening's own
-  // plane — vertical, unlike everything else here — and rotated into it. The
-  // slicer unions it with the wall it sits against.
-  for (const fill of controllerPortFilletPlacements(doc)) {
-    if (fill.rings.length === 0) continue
-    const geo = slantedPrism(fill.rings, fill.depthAt)
-    // Solids here rise along +Z from a base at `z`, so the opening's `u` runs
-    // along the board's side, `v` along +Z, and the extrusion along its axis.
-    geo.applyMatrix4(
-      new THREE.Matrix4()
-        .makeBasis(
-          new THREE.Vector3(fill.sideX, fill.sideY, 0),
-          new THREE.Vector3(0, 0, 1),
-          new THREE.Vector3(fill.outX, fill.outY, 0),
-        )
-        .setPosition(fill.x, fill.y, 0),
-    )
-    solids.push({ geo, z: 0 })
   }
   return solids
 }
@@ -205,6 +196,23 @@ export function plateSolids(doc: Doc): Solid[] {
 }
 
 type Vec3 = [number, number, number]
+
+/** One solid's triangles, as they are. */
+function rawTriangles(geo: THREE.BufferGeometry): Vec3[][] {
+  const pos = geo.getAttribute('position') as THREE.BufferAttribute
+  const index = geo.getIndex()
+  const count = index ? index.count : pos.count
+  const out: Vec3[][] = []
+  for (let i = 0; i + 2 < count; i += 3) {
+    const tri: Vec3[] = []
+    for (let k = 0; k < 3; k++) {
+      const j = index ? index.getX(i + k) : i + k
+      tri.push([pos.getX(j), pos.getY(j), pos.getZ(j)])
+    }
+    out.push(tri)
+  }
+  return out
+}
 
 /** One solid's triangles with T-junctions healed: any edge passing exactly
  * through another vertex of the same solid is split there, so neighbouring
@@ -283,8 +291,8 @@ function healedTriangles(geo: THREE.BufferGeometry): Vec3[][] {
 export function toSTL(solids: Solid[]): ArrayBuffer {
   // Twelve floats per facet: normal, then the three vertices.
   const facets: number[] = []
-  for (const { geo, z } of solids) {
-    for (const tri of healedTriangles(geo)) {
+  for (const { geo, z, sound } of solids) {
+    for (const tri of sound ? rawTriangles(geo) : healedTriangles(geo)) {
       const v = [
         tri[0][0], tri[0][1], tri[0][2] + z,
         tri[1][0], tri[1][1], tri[1][2] + z,

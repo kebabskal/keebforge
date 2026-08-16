@@ -1,6 +1,12 @@
 import { useRef, useState, type ReactNode } from 'react'
 import { EditorCanvas } from './editor/EditorCanvas'
-import { fastEditing, setFastEditing } from './model/editQuality'
+import {
+  fastEditing,
+  meshDetail,
+  setFastEditing,
+  setMeshDetail,
+  type Detail,
+} from './model/editQuality'
 import { Preview3D } from './preview/Preview3D'
 import { Inspector } from './ui/Inspector'
 import { useTheme } from './ui/theme'
@@ -67,6 +73,7 @@ export default function App() {
   const theme = useTheme((s) => s.theme)
   const toggleTheme = useTheme((s) => s.toggle)
   const [fast, setFast] = useState(fastEditing)
+  const [detail, setDetail] = useState(meshDetail)
 
   return (
     <div className="app">
@@ -87,6 +94,20 @@ export default function App() {
           </button>
         </nav>
         <Toolbar />
+        <select
+          className="detail-select"
+          value={detail}
+          onChange={(e) => {
+            const next = e.target.value as Detail
+            setMeshDetail(next)
+            setDetail(next)
+          }}
+          title="Mesh detail: how finely fillets and openings are sampled, in both views and in every export"
+        >
+          <option value="low">Detail: low</option>
+          <option value="medium">Detail: medium</option>
+          <option value="high">Detail: high</option>
+        </select>
         <button
           className={`theme-btn${fast ? ' active' : ''}`}
           onClick={() => {

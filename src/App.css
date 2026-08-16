@@ -103,6 +103,7 @@ main {
 
 .toolbar button,
 .toolbar select,
+.detail-select,
 .inspector select {
   font: inherit;
   font-size: 0.85rem;

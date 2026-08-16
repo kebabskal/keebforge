@@ -45,8 +45,8 @@ const {
 // Absent when benchmarking a revision from before the quality knob existed,
 // so an A/B against the old code still runs (its draft column just repeats
 // the fine one).
-const setOutlineQuality: (q: 'fine' | 'draft') => void =
-  (outline as { setOutlineQuality?: (q: 'fine' | 'draft') => void }).setOutlineQuality ??
+const setOutlineQuality: (q: 'low' | 'draft') => void =
+  (outline as { setOutlineQuality?: (q: 'low' | 'draft') => void }).setOutlineQuality ??
   (() => {})
 const { DOCS } = await import('./testDocs')
 
@@ -104,12 +104,12 @@ let total2d = 0
 let totalDraft = 0
 let total3d = 0
 for (const [name, make] of docs) {
-  setOutlineQuality('fine')
+  setOutlineQuality('low')
   const a = bench(make, view2d)
   const b = bench(make, view3d)
   setOutlineQuality('draft')
   const d = bench(make, view2d)
-  setOutlineQuality('fine')
+  setOutlineQuality('low')
   total2d += a.ms
   totalDraft += d.ms
   total3d += b.ms
